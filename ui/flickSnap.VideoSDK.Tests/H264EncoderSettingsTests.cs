@@ -1,0 +1,223 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using FlickSnap.Interop;
+using FlickSnap.Interop.Testing;
+using FlickSnap.VideoSDK.Media;
+using FFmpeg.AutoGen.Abstractions;
+using Xunit;
+
+namespace FlickSnap.VideoSDK.Tests
+{
+    /// <summary>
+    /// The crf → per-encoder settings (<see cref="H264EncoderSettings"/>) pinned without FFmpeg:
+    /// the option names and values each encoder is handed, the generic rate-control fields, and
+    /// the description line. The crf mapping itself (NVENC cq, the VideoToolbox slider and bitrate)
+    /// is <c>flicksnap_shared::encoding</c>, shared with the recorder, and its tables are pinned
+    /// there (crates/flicksnap_shared/src/encoding.rs), its marshalling smoke in FlickSnap.Interop.Tests;
+    /// the rows here check that the settings carry what that one call returns, with no number of
+    /// the mapping repeated.
+    /// </summary>
+    public class H264EncoderSettingsTests
+    {
+        private static string Opt(H264EncoderSettings s, string name)
+        {
+            var matches = s.PrivateOptions.Where(o => o.Key == name).ToList();
+            Assert.True(matches.Count == 1, $"expected exactly one '{name}' option, found {matches.Count}");
+            return matches[0].Value;
+        }
+
+        // every settings build makes the one native mapping call
+        private static H264EncoderSettings At(VideoEncoder encoder, int crf, int w = 1920, int h = 1080, int fpsNum = 60, int fpsDen = 1)
+        {
+            InteropTestGate.Require();
+            return H264EncoderSettings.For(encoder, crf, w, h, fpsNum, fpsDen);
+        }
+
+        [Fact]
+        public void X264_passes_crf_through_with_preset_fast_and_profile_high()
+        {
+            var s = At(VideoEncoder.Software, 18);
+            Assert.Equal(VideoEncoder.Software, s.Encoder);
+            Assert.Equal("libx264", s.CodecName);
+            Assert.Equal("18", Opt(s, "crf"));
+            Assert.Equal("fast", Opt(s, "preset"));
+            Assert.Equal("high", Opt(s, "profile"));
+            Assert.Equal(3, s.PrivateOptions.Count);
+            Assert.Equal(0, s.BitRate);
+            Assert.Equal(0, s.MaxRate);
+            Assert.False(s.ConstantQuality);
+            Assert.Null(s.BitrateFallback);
+            Assert.Equal("x264 crf=18 preset=fast profile=high bf=2 gop=600", s.Description);
+        }
+
+        /// <summary>crf 0 is lossless, and x264 refuses to apply the High profile to a lossless
+        /// encode; the option is left out so x264 picks High 4:4:4 Predictive itself.</summary>
+        [Fact]
+        public void X264_at_crf_0_leaves_the_profile_to_x264()
+        {
+            var s = At(VideoEncoder.Software, 0);
+            Assert.Equal("0", Opt(s, "crf"));
+            Assert.Equal("fast", Opt(s, "preset"));
+            Assert.DoesNotContain(s.PrivateOptions, o => o.Key == "profile");
+            Assert.Equal(2, s.PrivateOptions.Count);
+            Assert.Equal("x264 crf=0 (lossless) preset=fast profile=high444 bf=2 gop=600", s.Description);
+
+            // 1 is the first lossy crf and gets the normal profile
+            Assert.Equal("high", Opt(At(VideoEncoder.Software, 1), "profile"));
+        }
+
+        [Theory]
+        [InlineData(21)]
+        [InlineData(51)] // where the Rust table clamps
+        public void Nvenc_is_constant_quality_vbr_at_the_mapped_cq(int crf)
+        {
+            InteropTestGate.Require();
+            var cq = H264Quality.For(crf, 1920, 1080, 60, 1).NvencCq;
+            var s = At(VideoEncoder.Nvenc, crf);
+            Assert.Equal("h264_nvenc", s.CodecName);
+            Assert.Equal("vbr", Opt(s, "rc"));
+            Assert.Equal(cq.ToString(), Opt(s, "cq"));
+            Assert.Equal("p6", Opt(s, "preset"));
+            Assert.Equal("hq", Opt(s, "tune"));
+            Assert.Equal("qres", Opt(s, "multipass"));
+            Assert.Equal("8", Opt(s, "rc-lookahead"));
+            Assert.Equal("1", Opt(s, "spatial-aq"));
+            Assert.Equal("high", Opt(s, "profile"));
+            // b:v=0 and maxrate=0: anything else caps bursts instead of letting cq decide
+            Assert.Equal(0, s.BitRate);
+            Assert.Equal(0, s.MaxRate);
+            Assert.Equal(2, s.MaxBFrames);
+            Assert.StartsWith($"NVENC vbr cq={cq} preset=p6 tune=hq multipass=qres rc-lookahead=8 spatial-aq=1 ", s.Description, StringComparison.Ordinal);
+        }
+
+        [Fact]
+        public void Amf_is_constant_qp_at_crf_for_every_picture_type()
+        {
+            var s = At(VideoEncoder.Amf, 23);
+            Assert.Equal("h264_amf", s.CodecName);
+            Assert.Equal("cqp", Opt(s, "rc"));
+            Assert.Equal("23", Opt(s, "qp_i"));
+            Assert.Equal("23", Opt(s, "qp_p"));
+            Assert.Equal("23", Opt(s, "qp_b"));
+            Assert.Equal("quality", Opt(s, "quality"));
+            Assert.Equal("high", Opt(s, "profile"));
+            // amfenc_h264.c only applies bf when max_b_frames is set too
+            Assert.Equal("2", Opt(s, "max_b_frames"));
+            Assert.Equal("2", Opt(s, "bf"));
+            Assert.Equal(2, s.MaxBFrames);
+            Assert.Equal(0, s.BitRate);
+            Assert.Equal("AMF cqp qp=23 quality=quality profile=high bf=2 gop=600", s.Description);
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(23)]
+        [InlineData(51)]
+        public void VideoToolbox_quality_is_the_mapped_slider_in_lambda_units(int crf)
+        {
+            InteropTestGate.Require();
+            var q = H264Quality.For(crf, 1920, 1080, 30, 1).VideoToolboxQuality;
+            Assert.Equal(q * ffmpeg.FF_QP2LAMBDA, At(VideoEncoder.VideoToolbox, crf).GlobalQuality);
+        }
+
+        [Fact]
+        public void VideoToolbox_opens_in_quality_mode_with_a_bitrate_fallback()
+        {
+            var s = At(VideoEncoder.VideoToolbox, 23, 3440, 1440, 30, 1);
+            Assert.Equal("h264_videotoolbox", s.CodecName);
+            Assert.True(s.ConstantQuality);
+            Assert.Equal(55 * ffmpeg.FF_QP2LAMBDA, s.GlobalQuality); // q:v=55 in lambda units
+            Assert.Equal(0, s.BitRate);
+            Assert.Equal("high", Opt(s, "profile"));
+            Assert.Equal("0", Opt(s, "allow_sw"));
+            Assert.Equal("VideoToolbox q:v=55 profile=high bf=0 gop=300", s.Description);
+            // Frame reordering is off on purpose: FFmpeg's dts for a reordering
+            // h264_videotoolbox is short by a frame and movenc rejects the packets. Both
+            // variants must stay at 0; see the VideoToolbox case of H264EncoderSettings.For.
+            Assert.Equal(0, H264EncoderSettings.VideoToolboxBFrames);
+            Assert.Equal(0, s.MaxBFrames);
+
+            var fallback = s.BitrateFallback;
+            Assert.NotNull(fallback);
+            Assert.Equal(VideoEncoder.VideoToolbox, fallback.Encoder);
+            Assert.False(fallback.ConstantQuality);
+            Assert.Equal(4000 * 1000L, fallback.BitRate); // the reference size at the reference rate
+            Assert.Equal(s.PrivateOptions, fallback.PrivateOptions);
+            Assert.Null(fallback.BitrateFallback);
+            Assert.Equal(0, fallback.MaxBFrames);
+            Assert.Contains("b:v=4000k", fallback.Description, StringComparison.Ordinal);
+            Assert.Contains("bf=0", fallback.Description, StringComparison.Ordinal);
+        }
+
+        [Theory]
+        [InlineData(3440, 1440, 30, 1)]
+        [InlineData(1920, 1080, 30000, 1001)]
+        public void VideoToolbox_fallback_bitrate_is_the_mapped_rate(int w, int h, int fpsNum, int fpsDen)
+        {
+            InteropTestGate.Require();
+            var kbps = H264Quality.For(23, w, h, fpsNum, fpsDen).VideoToolboxBitrateKbps;
+            Assert.Equal(kbps * 1000L, At(VideoEncoder.VideoToolbox, 23, w, h, fpsNum, fpsDen).BitrateFallback.BitRate);
+        }
+
+        [Theory]
+        [InlineData(60, 1, 600)]
+        [InlineData(30, 1, 300)]
+        [InlineData(30000, 1001, 300)]
+        [InlineData(24, 1, 240)]
+        [InlineData(1, 100, 1)] // 0.01 fps: never below one frame
+        public void Gop_is_ten_seconds_of_frames(int fpsNum, int fpsDen, int frames)
+        {
+            Assert.Equal(frames, H264EncoderSettings.GopFrames(fpsNum, fpsDen));
+            foreach (var encoder in new[] { VideoEncoder.Software, VideoEncoder.Nvenc, VideoEncoder.Amf, VideoEncoder.VideoToolbox })
+            {
+                var s = At(encoder, 21, fpsNum: fpsNum, fpsDen: fpsDen);
+                Assert.Equal(frames, s.GopSize);
+                Assert.Equal(encoder == VideoEncoder.VideoToolbox
+                    ? H264EncoderSettings.VideoToolboxBFrames
+                    : H264EncoderSettings.BFrames, s.MaxBFrames);
+                Assert.Contains($"gop={frames}", s.Description, StringComparison.Ordinal);
+            }
+        }
+
+        [Fact]
+        public void Auto_and_bad_inputs_are_rejected()
+        {
+            Assert.Throws<ArgumentException>(() => At(VideoEncoder.Auto, 21));
+            Assert.Throws<ArgumentException>(() => H264EncoderSettings.CodecNameOf(VideoEncoder.Auto));
+            Assert.Equal("crf", Assert.Throws<ArgumentOutOfRangeException>(() => At(VideoEncoder.Software, 52)).ParamName);
+            Assert.Equal("crf", Assert.Throws<ArgumentOutOfRangeException>(() => At(VideoEncoder.Software, -1)).ParamName);
+            Assert.Equal("width", Assert.Throws<ArgumentOutOfRangeException>(() => At(VideoEncoder.Software, 21, w: 0)).ParamName);
+            Assert.Equal("fpsNum", Assert.Throws<ArgumentOutOfRangeException>(() => At(VideoEncoder.Software, 21, fpsNum: 0)).ParamName);
+            Assert.Throws<ArgumentOutOfRangeException>(() => H264EncoderSettings.GopFrames(30, 0));
+        }
+
+        [Fact]
+        public void Codec_names_are_the_ffmpeg_encoder_names()
+        {
+            Assert.Equal("libx264", H264EncoderSettings.CodecNameOf(VideoEncoder.Software));
+            Assert.Equal("h264_nvenc", H264EncoderSettings.CodecNameOf(VideoEncoder.Nvenc));
+            Assert.Equal("h264_amf", H264EncoderSettings.CodecNameOf(VideoEncoder.Amf));
+            Assert.Equal("h264_videotoolbox", H264EncoderSettings.CodecNameOf(VideoEncoder.VideoToolbox));
+        }
+
+        [Fact]
+        public void Wire_names_round_trip_and_reject_anything_else()
+        {
+            foreach (var encoder in (VideoEncoder[])Enum.GetValues(typeof(VideoEncoder)))
+            {
+                string name = VideoEncoderNames.Of(encoder);
+                Assert.Equal(name, name.ToLowerInvariant());
+                Assert.True(VideoEncoderNames.TryParse(name, out var parsed));
+                Assert.Equal(encoder, parsed);
+                Assert.True(VideoEncoderNames.TryParse(name.ToUpperInvariant(), out parsed));
+                Assert.Equal(encoder, parsed);
+            }
+            Assert.Equal("auto|software|nvenc|amf|videotoolbox", VideoEncoderNames.All);
+            Assert.False(VideoEncoderNames.TryParse("x264", out _));
+            Assert.False(VideoEncoderNames.TryParse(" nvenc", out _));
+            Assert.False(VideoEncoderNames.TryParse("", out _));
+            Assert.False(VideoEncoderNames.TryParse(null, out _));
+        }
+    }
+}

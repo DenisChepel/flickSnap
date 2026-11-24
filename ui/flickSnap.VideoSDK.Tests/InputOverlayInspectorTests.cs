@@ -1,0 +1,916 @@
+﻿using System;
+using System.Linq;
+using FlickSnap.UI.Controls;
+using FlickSnap.UI.VideoEditor.Inspector;
+using FlickSnap.VideoSDK.Composition;
+using FlickSnap.VideoSDK.Editing;
+using FlickSnap.VideoSDK.Model;
+using Xunit;
+
+namespace FlickSnap.VideoSDK.Tests
+{
+    /// <summary>
+    /// The inspector over the two input-overlay item kinds: which sections each lights (the cursor
+    /// carries no placement at all, the keystroke block carries position and width but nothing
+    /// picture-shaped), and that every editor writes the whole overlay row — the split segments of
+    /// one overlay must never end up with different styles or timings. Framework-free like
+    /// <see cref="EffectInspectorTests"/> — no Avalonia here.
+    /// </summary>
+    public class InputOverlayInspectorTests
+    {
+        private static long Ms(long ms) => ms * TimeSpan.TicksPerMillisecond;
+
+        /// <summary>A recording cut into two keep-segments, its rows grouped, over a source that
+        /// carries input capture — so every overlay row the factories build has two items, which is
+        /// what the fan-out tests are about.</summary>
+        private static (EditorSession Session, SelectedItemViewModel Vm) NewInspector(out Item screen)
+        {
+            var sourceId = Guid.NewGuid();
+            var group = Guid.NewGuid();
+            var screenTrack = new Track { Id = Guid.NewGuid(), Kind = TrackKind.Video, Name = "Screen", Order = 0, GroupId = group };
+            var audioTrack = new Track { Id = Guid.NewGuid(), Kind = TrackKind.Audio, Name = "Audio", Order = 1, GroupId = group };
+
+            var project = new Project
+            {
+                Output = new OutputSettings { WidthPx = 1920, HeightPx = 1080, FpsNum = 30, FpsDen = 1, SampleRate = 48000 },
+                Sources =
+                {
+                    new Source
+                    {
+                        Id = sourceId,
+                        Path = @"C:\rec\input.mp4",
+                        InputCapturePath = TestPath.ExistingCapture,
+                        Streams =
+                        {
+                            new SourceStream { Index = 0, Kind = StreamKind.Video, Width = 1920, Height = 1080, AvgFrameRateNum = 30, AvgFrameRateDen = 1, DurationTicks = Ms(60_000) },
+                            new SourceStream { Index = 1, Kind = StreamKind.Audio, DurationTicks = Ms(60_000) },
+                        },
+                    },
+                },
+                Tracks = { screenTrack, audioTrack },
+            };
+
+            screen = AddSegment(project, screenTrack, audioTrack, sourceId, 0, Ms(8_000));
+            AddSegment(project, screenTrack, audioTrack, sourceId, Ms(8_000), Ms(12_000));
+
+            var session = new EditorSession(project, null, null);
+            return (session, new SelectedItemViewModel { Session = session });
+        }
+
+        private static Item AddSegment(Project project, Track screen, Track audio, Guid sourceId,
+            long startTicks, long durationTicks)
+        {
+            var item = new Item
+            {
+                Id = Guid.NewGuid(),
+                TrackId = screen.Id,
+                TimelineStartTicks = startTicks,
+                DurationTicks = durationTicks,
+                Content = new MediaContent { SourceId = sourceId, StreamIndex = 0, SourceInTicks = startTicks },
+            };
+            project.Items.Add(item);
+            project.Items.Add(new Item
+            {
+                Id = Guid.NewGuid(),
+                TrackId = audio.Id,
+                TimelineStartTicks = startTicks,
+                DurationTicks = durationTicks,
+                Content = new MediaContent { SourceId = sourceId, StreamIndex = 1, SourceInTicks = startTicks },
+            });
+            return item;
+        }
+
+        private static Item Live(EditorSession session, Guid id) =>
+            session.Project.Items.First(i => i.Id == id);
+
+        private static CursorContent[] CursorItems(EditorSession session) =>
+            session.Project.Items.Select(i => i.Content).OfType<CursorContent>().ToArray();
+
+        private static KeyboardContent[] KeyboardItems(EditorSession session) =>
+            session.Project.Items.Select(i => i.Content).OfType<KeyboardContent>().ToArray();
+
+        // ---------------------------------------------------------------------- section gating
+
+        [Fact]
+        public void CursorItem_ShowsItsOwnSectionAndNoPlacement()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.True(vm.HasSelection);
+            Assert.True(vm.ShowCursorTrack);
+            // position, size, aspect, crop and shape all come from the screen clip it draws through
+            Assert.False(vm.ShowTransform);
+            Assert.False(vm.ShowScale);
+            Assert.False(vm.ShowMask);
+            Assert.False(vm.ShowCrop);
+            Assert.False(vm.ShowKeyboardTrack);
+            Assert.False(vm.ShowText);
+            Assert.False(vm.ShowAudio);
+            Assert.True(vm.ShowSpeed);
+            Assert.False(vm.ShowSpeedEffect);
+            Assert.False(vm.ShowZoomEffect);
+            Assert.False(vm.ShowRamp);
+            Assert.False(vm.ShowTransitions);
+            Assert.False(vm.ShowTrackMuted);
+            // the eye stays: hiding the row is how the overlay is switched off
+            Assert.True(vm.ShowTrackHidden);
+            Assert.Equal("Cursor", vm.SubjectKind);
+            Assert.Equal("Cursor", vm.SubjectName);
+        }
+
+        [Fact]
+        public void KeyboardItem_KeepsPlacementButNothingPictureShaped()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            Assert.True(vm.ShowKeyboardTrack);
+            // the transform IS the block's anchor and wrap width
+            Assert.True(vm.ShowTransform);
+            Assert.True(vm.ShowScale);
+            Assert.Equal(0.5, vm.PositionX);
+            Assert.Equal(0.5, vm.Scale);
+            // …but a keystroke block is not a picture: no ratio, crop or mask — and no rotation,
+            // which the composer never reads for it (DrawKeyboard draws the block upright)
+            Assert.False(vm.ShowRotation);
+            Assert.False(vm.ShowMask);
+            Assert.False(vm.ShowCrop);
+            Assert.False(vm.ShowCursorTrack);
+            Assert.True(vm.ShowSpeed);
+            Assert.False(vm.ShowRamp);
+            Assert.Equal("Keys", vm.SubjectKind);
+        }
+
+        [Fact]
+        public void RotationRow_StaysForOrdinaryPictureItems()
+        {
+            var (session, vm) = NewInspector(out var screen);
+            session.Select(screen.Id);
+
+            Assert.True(vm.ShowTransform);
+            Assert.True(vm.ShowRotation);
+        }
+
+        // -------------------------------------------------------------------------------- cursor
+
+        [Fact]
+        public void CursorStyle_ReadsAndWritesEverySegmentOfTheRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Equal(2, CursorItems(session).Length);
+            Assert.Equal("vision", vm.CursorStyle.Value);
+            Assert.True(vm.CursorGlyphEnabled);
+
+            vm.CursorStyle = SelectedItemViewModel.CursorStyleOptions.First(o => o.Value == "native");
+
+            Assert.All(CursorItems(session), c => Assert.Equal("native", c.Style));
+            Assert.Equal("native", vm.CursorStyle.Value);
+        }
+
+        /// <summary>The colorway row is the style's own: it appears only for a style that offers
+        /// more than one, and writing it fans out over the row exactly as the style does.</summary>
+        [Fact]
+        public void CursorVariant_ShowsOnlyForAStyleWithColorwaysAndWritesTheWholeRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            // vision offers two; nothing is stored until the user picks, and the getter reads the
+            // style's default rather than showing an empty tile row
+            Assert.True(vm.CursorVariantsVisible);
+            Assert.Equal(new[] { "dark", "light" }, vm.CursorVariantOptions.Select(o => o.Value).ToArray());
+            Assert.Equal("dark", vm.CursorVariant.Value);
+            Assert.All(CursorItems(session), c => Assert.Null(c.Variant));
+
+            vm.CursorVariant = vm.CursorVariantOptions.First(o => o.Value == "light");
+
+            Assert.All(CursorItems(session), c => Assert.Equal("light", c.Variant));
+            Assert.Equal("light", vm.CursorVariant.Value);
+
+            // native has no artwork at all, so it has no colorways and the row leaves the panel
+            vm.CursorStyle = SelectedItemViewModel.CursorStyleOptions
+                .First(o => o.Value == SelectedItemViewModel.NativeCursorStyle);
+
+            Assert.False(vm.CursorVariantsVisible);
+            Assert.Empty(vm.CursorVariantOptions);
+            Assert.Null(vm.CursorVariant);
+
+            // ...and the pick survives the trip: going back re-selects what was stored
+            vm.CursorStyle = SelectedItemViewModel.DefaultCursorStyleOption;
+            Assert.True(vm.CursorVariantsVisible);
+            Assert.Equal("light", vm.CursorVariant.Value);
+        }
+
+        [Fact]
+        public void NativeStyle_HidesTheGlyphOnlyRows()
+        {
+            // the size row and the whole EFFECT section bind their IsVisible to this: under native
+            // they do not merely gray out, they leave the panel
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            vm.CursorStyle = SelectedItemViewModel.CursorStyleOptions
+                .First(o => o.Value == SelectedItemViewModel.NativeCursorStyle);
+
+            Assert.False(vm.CursorGlyphEnabled);
+            Assert.False(vm.ShowSurround);
+
+            vm.CursorStyle = SelectedItemViewModel.DefaultCursorStyleOption;
+            Assert.True(vm.CursorGlyphEnabled);
+            Assert.True(vm.ShowSurround);
+        }
+
+        [Fact]
+        public void OverlayRows_UngroupLikeAnyOtherRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            var keys = session.AddKeyboardTrack();
+
+            foreach (var overlay in new[] { cursor, keys })
+            {
+                session.Select(overlay.Id);
+                Assert.True(vm.IsGrouped);
+                Assert.True(((System.Windows.Input.ICommand)vm.CommandUngroup).CanExecute(null));
+
+                ((System.Windows.Input.ICommand)vm.CommandUngroup).Execute(null);
+
+                Assert.False(vm.IsGrouped);
+                Assert.False(((System.Windows.Input.ICommand)vm.CommandUngroup).CanExecute(null));
+                Assert.Null(session.Project.TrackOf(Live(session, overlay.Id)).GroupId);
+            }
+        }
+
+        /// <summary>The caption says a clip's speed stops at the clip, which only needs saying while
+        /// the row is grouped, and the write proves it: nothing else on the rows changes.</summary>
+        [Fact]
+        public void OverlaySpeed_RetimesThisClipAloneAndSaysSoOnAGroupedRow()
+        {
+            var (session, vm) = NewInspector(out var screen);
+            var cursor = session.AddCursorTrack();
+            var keys = session.AddKeyboardTrack();
+            session.Select(cursor.Id);
+            Assert.True(vm.ShowSpeedGroupCaption);
+            Assert.Equal(1.0, vm.SpeedChoice.Value);
+
+            var others = session.Project.Items.Where(i => i.Id != cursor.Id)
+                .Select(i => (i.Id, i.TimelineStartTicks, i.DurationTicks, (i.Content as SourceClockContent)?.Speed)).ToList();
+
+            vm.SpeedChoice = SelectedItemViewModel.SpeedOptions.First(o => o.Value == 2.0);
+
+            Assert.Equal(2.0, ((CursorContent)Live(session, cursor.Id).Content).Speed);
+            Assert.Equal(Ms(4_000), Live(session, cursor.Id).DurationTicks);
+            Assert.Equal(others, session.Project.Items.Where(i => i.Id != cursor.Id)
+                .Select(i => (i.Id, i.TimelineStartTicks, i.DurationTicks, (i.Content as SourceClockContent)?.Speed)).ToList());
+
+            // the row reads the clip's own speed when it comes back to it
+            session.Select(screen.Id);
+            Assert.Equal(1.0, vm.SpeedChoice.Value);
+            session.Select(cursor.Id);
+            Assert.Equal(2.0, vm.SpeedChoice.Value);
+
+            session.UngroupTracks(new[] { session.Project.TrackOf(Live(session, keys.Id)).Id });
+            session.Select(keys.Id);
+            Assert.True(vm.ShowSpeed);
+            Assert.False(vm.ShowSpeedGroupCaption);
+
+            session.Select(screen.Id);
+            Assert.True(vm.ShowSpeed);
+            Assert.True(vm.ShowSpeedGroupCaption);
+        }
+
+        /// <summary>Ungrouping changes the caption and not the Speed row beside it, so the panel has
+        /// to be told about the caption by name.</summary>
+        [Fact]
+        public void OverlaySpeed_CaptionLeavesThePanelWhenTheRowIsUngrouped()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+            Assert.True(vm.ShowSpeedGroupCaption);
+
+            var raised = new System.Collections.Generic.List<string>();
+            vm.PropertyChanged += (_, e) => raised.Add(e.PropertyName);
+
+            ((System.Windows.Input.ICommand)vm.CommandUngroup).Execute(null);
+
+            Assert.True(vm.ShowSpeed);
+            Assert.False(vm.ShowSpeedGroupCaption);
+            Assert.Contains(nameof(vm.ShowSpeedGroupCaption), raised);
+        }
+
+        [Fact]
+        public void OverlaySpeed_IsNotOfferedOnAHeldFrame()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.EditItem(cursor.Id, i => ((CursorContent)i.Content).Freeze = true);
+            session.Select(cursor.Id);
+
+            Assert.False(vm.ShowSpeed);
+            Assert.False(vm.ShowSpeedGroupCaption);
+        }
+
+        [Fact]
+        public void ClickColor_ReachesTheHighlightPreviews()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Equal(SelectedItemViewModel.DefaultCursorClickColor, vm.CursorClickColor);
+            Assert.All(CursorItems(session), c => Assert.Equal(vm.CursorClickColor, c.ClickColor));
+
+            session.EditItem(cursor.Id, i => ((CursorContent)i.Content).ClickColor = 0x8000FF00,
+                "test", structural: false, origin: new object());
+
+            Assert.Equal(0x8000FF00u, vm.CursorClickColor);
+        }
+
+        [Fact]
+        public void CursorSizeAndClicks_WriteTheWholeRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Equal(1.0, vm.CursorSize);
+            Assert.Equal("none", vm.CursorClickAnimation.Value);
+
+            vm.CursorSize = 2.0;
+            vm.CursorClickAnimation = SelectedItemViewModel.ClickAnimationOptions.First(o => o.Value == "ripple");
+
+            Assert.All(CursorItems(session), c =>
+            {
+                Assert.Equal(2.0, c.Size);
+                Assert.Equal("ripple", c.ClickAnimation);
+            });
+        }
+
+        [Fact]
+        public void CursorDebounce_DefaultsOnAndWritesTheWholeRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.True(vm.CursorDebounce);
+            Assert.All(CursorItems(session), c => Assert.True(c.Debounce));
+
+            vm.CursorDebounce = false;
+            Assert.All(CursorItems(session), c => Assert.False(c.Debounce));
+
+            // an external edit (undo, another view) syncs back into the panel
+            session.EditItem(cursor.Id, i => ((CursorContent)i.Content).Debounce = true,
+                "test", structural: false, origin: new object());
+            Assert.True(vm.CursorDebounce);
+        }
+
+        [Fact]
+        public void HighlightDials_WriteTheWholeRowAndClampToTheModelsRange()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Equal(1.0, vm.CursorHoldSize);
+            Assert.Equal(1.0, vm.CursorClickSize);
+            Assert.Equal(1.0, vm.CursorAnimationSpeed);
+
+            vm.CursorHoldSize = 2.5;
+            vm.CursorClickSize = 0.5;
+            vm.CursorAnimationSpeed = 3.0;
+
+            Assert.All(CursorItems(session), c =>
+            {
+                Assert.Equal(2.5, c.HoldSize);
+                Assert.Equal(0.5, c.ClickSize);
+                Assert.Equal(3.0, c.AnimationSpeed);
+            });
+
+            // the spinners offer exactly the range Project.Validate accepts, so a clamped write
+            // can never produce a project that fails validation
+            vm.CursorHoldSize = 99;
+            vm.CursorClickSize = -1;
+            vm.CursorAnimationSpeed = Double.NaN;
+
+            Assert.Equal(SelectedItemViewModel.MaxHighlightFactor, vm.CursorHoldSize);
+            Assert.Equal(SelectedItemViewModel.MinHighlightFactor, vm.CursorClickSize);
+            Assert.Equal(SelectedItemViewModel.MinHighlightFactor, vm.CursorAnimationSpeed);
+            Assert.Equal(CursorContent.MinHighlightFactor, SelectedItemViewModel.MinHighlightFactor);
+            Assert.Equal(CursorContent.MaxHighlightFactor, SelectedItemViewModel.MaxHighlightFactor);
+        }
+
+        [Fact]
+        public void HighlightDials_AreHiddenWhileNothingIsDrawn()
+        {
+            // the three rows bind their IsVisible to this: "none" draws no highlight, so its size
+            // and speed dials leave the panel rather than sit there inert
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Equal("none", vm.CursorClickAnimation.Value);
+            Assert.False(vm.CursorHighlightEnabled);
+
+            vm.CursorClickAnimation = SelectedItemViewModel.ClickAnimationOptions.First(o => o.Value == "pulse");
+            Assert.True(vm.CursorHighlightEnabled);
+
+            vm.CursorClickAnimation = SelectedItemViewModel.DefaultClickAnimationOption;
+            Assert.False(vm.CursorHighlightEnabled);
+        }
+
+        [Fact]
+        public void HighlightRows_ShowOnlyWhatTheModeUses()
+        {
+            // color: every drawn highlight except press (a warp colors nothing);
+            // hold size: only the bursts draw the held dot it scales; fill: the ring alone
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.False(vm.CursorHighlightColorEnabled);
+            Assert.False(vm.CursorHoldSizeEnabled);
+            Assert.False(vm.CursorRingFillEnabled);
+
+            vm.CursorClickAnimation = SelectedItemViewModel.ClickAnimationOptions.First(o => o.Value == "ripple");
+            Assert.True(vm.CursorHighlightColorEnabled);
+            Assert.True(vm.CursorHoldSizeEnabled);
+            Assert.False(vm.CursorRingFillEnabled);
+
+            vm.CursorClickAnimation = SelectedItemViewModel.ClickAnimationOptions.First(o => o.Value == "ring");
+            Assert.True(vm.CursorHighlightColorEnabled);
+            Assert.False(vm.CursorHoldSizeEnabled);
+            Assert.True(vm.CursorRingFillEnabled);
+
+            vm.CursorClickAnimation = SelectedItemViewModel.ClickAnimationOptions.First(o => o.Value == "pressure");
+            Assert.True(vm.CursorHighlightEnabled); // the size/speed dials still apply
+            Assert.False(vm.CursorHighlightColorEnabled);
+            Assert.False(vm.CursorHoldSizeEnabled);
+            Assert.False(vm.CursorRingFillEnabled);
+        }
+
+        [Fact]
+        public void FillOpacity_WritesTheWholeRowAndClamps()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Equal(SelectedItemViewModel.DefaultCursorFillOpacity, vm.CursorFillOpacity);
+
+            vm.CursorFillOpacity = 0.6;
+            Assert.All(CursorItems(session), c => Assert.Equal(0.6, c.FillOpacity));
+
+            // the spinner offers exactly the range Project.Validate accepts
+            vm.CursorFillOpacity = 1.5;
+            Assert.Equal(1.0, vm.CursorFillOpacity);
+            vm.CursorFillOpacity = -1;
+            Assert.Equal(0.0, vm.CursorFillOpacity);
+        }
+
+        [Fact]
+        public void CursorSize_ClampsToTheSpinnersRange()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            vm.CursorSize = 99;
+            Assert.Equal(SelectedItemViewModel.MaxCursorSize, vm.CursorSize);
+
+            vm.CursorSize = -5;
+            Assert.Equal(SelectedItemViewModel.MinCursorSize, vm.CursorSize);
+
+            vm.CursorSize = Double.NaN;
+            Assert.Equal(SelectedItemViewModel.MinCursorSize, vm.CursorSize);
+        }
+
+        [Fact]
+        public void CursorSection_ReReadsAChangeFromElsewhere()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            session.EditItem(cursor.Id, i =>
+            {
+                var content = (CursorContent)i.Content;
+                content.Style = "native";
+                content.Size = 1.75;
+                content.ClickAnimation = "pulse";
+                content.HoldSize = 1.5;
+                content.ClickSize = 2.5;
+                content.AnimationSpeed = 0.75;
+            }, "test", structural: false, origin: new object());
+
+            Assert.Equal("native", vm.CursorStyle.Value);
+            Assert.Equal(1.75, vm.CursorSize);
+            Assert.Equal("pulse", vm.CursorClickAnimation.Value);
+            Assert.True(vm.CursorHighlightEnabled);
+            Assert.Equal(1.5, vm.CursorHoldSize);
+            Assert.Equal(2.5, vm.CursorClickSize);
+            Assert.Equal(0.75, vm.CursorAnimationSpeed);
+        }
+
+        // ------------------------------------------------------------------------------ keyboard
+
+        [Fact]
+        public void KeyboardSpinners_WriteTheWholeRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            Assert.Equal(2, KeyboardItems(session).Length);
+            Assert.Equal(40, vm.KeyboardFontSize);
+            Assert.Equal(1000, vm.KeyboardLingerMs);
+            Assert.Equal(1000, vm.KeyboardPauseBreakMs);
+
+            // every one of these differs from the default, or the write would coalesce away and
+            // the fan-out would go untested
+            vm.KeyboardFontSize = 56;
+            vm.KeyboardLingerMs = 500;
+            vm.KeyboardPauseBreakMs = 2000;
+
+            Assert.All(KeyboardItems(session), k =>
+            {
+                Assert.Equal(56, k.FontSize);
+                Assert.Equal(500, k.LingerMs);
+                Assert.Equal(2000, k.PauseBreakMs);
+            });
+        }
+
+        // ------------------------------------------------------------- keystroke style picker
+
+        private static KeystrokeNumberRow NumberRow(SelectedItemViewModel vm, string label) =>
+            vm.KeystrokeStyle.AllRows.OfType<KeystrokeNumberRow>().First(r => r.Label == label);
+
+        private static KeystrokeColorRow KeyColorRow(SelectedItemViewModel vm, string label) =>
+            vm.KeystrokeStyle.KeyRows.OfType<KeystrokeColorRow>().First(r => r.Label == label);
+
+        private static KeystrokeColorRow TypingColorRow(SelectedItemViewModel vm, string label) =>
+            vm.KeystrokeStyle.TypingRows.OfType<KeystrokeColorRow>().First(r => r.Label == label);
+
+        private static KeystrokeStyleOption StyleOption(string id) =>
+            KeystrokeStyleEditor.StyleOptions.First(o => o.Value == id);
+
+        private static KeystrokeStyleOption ThemeOption(string id) =>
+            KeystrokeStyleEditor.ThemeOptions.First(o => o.Value == id);
+
+        [Fact]
+        public void KeystrokeStyle_AFreshItemReadsDefaultDark()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            var editor = vm.KeystrokeStyle;
+            Assert.True(editor.HasTarget);
+            Assert.Equal(KeystrokeStyles.Default, editor.SelectedStyle.Value);
+            Assert.Equal(KeystrokeStyles.Dark, editor.SelectedTheme.Value);
+            Assert.True(editor.IsPreset);
+            Assert.False(editor.IsCustom);
+            // the Custom tile shows what picking it would start from: the preset on screen
+            Assert.Equal(KeystrokeStyles.Preset(KeystrokeStyles.Default, KeystrokeStyles.Dark), editor.CustomTileLook);
+            Assert.Equal(KeystrokeStyles.Styles, KeystrokeStyleEditor.StyleOptions.Select(o => o.Value));
+            Assert.Contains(KeystrokeStyleEditor.ThemeOptions, o => o.Value == KeystrokeStyles.Light);
+        }
+
+        [Fact]
+        public void KeystrokeStyle_StyleAndThemeWriteTheWholeRow()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            vm.KeystrokeStyle.SelectedStyle = StyleOption(KeystrokeStyles.Laptop);
+            vm.KeystrokeStyle.SelectedTheme = ThemeOption("pink");
+
+            Assert.Equal(2, KeyboardItems(session).Length);
+            Assert.All(KeyboardItems(session), k =>
+            {
+                Assert.Equal(KeystrokeStyles.Laptop, k.Style);
+                Assert.Equal("pink", k.Theme);
+                Assert.Null(k.Custom);
+            });
+            Assert.Equal("pink", vm.KeystrokeStyle.Theme);
+            Assert.Equal(KeystrokeStyles.Laptop, vm.KeystrokeStyle.PresetStyle);
+            Assert.Equal(KeystrokeStyles.Preset(KeystrokeStyles.Laptop, "pink"), vm.KeystrokeStyle.CustomTileLook);
+        }
+
+        [Fact]
+        public void KeystrokeStyle_CustomSeedsFromThePresetOnScreen()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+            var editor = vm.KeystrokeStyle;
+
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Simple);
+            editor.SelectedTheme = ThemeOption(KeystrokeStyles.Light);
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+
+            var seeded = KeystrokeStyles.Preset(KeystrokeStyles.Simple, KeystrokeStyles.Light);
+            Assert.All(KeyboardItems(session), k =>
+            {
+                Assert.Equal(KeystrokeStyles.Custom, k.Style);
+                Assert.Equal(seeded, k.Custom);
+            });
+            Assert.True(editor.IsCustom);
+            Assert.False(editor.IsPreset);
+            Assert.Equal(seeded, editor.CustomTileLook);
+
+            // the rows show the seeded look, and reset to the preset it was seeded from — so a
+            // fresh seed shows no reset dots, even though Simple differs from Default
+            Assert.Equal(seeded.OuterRadius, NumberRow(vm, "Outer radius").Value);
+            Assert.Equal(seeded.OuterRadius, NumberRow(vm, "Outer radius").DefaultValue);
+            Assert.Equal(seeded.KeyTrackPadding, NumberRow(vm, "Track padding").Value);
+            Assert.Equal(seeded.KeyTrackPadding, NumberRow(vm, "Track padding").DefaultValue);
+            Assert.Equal(KeystrokeStyleEditor.HexOf(seeded.KeyTrackColor), KeyColorRow(vm, "Track").Hex);
+            Assert.Equal(KeystrokeStyleEditor.HexOf(seeded.TypingTrackColor), TypingColorRow(vm, "Track").Hex);
+            Assert.Equal(KeystrokeStyleEditor.HexOf(seeded.KeyTrackColor), KeyColorRow(vm, "Track").DefaultHex);
+
+            // one edit leaves the look nearest that preset: the edited row resets to Simple's value
+            NumberRow(vm, "Outer radius").Value = 0.3;
+            Assert.Equal(0.3, NumberRow(vm, "Outer radius").Value);
+            Assert.Equal(seeded.OuterRadius, NumberRow(vm, "Outer radius").DefaultValue);
+            Assert.Equal(KeystrokeStyleEditor.HexOf(seeded.KeyTrackColor), KeyColorRow(vm, "Track").DefaultHex);
+        }
+
+        [Fact]
+        public void KeystrokeStyle_CustomRowsWriteTheWholeRowAndClamp()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+            vm.KeystrokeStyle.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+
+            NumberRow(vm, "Offset").Value = 0.2;
+            NumberRow(vm, "Outer radius").Value = 9;          // past the 0.5 pill
+            NumberRow(vm, "Padding W").Value = Double.NaN;
+            NumberRow(vm, "Radius").Value = 0.12;              // the typing track's
+            KeyColorRow(vm, "Key top").Hex = "#FF123456";
+            KeyColorRow(vm, "Track").Hex = "#80FFFFFF";
+            TypingColorRow(vm, "Text").Hex = "#00FF00";       // #RRGGBB is opaque
+
+            Assert.All(KeyboardItems(session), k =>
+            {
+                Assert.Equal(0.2, k.Custom.Drop);
+                Assert.Equal(KeystrokeLook.MaxRadius, k.Custom.OuterRadius);
+                Assert.Equal(0, k.Custom.PaddingX);
+                Assert.Equal(0.12, k.Custom.TypingRadius);
+                Assert.Equal(0xFF123456u, k.Custom.KeyTopColor);
+                Assert.Equal(0x80FFFFFFu, k.Custom.KeyTrackColor);
+                Assert.Equal(0xFF00FF00u, k.Custom.TypingTextColor);
+            });
+            Assert.Equal(KeystrokeLook.MaxRadius, NumberRow(vm, "Outer radius").Value);
+            Assert.Equal(0xFF123456u, KeyColorRow(vm, "Key top").Argb);
+            Assert.Equal(0xFF123456u, vm.KeystrokeStyle.CustomTileLook.KeyTopColor);
+
+            // a half-typed value stays on the row unwritten
+            TypingColorRow(vm, "Text").Hex = "#00FF0";
+            Assert.Equal("#00FF0", TypingColorRow(vm, "Text").Hex);
+            Assert.All(KeyboardItems(session), k => Assert.Equal(0xFF00FF00u, k.Custom.TypingTextColor));
+        }
+
+        [Fact]
+        public void KeystrokeStyle_CustomAfterAPresetStartsFromThatPresetEvenAfterEdits()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+            var editor = vm.KeystrokeStyle;
+
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+            KeyColorRow(vm, "Key top").Hex = "#FFABCDEF";
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Laptop);
+            editor.SelectedTheme = ThemeOption("teal");
+
+            // the Custom tile previews what picking it would start from: the preset on screen
+            Assert.Equal(KeystrokeStyles.Preset(KeystrokeStyles.Laptop, "teal"), editor.CustomTileLook);
+
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+            var seeded = KeystrokeStyles.Preset(KeystrokeStyles.Laptop, "teal");
+            Assert.All(KeyboardItems(session), k => Assert.Equal(seeded, k.Custom));
+            Assert.Equal($"#{seeded.KeyTopColor:X8}", KeyColorRow(vm, "Key top").Hex);
+        }
+
+        [Fact]
+        public void KeystrokeStyle_UneditedCustomReseedsFromTheNextPreset()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+            var editor = vm.KeystrokeStyle;
+
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Simple);
+            editor.SelectedTheme = ThemeOption("blue");
+            Assert.Equal(KeystrokeStyles.Preset(KeystrokeStyles.Simple, "blue"), editor.CustomTileLook);
+
+            editor.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+            Assert.All(KeyboardItems(session), k =>
+                Assert.Equal(KeystrokeStyles.Preset(KeystrokeStyles.Simple, "blue"), k.Custom));
+        }
+
+        [Fact]
+        public void KeystrokeStyle_ASpinnerDragIsOneUndoEntry()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+            vm.KeystrokeStyle.SelectedStyle = StyleOption(KeystrokeStyles.Custom);
+            var seeded = ((KeyboardContent)Live(session, keys.Id).Content).Custom.Drop;
+
+            NumberRow(vm, "Offset").Value = 0.11;
+            NumberRow(vm, "Offset").Value = 0.12;
+            NumberRow(vm, "Offset").Value = 0.13;
+            Assert.All(KeyboardItems(session), k => Assert.Equal(0.13, k.Custom.Drop));
+
+            session.Undo();
+
+            // the whole drag went, and the picker re-read what undo put back
+            Assert.All(KeyboardItems(session), k => Assert.Equal(seeded, k.Custom.Drop));
+            Assert.Equal(seeded, NumberRow(vm, "Offset").Value);
+            Assert.True(vm.KeystrokeStyle.IsCustom);
+
+            session.Undo();
+            Assert.All(KeyboardItems(session), k => Assert.Equal(KeystrokeStyles.Default, k.Style));
+            Assert.True(vm.KeystrokeStyle.IsPreset);
+        }
+
+        [Fact]
+        public void KeystrokeStyle_IgnoresPicksWithNothingToEdit()
+        {
+            var (session, vm) = NewInspector(out var screen);
+            session.AddKeyboardTrack();
+            session.Select(screen.Id);
+
+            Assert.False(vm.KeystrokeStyle.HasTarget);
+            vm.KeystrokeStyle.SelectedStyle = StyleOption(KeystrokeStyles.Simple);
+            NumberRow(vm, "Offset").Value = 0.3;
+
+            Assert.Equal(KeystrokeStyles.Default, vm.KeystrokeStyle.SelectedStyle.Value);
+            Assert.All(KeyboardItems(session), k =>
+            {
+                Assert.Equal(KeystrokeStyles.Default, k.Style);
+                Assert.Null(k.Custom);
+            });
+        }
+
+        [Fact]
+        public void KeyboardSpinners_ClampToTheModelsRanges()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            vm.KeyboardFontSize = 5000;
+            vm.KeyboardLingerMs = 99_999;
+            vm.KeyboardPauseBreakMs = Double.NaN;
+
+            Assert.Equal(SelectedItemViewModel.MaxKeyboardFontSize, vm.KeyboardFontSize);
+            Assert.Equal(SelectedItemViewModel.MaxKeyboardMs, vm.KeyboardLingerMs);
+            Assert.Equal(0, vm.KeyboardPauseBreakMs);
+
+            var content = (KeyboardContent)Live(session, keys.Id).Content;
+            Assert.Equal(SelectedItemViewModel.MaxKeyboardFontSize, content.FontSize);
+            Assert.Equal((int)SelectedItemViewModel.MaxKeyboardMs, content.LingerMs);
+            Assert.Equal(0, content.PauseBreakMs);
+        }
+
+        [Fact]
+        public void KeyboardPlacement_StillWritesTheTransform()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            vm.PositionY = 0.7;
+            vm.Scale = 0.8;
+
+            var transform = Live(session, keys.Id).Transform;
+            Assert.Equal(0.7, transform.Y);
+            Assert.Equal(0.8, transform.Scale);
+        }
+
+        [Fact]
+        public void KeyboardSection_ReReadsAChangeFromElsewhere()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            session.EditItem(keys.Id, i =>
+            {
+                var content = (KeyboardContent)i.Content;
+                content.FontSize = 64;
+                content.LingerMs = 111;
+                content.PauseBreakMs = 333;
+                KeystrokeStyles.SelectStyle(content, KeystrokeStyles.Custom);
+                content.Custom.TypingTextColor = 0xFF010203;
+                content.Custom.TypingTrackColor = 0x11223344;
+            }, "test", structural: false, origin: new object());
+
+            Assert.Equal(64, vm.KeyboardFontSize);
+            Assert.Equal(111, vm.KeyboardLingerMs);
+            Assert.Equal(333, vm.KeyboardPauseBreakMs);
+            Assert.True(vm.KeystrokeStyle.IsCustom);
+            Assert.Equal("#FF010203", TypingColorRow(vm, "Text").Hex);
+            Assert.Equal("#11223344", TypingColorRow(vm, "Track").Hex);
+        }
+
+        /// <summary>The animation section stays on for a keystroke overlay — it is what animates
+        /// each row — and the factory's defaults are the ones the user sees.</summary>
+        [Fact]
+        public void KeyboardRows_ArriveWithTheFactorysRowAnimation()
+        {
+            var (session, vm) = NewInspector(out _);
+            var keys = session.AddKeyboardTrack();
+            session.Select(keys.Id);
+
+            Assert.True(vm.ShowTransitions);
+            Assert.Equal(TransitionKind.SlideUp, vm.EntryKind);
+            Assert.Equal(TransitionKind.Fade, vm.ExitKind);
+            Assert.Equal(300, vm.EntryDurationMs);
+            Assert.Equal(300, vm.ExitDurationMs);
+
+            // transitions are per item, not per overlay row — the same rule every other item
+            // kind's animation follows, and the only keystroke editor that does not fan out
+            vm.EntryKind = TransitionKind.Fade;
+            Assert.Equal(TransitionKind.Fade, Live(session, keys.Id).Entry.Kind);
+        }
+
+        // ------------------------------------------------------------------------------- options
+
+        [Fact]
+        public void OptionLists_MirrorTheModelsOwnValues()
+        {
+            Assert.Equal(CursorContent.Styles.ToArray(),
+                SelectedItemViewModel.CursorStyleOptions.Select(o => o.Value).ToArray());
+            Assert.Equal(CursorContent.ClickAnimations.ToArray(),
+                SelectedItemViewModel.ClickAnimationOptions.Select(o => o.Value).ToArray());
+
+            // the tile pickers select by reference, so the defaults must be list members
+            Assert.Contains(SelectedItemViewModel.DefaultCursorStyleOption, SelectedItemViewModel.CursorStyleOptions);
+            Assert.Contains(SelectedItemViewModel.DefaultClickAnimationOption, SelectedItemViewModel.ClickAnimationOptions);
+            Assert.Equal("vision", SelectedItemViewModel.DefaultCursorStyleOption.Value);
+            Assert.Equal("none", SelectedItemViewModel.DefaultClickAnimationOption.Value);
+            Assert.Equal("Vision", SelectedItemViewModel.DefaultCursorStyleOption.Label);
+            Assert.Equal("None", SelectedItemViewModel.CursorStyleOptions[0].Label);
+            Assert.Equal("Native", SelectedItemViewModel.CursorStyleOptions[1].Label);
+
+            // every themed style tile draws real artwork; none (the ban sign) and native (the
+            // recorded sprite / outline stand-in) are the two the asset table has nothing for
+            Assert.All(SelectedItemViewModel.CursorStyleOptions, o =>
+                Assert.Equal(o.Value == SelectedItemViewModel.NativeCursorStyle
+                        || o.Value == SelectedItemViewModel.NoneCursorStyle,
+                    CursorAssets.TryGet(o.Value, CursorAssets.KindArrow) == null));
+
+            // the highlight tiles animate off ClickHighlight: "none" is the one that never does
+            Assert.Equal(new[] { "None", "Ripple", "Pulse", "Ring", "Pressure" },
+                SelectedItemViewModel.ClickAnimationOptions.Select(o => o.Label).ToArray());
+            Assert.All(SelectedItemViewModel.ClickAnimationOptions, o =>
+                Assert.Equal(o.Value != "none", ClickHighlight.TryParse(o.Value, out _)));
+        }
+
+        [Fact]
+        public void CursorStyleGetter_IsTheSingletonTheDropdownOffers()
+        {
+            var (session, vm) = NewInspector(out _);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+
+            Assert.Same(SelectedItemViewModel.DefaultCursorStyleOption, vm.CursorStyle);
+            Assert.Same(SelectedItemViewModel.DefaultClickAnimationOption, vm.CursorClickAnimation);
+        }
+
+        // ------------------------------------------------------------------------------- writes
+
+        [Fact]
+        public void CursorWrites_AreIgnoredWhenSomethingElseIsSelected()
+        {
+            var (session, vm) = NewInspector(out var screen);
+            var cursor = session.AddCursorTrack();
+            session.Select(cursor.Id);
+            session.Select(screen.Id);
+
+            // the section's bindings stay live while it is hidden: a stale write must find nothing
+            // to do rather than reach the screen item under the selection
+            vm.CursorSize = 2.5;
+            vm.KeyboardFontSize = 64;
+
+            Assert.All(CursorItems(session), c => Assert.Equal(1.0, c.Size));
+            Assert.IsType<MediaContent>(Live(session, screen.Id).Content);
+        }
+    }
+}

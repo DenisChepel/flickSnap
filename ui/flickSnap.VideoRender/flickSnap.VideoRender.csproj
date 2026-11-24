@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>flickSnap.VideoRender</AssemblyName>
+    <RootNamespace>FlickSnap.VideoRender</RootNamespace>
+    <!-- The tool speaks a fixed ASCII line protocol on stdout and parses invariant JSON; no
+         culture data is involved. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <NoWarn>$(NoWarn);CA2007</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- IpcChild: the child side of the job protocol -->
+    <ProjectReference Include="..\flickSnap.Ipc\flickSnap.Ipc.csproj" />
+    <ProjectReference Include="..\flickSnap.VideoSDK\flickSnap.VideoSDK.csproj" />
+  </ItemGroup>
+</Project>

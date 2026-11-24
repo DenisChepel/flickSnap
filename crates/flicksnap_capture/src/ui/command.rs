@@ -1,0 +1,60 @@
+//! Shared vocabulary of commands a component can emit to request
+//! app-level behavior.
+//!
+//! This is the *only* type-specific coupling between components and the
+//! app: a component turns a user interaction (button click, key press,
+//! …) into a `Command` variant; the app matches on it and performs the
+//! effect. Any component can emit any command — they're not owned by
+//! a specific component.
+//!
+//! Adding a new command = add a variant here + one arm in the app's
+//! command dispatcher.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// Upload the current selection.
+    Upload,
+    /// Open the selection in the editor.
+    Edit,
+    /// Start video capture on the current selection.
+    Video,
+    /// Start mirroring the current selection into a shareable window.
+    /// Emitted only by `--share` mode's auto-dispatch — no panel button
+    /// carries it, exactly as `--video` mode reaches `Video` without one
+    /// when the shell launched the overlay for a recording region.
+    Share,
+    /// Enter scroll-point pick mode for the current selection: the next
+    /// click inside it hands the region + point off to the scrolling
+    /// capture driver.
+    ScrollCapture,
+    /// Run OCR over the current selection and lift the recognized lines
+    /// off the desktop.
+    Ocr,
+    /// Hand the selection to the shell for a reverse image search: the
+    /// shell posts the cropped image to the search engine and opens the
+    /// results page in the browser.
+    SearchImage,
+    /// Copy the recognized text to the clipboard.
+    OcrCopy,
+    /// Open a web search for the recognized text.
+    OcrSearch,
+    /// Upload the recognized text as a paste.
+    OcrUpload,
+    /// Leave OCR mode and return to the capture panel, keeping the
+    /// selection.
+    OcrBack,
+    /// Leave scroll-point pick mode and return to the capture panel,
+    /// keeping the selection. The keyboard twin of Escape in that mode.
+    ScrollBack,
+    /// Copy the selection to the clipboard.
+    Copy,
+    /// Save the selection to a file.
+    Save,
+    /// Report the pixel color under the cursor to the shell (H in
+    /// crosshair mode, before a selection exists).
+    SelectColor,
+    /// Reset the current selection (return to draw mode).
+    Reset,
+    /// Exit the capture tool.
+    Exit,
+}

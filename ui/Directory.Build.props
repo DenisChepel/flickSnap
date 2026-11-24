@@ -1,0 +1,22 @@
+﻿<Project>
+  <PropertyGroup>
+    <DebugType>embedded</DebugType>
+    <Product>flickSnap</Product>
+    <Title>flickSnap</Title>
+    <AssemblyTitle>flickSnap</AssemblyTitle>
+    <!-- Keep the full product name in generated build-marker filenames. -->
+    <MSBuildCopyMarkerName>$(MSBuildProjectName).Up2Date</MSBuildCopyMarkerName>
+    <!-- The single source of truth for SkiaSharp across ui/. Must equal the version
+         Avalonia.Skia resolves in FlickSnap.Ui (currently Avalonia 12.1.5 -> SkiaSharp 3.119.4)
+         so the app loads exactly one native Skia. FlickSnap.Ui has a build check
+         (VerifySkiaSharpMatchesAvalonia) that fails when an Avalonia upgrade drifts from
+         this pin - update it here when that fires. -->
+    <SkiaSharpVersion>3.119.4</SkiaSharpVersion>
+  </PropertyGroup>
+  <!-- Version stamping for all UI assemblies comes from nbgv (version.json at repo root):
+       major.minor is its "version", patch = git height since that version was last set
+       (shifted by its versionHeightOffset). -->
+  <ItemGroup>
+    <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.94" PrivateAssets="all" />
+  </ItemGroup>
+</Project>

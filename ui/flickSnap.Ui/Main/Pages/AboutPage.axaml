@@ -1,0 +1,179 @@
+<UserControl
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:FlickSnap.UI.Controls"
+    x:Class="FlickSnap.UI.Pages.AboutPage">
+
+    <UserControl.Styles>
+        <!-- Flat, full-width clickable row for a single open-source dependency. UserControl-level
+             styles override the Semi Button ControlTheme, so the row reads as a list entry with a
+             subtle hover fill rather than a filled button. -->
+        <Style Selector="Button.CreditRow">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="8,5" />
+            <Setter Property="CornerRadius" Value="4" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Cursor" Value="Hand" />
+        </Style>
+        <Style Selector="Button.CreditRow /template/ ContentPresenter">
+            <Setter Property="Background" Value="Transparent" />
+        </Style>
+        <Style Selector="Button.CreditRow:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource SemiColorFill0}" />
+        </Style>
+        <Style Selector="Button.CreditRow:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource SemiColorFill1}" />
+        </Style>
+        <!-- Setting/caption rhythm of the settings pages (see SystemSettingsPage), for the
+             Updates group: 24px between settings, 2px between a control and its caption. -->
+        <Style Selector="StackPanel.SettingsGroup">
+            <Setter Property="Spacing" Value="24" />
+        </Style>
+        <Style Selector="StackPanel.Setting">
+            <Setter Property="Spacing" Value="2" />
+        </Style>
+        <Style Selector="StackPanel.SettingRow">
+            <Setter Property="Orientation" Value="Horizontal" />
+            <Setter Property="Spacing" Value="12" />
+        </Style>
+        <Style Selector="TextBlock.Caption">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Opacity" Value="0.65" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="MaxWidth" Value="560" />
+            <Setter Property="HorizontalAlignment" Value="Left" />
+        </Style>
+    </UserControl.Styles>
+
+    <controls:FadeEdgeScrollViewer>
+        <StackPanel Margin="0,0,16,16" Spacing="8">
+            <!-- The logo (app tile + "flickSnap" wordmark, as in the main window's sidebar), larger. -->
+            <StackPanel Orientation="Horizontal" Spacing="14" HorizontalAlignment="Left"
+                        AutomationProperties.Name="flickSnap">
+                <Image Width="60" Height="60" Source="avares://flickSnap/Assets/flicksnap-logo.png"
+                       RenderOptions.BitmapInterpolationMode="HighQuality" />
+                <TextBlock Classes="FlickSnapWordmark" FontSize="40" VerticalAlignment="Center" Text="flickSnap" />
+            </StackPanel>
+
+            <TextBlock Classes="Base" Text="{Binding FlickSnapVersion}" />
+
+            <!-- Moved here from the System page. DataContext is SettingsGeneral (set in the
+                 code-behind), where the update options are persisted. The version itself is the
+                 line above, so the group does not repeat it. -->
+            <HeaderedContentControl x:Name="UpdatesGroup"
+                                    Header="Updates"
+                                    Margin="0,8"
+                                    Theme="{StaticResource GroupBox}">
+                <StackPanel Classes="SettingsGroup">
+                    <StackPanel Classes="Setting" Spacing="8">
+                        <StackPanel Classes="SettingRow">
+                            <Button x:Name="UpdateButton" Content="Check for Updates" Click="OnUpdateButtonClick" />
+                            <ProgressBar x:Name="UpdateProgress"
+                                         Width="180"
+                                         VerticalAlignment="Center"
+                                         Minimum="0" Maximum="100"
+                                         IsVisible="False" />
+                        </StackPanel>
+                        <TextBlock x:Name="UpdateStatusText" Classes="Caption" />
+                    </StackPanel>
+
+                    <StackPanel Classes="Setting" Spacing="8">
+                        <CheckBox x:Name="AutoDownloadCheck" IsChecked="{Binding AutoDownloadUpdates}">
+                            <TextBlock Text="Automatically check for and download updates" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <StackPanel Classes="SettingRow" IsEnabled="{Binding AutoDownloadUpdates}">
+                            <TextBlock VerticalAlignment="Center" Text="Check" />
+                            <ComboBox x:Name="UpdateIntervalCombo" MinWidth="160" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <StackPanel Classes="Setting">
+                        <CheckBox x:Name="AutoApplyCheck" IsChecked="{Binding AutoApplyUpdates}">
+                            <TextBlock Text="Automatically restart flickSnap to apply updates in the background"
+                                       TextWrapping="Wrap" />
+                        </CheckBox>
+                        <TextBlock Classes="Caption"
+                                   Text="Only restarts after 10 minutes of inactivity, never during a capture, recording or upload." />
+                    </StackPanel>
+
+                    <StackPanel x:Name="PrereleaseSection" Classes="Setting">
+                        <CheckBox x:Name="PrereleaseCheck" IsChecked="{Binding IncludePrereleaseUpdates}">
+                            <TextBlock Text="Opt in to experimental builds" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <TextBlock x:Name="PrereleaseHelpText" Classes="Caption"
+                                   Text="Experimental builds get new features first but may have more bugs." />
+                    </StackPanel>
+                </StackPanel>
+            </HeaderedContentControl>
+
+            <!-- The GPL's "Appropriate Legal Notices" (GPL-3.0 section 0 and 5d): copyright,
+                 no warranty, the license and how to view it. Section 5d obliges modified versions
+                 to keep displaying them, and NOTICE term 1 (section 7(b)) requires a fork to add
+                 "Based on Prisc by Caelan Sayler" here, and term 2 to say it is not the original.
+                 Keep in step with the repository NOTICE. -->
+            <TextBlock Classes="Body" TextWrapping="Wrap" FontWeight="SemiBold"
+                       Text="Based on Prisc by Caelan Sayler (https://github.com/priscapp/Prisc)" />
+            <TextBlock Classes="Body" TextWrapping="Wrap"
+                       Text="flickSnap is a modified version of Prisc maintained by Denis Chepel. It is not the original Prisc, and is not made, endorsed or supported by Caelan Sayler." />
+            <TextBlock Classes="Body" TextWrapping="Wrap"
+                       Text="Copyright © 2014–2026 Caelan Sayler. Modifications copyright © 2026 Denis Chepel." />
+            <TextBlock Classes="Body" TextWrapping="Wrap"
+                       Text="flickSnap is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version, together with the additional terms in the NOTICE file." />
+            <TextBlock Classes="Body" TextWrapping="Wrap"
+                       Text="flickSnap is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details." />
+            <TextBlock Classes="Body" TextWrapping="Wrap"
+                       Text="“Prisc” and the Prisc logo are trademarks of Caelan Sayler and are not licensed under the GNU General Public License; flickSnap does not use them." />
+
+            <StackPanel Orientation="Horizontal" Spacing="16">
+                <HyperlinkButton Padding="0" Content="License" NavigateUri="https://github.com/DenisChepel/flickSnap/blob/main/LICENSE" />
+                <HyperlinkButton Padding="0" Content="Additional terms" NavigateUri="https://github.com/DenisChepel/flickSnap/blob/main/NOTICE" />
+                <HyperlinkButton Padding="0" Content="Source code" NavigateUri="https://github.com/DenisChepel/flickSnap" />
+            </StackPanel>
+
+            <TextBlock Classes="Body"
+                       Text="flickSnap is made possible in part by these open source projects." />
+
+            <!-- One section per component (UI / capture engine); rows are generated from
+                 Assets/credits.json — regenerate with tools/gen-credits.sh. -->
+            <ItemsControl ItemsSource="{Binding Sections}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <StackPanel Margin="0,8,0,0">
+                            <TextBlock Classes="Base" Margin="0,0,0,2" Text="{Binding Title}" />
+                            <ItemsControl ItemsSource="{Binding Items}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Button Classes="CreditRow" Command="{Binding OpenCommand}">
+                                            <Grid ColumnDefinitions="*,Auto">
+                                                <StackPanel Grid.Column="0"
+                                                            Orientation="Horizontal"
+                                                            VerticalAlignment="Center">
+                                                    <TextBlock Classes="Body" Text="{Binding Name}" />
+                                                    <TextBlock Classes="Body"
+                                                               Margin="8,0,0,0"
+                                                               Opacity="0.4"
+                                                               Text="{Binding Version}" />
+                                                </StackPanel>
+                                                <TextBlock Grid.Column="1"
+                                                           Classes="Body"
+                                                           VerticalAlignment="Center"
+                                                           Opacity="0.55"
+                                                           Text="{Binding License}" />
+                                            </Grid>
+                                        </Button>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <TextBlock Classes="Body"
+                       Margin="0,8,0,0"
+                       Text="Missed your project in this list? Feel free to reach out through our GitHub." />
+        </StackPanel>
+    </controls:FadeEdgeScrollViewer>
+</UserControl>

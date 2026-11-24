@@ -1,0 +1,82 @@
+[package]
+name = "flicksnap_obs_platform"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# The window list, monitors and cursor (flicksnap_desktop), shared with the
+# overlay and the scrolling driver. Not flicksnap_telemetry: the helper binaries add it
+# themselves, off Linux only (HELPER_PROTOCOL.md §3.4).
+flicksnap_desktop = { workspace = true }
+flicksnap_shared = { workspace = true }
+# The physical mouse-button state for the input-capture frame rows, shared with the hook.
+flicksnap_platform = { workspace = true }
+flicksnap_obs = { workspace = true }
+flicksnap_obs_sys = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# The window list, monitors, DXGI outputs and cursor reads come through
+# flicksnap_desktop, which declares its own features.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    # Stock cursor handles (LoadCursorW) for the cursor classifier.
+    "Win32_UI_WindowsAndMessaging",
+    # SetProcessDpiAwarenessContext (init_process).
+    "Win32_UI_HiDpi",
+    # GetAsyncKeyState: mouse button state for the input-capture frame rows.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # GetModuleHandleW + GetProcAddress: user32's undocumented
+    # GetCursorFrameInfo, the animated-cursor step probe.
+    "Win32_System_LibraryLoader",
+    # ExitProcess (exit_process).
+    "Win32_System_Threading",
+    # RtlGetVersion + OSVERSIONINFOW: the real OS build number, used to resolve
+    # --capture-method auto to WGC on Windows 11+ (resolve_capture_method).
+    # GetVersionExW/VerifyVersionInfoW report a manifest-shimmed version
+    # instead, so ntdll's is the only usable one.
+    "Wdk_System_SystemServices",
+    "Win32_System_SystemInformation",
+    # CoInitializeEx / CoCreateInstance + IMMDeviceEnumerator/IAudioEndpointVolume:
+    # --speaker-volume-compensation endpoint-volume query (replaces the
+    # hand-rolled COM vtables that windows-sys required).
+    "Win32_System_Com",
+    # IMMDevice::Activate's PROPVARIANT activation-params argument lives behind
+    # these two gates in the generated bindings (we always pass None).
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+# Cursor classification and sprite capture (macos.rs cursor_shape): the stock
+# NSCursor set, the representation ladder, and the PNG encode via
+# representationUsingType:properties:. NSApplication is bootstrapped because
+# +[NSCursor arrowCursor] returns nil without one.
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSResponder",
+    "NSCursor",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    # Methods taking CGFloat / NSSize are cfg-gated on this in the generated
+    # bindings.
+    "objc2-core-foundation",
+] }
+# Mouse button state (CGEventSourceButtonState) and CGCursorIsVisible:
+# deprecated since 10.9 but still the only public answer; its binding needs
+# `libc` (boolean_t return).
+objc2-core-graphics = { workspace = true, features = ["CGEventSource", "CGEventTypes", "CGRemoteOperation", "libc"] }
+# The cursor hash (TIFF NSData bytes) and the sprite PNG encode (NSData plus the
+# empty properties NSDictionary it takes; the representation list is an
+# NSArray).
+objc2-foundation = { workspace = true, features = ["NSArray", "NSData", "NSDictionary", "NSGeometry", "NSString"] }
+
+[build-dependencies]
+flicksnap_build_support = { workspace = true }

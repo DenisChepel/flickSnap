@@ -1,0 +1,19 @@
+target/
+.idea/
+.vs/
+x64/
+bin/
+.vscode/
+.claude/
+obj/
+bin/
+.DS_Store
+build/
+.wrangler/
+
+# obs writes its game-capture compatibility data into the cwd when launched
+win-capture/
+
+# a generator under tools/ that imports a sibling module leaves a bytecode cache
+# next to the committed scripts
+__pycache__/

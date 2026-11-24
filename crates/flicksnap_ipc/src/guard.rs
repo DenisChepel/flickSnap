@@ -1,0 +1,278 @@
+//! The stdout guard (HELPER_PROTOCOL.md §3.2): the protocol pipe becomes a private handle only
+//! the channel writes to, and everything else that reaches fd 1 goes to stderr.
+//!
+//! The rule that stdout carries protocol lines and nothing else is one our own code keeps
+//! easily and native libraries do not keep at all: libobs, FFmpeg, CoreML and ONNX Runtime all
+//! print to fd 1 through the C runtime, at moments of their own choosing (CoreML's model
+//! compilation complaints once landed in the middle of a flicksnap_ai matte frame). There is no way
+//! to ask them to stop, so the pipe simply stops being reachable through fd 1.
+
+use std::fs::File;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The private protocol handle [`claim`] returns, and whether the fd 1 redirect took.
+#[derive(Debug)]
+pub struct ClaimedStdout {
+    /// A non-inheritable duplicate of the real stdout: the only way left to reach the pipe.
+    pub file: File,
+    /// Whether fd 1 now points at stderr: `dup2(2, 1)` on Unix; on Windows `SetStdHandle` and,
+    /// when the process has loaded the UCRT, its `_dup2(2, 1)`. A failure was already logged to
+    /// stderr, and stdout then still reaches the pipe, which is how a helper behaved before the
+    /// guard existed.
+    pub redirected: bool,
+}
+
+/// Set by the first [`claim`] that duplicated stdout. A second claim would duplicate what fd 1
+/// points at by then, which is stderr, so it is refused instead.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Duplicates the real stdout into a private handle, then points fd 1 (and on Windows the
+/// process's `STD_OUTPUT_HANDLE`) at stderr. Returns the private handle.
+///
+/// The duplicate is made with std's `try_clone_to_owned`, so it is never inheritable
+/// (`F_DUPFD_CLOEXEC` on Unix, `DuplicateHandle` without inheritance on Windows). An inheritable
+/// one would leak into every grandchild (obs-ffmpeg-mux, flicksnap_ai, a browser), and the parent's
+/// stdout pump would never see EOF while any of them lived.
+///
+/// Call it before any native library is initialised or called. A failure to redirect fd 1 is
+/// logged, not returned: stdout then still reaches the pipe, which is exactly how the helper
+/// behaved before the guard existed. Once per process: a second call is
+/// [`io::ErrorKind::AlreadyExists`] (see [`claim`]).
+pub fn claim_stdout() -> io::Result<File> {
+    claim().map(|claimed| claimed.file)
+}
+
+/// [`claim_stdout`], also reporting whether the redirect took. The one implementation of the
+/// guard: the Rust helpers reach it through [`claim_stdout`] and `open`, the C# helpers through
+/// flicksnap_interop's `flicksnap_ipc_claim_stdout`.
+///
+/// Once per process: a second call answers [`io::ErrorKind::AlreadyExists`] and changes
+/// nothing. A failed duplicate changes nothing either, and may be retried.
+pub fn claim() -> io::Result<ClaimedStdout> {
+    if CLAIMED.swap(true, Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "stdout was already claimed by this process",
+        ));
+    }
+    let file = match duplicate_stdout() {
+        Ok(file) => file,
+        Err(e) => {
+            CLAIMED.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    let redirected = redirect_stdout_to_stderr();
+    Ok(ClaimedStdout {
+        file,
+        redirected,
+    })
+}
+
+#[cfg(unix)]
+fn duplicate_stdout() -> io::Result<File> {
+    use std::os::fd::AsFd;
+    Ok(File::from(io::stdout().as_fd().try_clone_to_owned()?))
+}
+
+#[cfg(unix)]
+fn redirect_stdout_to_stderr() -> bool {
+    // SAFETY: a plain descriptor-table edit. dup2 closes the old fd 1, the pipe, but the
+    // duplicate above already holds it open, so nothing the parent reads from is released.
+    if unsafe { libc::dup2(2, 1) } < 0 {
+        crate::log!(
+            "flicksnap_ipc: could not point stdout at stderr ({}); a native library printing to stdout would corrupt the \
+             protocol",
+            io::Error::last_os_error()
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn duplicate_stdout() -> io::Result<File> {
+    use std::os::windows::io::AsHandle;
+    Ok(File::from(
+        io::stdout()
+            .as_handle()
+            .try_clone_to_owned()?,
+    ))
+}
+
+/// The original pipe handle came in through STARTUPINFO and is inheritable, so first its
+/// inherit flag is cleared: the UCRT `_dup2` below is the only thing that closes it, and that
+/// step is skipped in a static-CRT process that never loads `ucrtbase.dll`. Left inheritable,
+/// it would reach every grandchild spawned with handle inheritance (std's `Command` among them).
+///
+/// Then `SetStdHandle` moves what `GetStdHandle` returns (Rust's own `println!`, and anything
+/// else that asks the OS), and the shared UCRT's `_dup2(2, 1)` moves the C runtime's fd 1, which
+/// native `printf` writes to. The last step assumes every native library shares the dynamic
+/// UCRT (`ucrtbase.dll`); a library with its own CRT keeps the old handle value in its own fd
+/// table (§3.2).
+#[cfg(windows)]
+fn redirect_stdout_to_stderr() -> bool {
+    use windows::core::{s, w};
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    // SAFETY: a flag change on this process's own standard output handle, which
+    // duplicate_stdout has just proved valid.
+    let uninherited =
+        unsafe { GetStdHandle(STD_OUTPUT_HANDLE).and_then(|stdout| SetHandleInformation(stdout, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))) };
+    if let Err(e) = uninherited {
+        crate::log!("flicksnap_ipc: could not make the original stdout handle non-inheritable ({e})");
+    }
+
+    // SAFETY: handle-table edits on this process's own standard handles.
+    let redirected = unsafe { GetStdHandle(STD_ERROR_HANDLE).and_then(|stderr| SetStdHandle(STD_OUTPUT_HANDLE, stderr)) };
+    if let Err(e) = &redirected {
+        crate::log!("flicksnap_ipc: could not point STD_OUTPUT_HANDLE at stderr ({e})");
+    }
+    let std_handle_moved = redirected.is_ok();
+
+    // Only when something already loaded the UCRT: a process without it has no CRT fd 1 a
+    // native library could print through. The binaries themselves link the CRT statically, and
+    // no native code of ours prints through that copy.
+    // SAFETY: looking up an export of an already-loaded module; the signature is `_dup2`'s.
+    let crt_fd_moved = unsafe {
+        let Ok(ucrt) = GetModuleHandleW(w!("ucrtbase.dll")) else {
+            return std_handle_moved;
+        };
+        let Some(dup2) = GetProcAddress(ucrt, s!("_dup2")) else {
+            return std_handle_moved;
+        };
+        let dup2: unsafe extern "C" fn(i32, i32) -> i32 = std::mem::transmute(dup2);
+        let moved = dup2(2, 1) == 0;
+        if !moved {
+            crate::log!("flicksnap_ipc: the UCRT's _dup2(2, 1) failed; native stdout output is not redirected");
+        }
+        moved
+    };
+    std_handle_moved && crt_fd_moved
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ROLE_VAR: &str = "FLICKSNAP_IPC_GUARD_TEST_ROLE";
+    const GRANDCHILD_LIFETIME: Duration = Duration::from_secs(4);
+
+    /// Re-runs this test binary as `role`, executing only the test named `test`.
+    fn self_command(test: &str, role: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ROLE_VAR, role);
+        command
+    }
+
+    /// The child: claims stdout, writes one line through the private handle, starts a
+    /// grandchild with default (inherited) stdio that outlives it, and exits at once.
+    #[test]
+    fn guard_child_role() {
+        match std::env::var(ROLE_VAR).as_deref() {
+            Ok("child") => {
+                let claimed = super::claim().unwrap();
+                let mut private = claimed.file;
+                private.write_all(b"PROTOCOL\n").unwrap();
+                writeln!(private, "REDIRECTED {}", claimed.redirected).unwrap();
+                // Once per process: the second claim changes nothing and says so.
+                let second = super::claim_stdout()
+                    .map(drop)
+                    .map_err(|e| e.kind());
+                writeln!(private, "SECOND {second:?}").unwrap();
+                // Through fd 1, which now goes to stderr.
+                println!("STRAY");
+                self_command("guard::tests::guard_child_role", "grandchild")
+                    .spawn()
+                    .unwrap();
+                std::process::exit(0);
+            }
+            Ok("grandchild") => std::thread::sleep(GRANDCHILD_LIFETIME),
+            _ => {}
+        }
+    }
+
+    /// The child for the retry test: a claim made while fd 1 is closed fails with EBADF and
+    /// leaves the latch open, so the claim after fd 1 is back succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn guard_retry_child_role() {
+        if std::env::var(ROLE_VAR).as_deref() != Ok("retry") {
+            return;
+        }
+        // SAFETY: descriptor-table edits on this process's own fd 1, restored before any use.
+        let saved = unsafe { libc::dup(1) };
+        assert!(saved >= 0, "dup(1): {}", std::io::Error::last_os_error());
+        assert_eq!(unsafe { libc::close(1) }, 0);
+        let first = super::claim()
+            .map(drop)
+            .map_err(|e| (e.kind(), e.raw_os_error()));
+        // SAFETY: as above; fd 1 is free, so dup2 puts the pipe back there.
+        assert_eq!(unsafe { libc::dup2(saved, 1) }, 1);
+        unsafe { libc::close(saved) };
+        let mut private = super::claim()
+            .expect("the claim after a failed duplicate")
+            .file;
+        private.write_all(b"PROTOCOL\n").unwrap();
+        let first = match first {
+            Err((_, Some(code))) if code == libc::EBADF => "EBADF".to_string(),
+            other => format!("{other:?}"),
+        };
+        writeln!(private, "FIRST {first}").unwrap();
+        std::process::exit(0);
+    }
+
+    /// A failed duplicate must not latch the claim: a transient EBADF would otherwise turn every
+    /// later claim (and `flicksnap_ipc::open`) into AlreadyExists.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_claim_can_be_retried() {
+        let output = self_command("guard::tests::guard_retry_child_role", "retry")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "status {:?}; stderr: {stderr}", output.status);
+        assert!(stdout.contains("FIRST EBADF\n"), "stdout: {stdout:?}; stderr: {stderr}");
+        assert!(stdout.contains("PROTOCOL\n"), "stdout: {stdout:?}");
+    }
+
+    /// The private handle must not be inherited: if the grandchild held it, the pipe would stay
+    /// open until the grandchild exits, and the read below would take its whole lifetime.
+    #[test]
+    fn private_stdout_is_not_inherited_and_fd1_goes_to_stderr() {
+        let mut child = self_command("guard::tests::guard_child_role", "child")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        let elapsed = started.elapsed();
+        child.wait().unwrap();
+        assert!(stdout.contains("PROTOCOL\n"), "stdout: {stdout:?}");
+        assert!(stdout.contains("REDIRECTED true\n"), "stdout: {stdout:?}");
+        assert!(stdout.contains("SECOND Err(AlreadyExists)\n"), "stdout: {stdout:?}");
+        assert!(!stdout.contains("STRAY"), "fd 1 still reaches the pipe: {stdout:?}");
+        assert!(
+            elapsed < GRANDCHILD_LIFETIME / 2,
+            "stdout stayed open for {elapsed:?}: the grandchild inherited the private handle"
+        );
+    }
+}

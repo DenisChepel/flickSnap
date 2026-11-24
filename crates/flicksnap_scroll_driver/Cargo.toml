@@ -1,0 +1,44 @@
+[package]
+name = "flicksnap_scroll_driver"
+version = "1.0.0"
+edition = "2021"
+license.workspace = true
+
+# The second half of a scrolling capture: the overlay picks the region and scroll point,
+# this binary scrolls, photographs and stitches. Kept out of the capturer because starting a
+# window or GPU here would put pixels in front of the very content it is about to photograph.
+
+# image, euclid and sentry reach this crate through flicksnap_shared and flicksnap_telemetry and are not named directly.
+[dependencies]
+flicksnap_ipc.workspace = true
+# The permission preflight and the Esc poll (physical key state), shared with the other helpers.
+flicksnap_platform.workspace = true
+flicksnap_desktop.workspace = true
+flicksnap_shared.workspace = true
+flicksnap_telemetry.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+log.workspace = true
+simplelog.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    # SendInput for the wheel injection (input/win.rs); the Esc poll reads flicksnap_platform::input.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # Window resolution, cursor parking, WM_MOUSEWHEEL (input/win.rs).
+    "Win32_UI_WindowsAndMessaging",
+    # The per-monitor-DPI-awareness assertion (input/win.rs::preflight).
+    "Win32_UI_HiDpi",
+    # ScreenToClient (input/win.rs).
+    "Win32_Graphics_Gdi",
+] }
+
+# The macOS half of input: objc2-core-graphics carries the scroll events and the window ids (the
+# window list, cursor warp and frame grab come through flicksnap_desktop, the Esc poll and
+# the Accessibility preflight through flicksnap_platform), and objc2-app-kit provides
+# NSRunningApplication for activation.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation.workspace = true
+objc2-core-graphics = { workspace = true, features = ["CGEvent", "CGEventSource", "CGEventTypes", "CGWindow", "libc"] }
+objc2-app-kit = { workspace = true, features = ["libc"] }

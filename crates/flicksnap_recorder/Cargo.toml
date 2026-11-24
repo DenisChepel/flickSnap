@@ -1,0 +1,56 @@
+[package]
+name = "flicksnap_recorder"
+version = "0.11.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# The helper protocol (crates/flicksnap_capture/HELPER_PROTOCOL.md): stdio channel, commands, lifetime.
+flicksnap_ipc = { workspace = true }
+flicksnap_obs = { workspace = true }
+flicksnap_obs_sys = { workspace = true }
+flicksnap_obs_platform = { workspace = true }
+# The keyboard half of --input-capture: the observe stream of FlickSnap's one keyboard hook
+# (src/input_hook.rs). The mouse hook stays local; flicksnap_hotkeys is keyboard only.
+flicksnap_hotkeys = { workspace = true }
+# The physical key state behind the stranded-key release (src/input_hook.rs), shared with the hook.
+flicksnap_platform = { workspace = true }
+# The pure shared logic (crf mapping, contracts) on every OS, Linux included. flicksnap_telemetry
+# is added off Linux below.
+flicksnap_shared = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+# PNG encoding of the cursor_image sprite planes (cursor_sprite.rs).
+image = { workspace = true, features = ["png"] }
+libc = { workspace = true }
+
+# Sentry: panics and release-health sessions, one project with the rest of FlickSnap. Not on
+# Linux, where the recorder is built in the manylinux image without the sentry/TLS tree
+# (HELPER_PROTOCOL.md §3.4).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+flicksnap_telemetry = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Only what this crate's own Windows code uses; the platform layer's features are
+# declared in flicksnap_obs_platform.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    # The mouse hook (input_hook.rs): SetWindowsHookExW, its message loop and
+    # GetCurrentThreadId for the shutdown PostThreadMessageW.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The input hook (input_hook.rs): the event tap's CFMachPort + run-loop plumbing;
+# CFDate gates CFRunLoopRunInMode (CFTimeInterval lives in CFDate.h).
+objc2-core-foundation = { workspace = true, features = ["CFMachPort", "CFRunLoop", "CFDate"] }
+objc2-core-graphics = { workspace = true, features = ["CGEvent", "CGEventSource", "CGEventTypes"] }
+
+[build-dependencies]
+# Linux: stages the shared FFmpeg bundle (and, for flicksnap_recorder, libobs + plugins)
+# next to the binary with $ORIGIN RUNPATHs.
+flicksnap_build_support = { workspace = true }

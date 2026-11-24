@@ -1,0 +1,335 @@
+name: Release
+
+# Publishes a completed CI run to GitHub Releases via Velopack, one job per rid, each
+# rid mapping to a Velopack channel that UpdateService follows.
+# A pre-release differs from a stable release only by the flag on the GitHub release, so
+# unticking it on github.com promotes the release with no re-publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "CI run id to publish (must have package + version artifacts)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release (opt-in users only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+  # OIDC token for azure/login.
+  id-token: write
+
+jobs:
+  # Creates the draft up-front so that concurrent vpk jobs cannot each miss the others' in-flight release and create duplicates.
+  draft:
+    name: create draft
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.create.outputs.version }}
+      tag: ${{ steps.create.outputs.tag }}
+      from_sha: ${{ steps.range.outputs.from_sha }}
+      to_sha: ${{ steps.range.outputs.to_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # Only needed to turn the previous release's tag into a commit for the notes range.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Create draft release
+        id: create
+        run: |
+          gh run download ${{ inputs.run_id }} --repo ${{ github.repository }} -n version -D version-artifact
+          VERSION=$(tr -d '[:space:]' < version-artifact/version.txt)
+          TAG="$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # A leftover draft is from a failed run, and vpk refuses to merge into a release that already has an index for its channel.
+          if IS_DRAFT=$(gh release view "$TAG" --repo ${{ github.repository }} --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$IS_DRAFT" != "true" ]; then
+              echo "::error::Release $TAG is already published, refusing to overwrite it."
+              exit 1
+            fi
+            echo "Deleting leftover draft release $TAG"
+            gh release delete "$TAG" --repo ${{ github.repository }} --yes
+          fi
+
+          PRE=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then PRE="--prerelease"; fi
+          gh release create "$TAG" --repo ${{ github.repository }} \
+            --draft --title "$TAG" --notes "" $PRE
+          echo "Created draft release $TAG"
+
+      # A pre-release's notes cover only its own build, so the baseline is whatever shipped last.
+      # A stable release's notes cover everything since the last stable, which folds in every
+      # pre-release in between. gh release list is newest first and drafts are excluded, so the
+      # draft created above is never picked as its own baseline.
+      - name: Resolve notes range
+        id: range
+        run: |
+          TO_SHA=$(gh run view "${{ inputs.run_id }}" --repo ${{ github.repository }} --json headSha -q .headSha)
+
+          EXCLUDE=""
+          if [ "${{ inputs.prerelease }}" != "true" ]; then EXCLUDE="--exclude-pre-releases"; fi
+          PREV_TAG=$(gh release list --repo ${{ github.repository }} --exclude-drafts $EXCLUDE \
+            --limit 1 --json tagName -q '.[0].tagName // ""')
+
+          if [ -n "$PREV_TAG" ]; then
+            FROM_SHA=$(git rev-list -n 1 "$PREV_TAG")
+            echo "Previous release $PREV_TAG at $FROM_SHA"
+          else
+            echo "First release. Include history through $TO_SHA."
+            FROM_SHA=""
+          fi
+
+          echo "from_sha=$FROM_SHA" >> "$GITHUB_OUTPUT"
+          echo "to_sha=$TO_SHA" >> "$GITHUB_OUTPUT"
+
+      # Give the release time to become visible to the API the vpk jobs look it up with.
+      - name: Wait for release to settle
+        run: sleep 30
+
+  release:
+    name: release (${{ matrix.rid }})
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-15, not the recorder's macos-26: see build-rust.yml.
+          - rid: win-x64
+            os: windows-latest
+          - rid: win-arm64
+            os: windows-latest
+          - rid: osx-x64
+            os: macos-15
+          - rid: osx-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO_URL: https://github.com/${{ github.repository }}
+      VERSION: ${{ needs.draft.outputs.version }}
+      TAG: ${{ needs.draft.outputs.tag }}
+    steps:
+      # Only needed for the packaging icon.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk
+        shell: bash
+
+      - name: Download build artifacts
+        run: |
+          CHANNEL="${{ matrix.rid }}"
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # The macOS artifact is a zip, which preserves unix file modes.
+            gh run download ${{ inputs.run_id }} --repo ${{ github.repository }} -n flickSnap-${{ matrix.rid }} -D package
+            unzip -q "package/flickSnap-${{ matrix.rid }}.zip" -d publish
+          else
+            gh run download ${{ inputs.run_id }} --repo ${{ github.repository }} -n flickSnap-${{ matrix.rid }} -D publish
+          fi
+          echo "Publishing version $VERSION to channel $CHANNEL"
+        shell: bash
+
+      # Deltas are always built against the newest stable release, the base most installs are actually on; fails harmlessly on a channel's first release.
+      - name: Download previous release (deltas)
+        run: >
+          vpk download github --repoUrl "$REPO_URL" --token "$GH_TOKEN"
+          --channel "$CHANNEL" --pre false -o releases
+          || echo "No previous release found for channel $CHANNEL (first release?)"
+        shell: bash
+
+      - name: Configure Windows signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          $signing = @{
+            Endpoint = $env:AZURE_SIGNING_ENDPOINT
+            CodeSigningAccountName = $env:AZURE_SIGNING_ACCOUNT
+            CertificateProfileName = $env:AZURE_SIGNING_CERTIFICATE_PROFILE
+          }
+          if ($signing.Values.Where({ [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+            throw 'Set AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT and AZURE_SIGNING_CERTIFICATE_PROFILE for this repository.'
+          }
+          $signing | ConvertTo-Json | Set-Content -LiteralPath .github/azure-trusted-sign.json -Encoding utf8
+
+      # vpk authenticates via DefaultAzureCredential, which picks up the CLI session this establishes.
+      - name: Azure login (Trusted Signing)
+        if: runner.os == 'Windows'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # vpk bundles the msix as-is, so it must be signed as a package beforehand; pwsh rather than bash because git-bash mangles signtool's /flag arguments into paths.
+      - name: Sign shell extension MSIX (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # A build from before the shell extension existed has no msix, and the pack below still works without one.
+          if (-not (Test-Path publish/flickSnapShellExt.msix)) {
+            Write-Warning "publish/flickSnapShellExt.msix not found - skipping shell extension signing."
+            exit 0
+          }
+          # The Trusted Signing dlib only ships with vpk, in a signing dir somewhere under its tool
+          # store (.store/vpk/<version>/...), so search the store rather than assume a depth. Only
+          # a dir named signing counts, which skips any per-arch copies (signing/x86, ...), and the
+          # newest vpk version wins by [version], not by a lexical path sort.
+          $store = Join-Path (Split-Path (Get-Command vpk).Source) .store/vpk
+          $dlib = Get-ChildItem $store -Recurse -File -Filter Azure.CodeSigning.Dlib.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq 'signing' } |
+            Sort-Object { $v = [regex]::Match($_.FullName, '[\\/]\.store[\\/]vpk[\\/]([^\\/]+)').Groups[1].Value; try { [version]$v } catch { [version]'0.0' } } |
+            Select-Object -Last 1
+          if (-not $dlib) { Write-Error "Azure.CodeSigning.Dlib.dll not found in a signing dir of vpk's tool store $store"; exit 1 }
+          # signtool: the newest Windows SDK's x64 one (the dlib is x64), else the copy vpk vendors beside the dlib.
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $signtool = Get-ChildItem $sdkBin -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+(\.\d+){3}$' -and (Test-Path (Join-Path $_.FullName x64/signtool.exe)) } |
+            Sort-Object { [version]$_.Name } | Select-Object -Last 1 |
+            ForEach-Object { Join-Path $_.FullName x64/signtool.exe }
+          if (-not $signtool) { $signtool = Join-Path $dlib.DirectoryName signtool.exe }
+          if (-not (Test-Path $signtool)) { Write-Error "signtool.exe not found in the Windows SDK or beside $($dlib.FullName)"; exit 1 }
+          Write-Host "signtool: $signtool"
+          Write-Host "dlib: $($dlib.FullName)"
+          & $signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 `
+            /dlib $dlib.FullName /dmdf .github/azure-trusted-sign.json `
+            publish/flickSnapShellExt.msix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        shell: pwsh
+
+      # vpk names the install root's launcher stub after --packTitle (flickSnap.exe), not after
+      # --mainExe; SparsePackageManager.RootStubFileName and the sparse MSIX manifest's
+      # Application Executable (crates/flicksnap_shell_ext/msix) must name that same file.
+      # Keep --packId flickSnap so existing installs continue receiving updates.
+      - name: Pack (Windows)
+        if: runner.os == 'Windows'
+        run: >
+          vpk pack --packId flickSnap --packTitle flickSnap --packAuthors "Denis Chepel"
+          --packVersion "$VERSION" --packDir publish --mainExe flickSnap.exe
+          --runtime ${{ matrix.rid }} --channel "$CHANNEL" -o releases
+          --icon ui/flickSnap.Ui/Assets/flicksnap-default.ico
+          --shortcuts Desktop,StartMenuRoot
+          --azureTrustedSignFile .github/azure-trusted-sign.json
+        shell: bash
+
+      # A throwaway keychain for vpk to codesign/notarize with; the p12 certificates were exported without a password, hence the empty -P.
+      - name: Install Apple certificates and notary profile
+        if: runner.os == 'macOS'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          INSTALLER_CERTIFICATE_BASE64: ${{ secrets.INSTALLER_CERTIFICATE_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM: ${{ secrets.APPLE_TEAM }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERT_BUILD_PATH=$RUNNER_TEMP/build_certificate.p12
+          CERT_INSTALLER_PATH=$RUNNER_TEMP/installer_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_BUILD_PATH"
+          echo -n "$INSTALLER_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_INSTALLER_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_BUILD_PATH" -P "" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security import "$CERT_INSTALLER_PATH" -P "" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          xcrun notarytool store-credentials --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM" \
+            --password "$APPLE_PASSWORD" --keychain "$KEYCHAIN_PATH" velopack-profile
+
+          # vpk wants the identity names without the "(TEAMID)" suffix.
+          APP_IDENTITY=$(security find-identity -v "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1 | sed 's/ ([A-Z0-9]*)$//')
+          INSTALL_IDENTITY=$(security find-identity -v "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Installer: [^"]*\)".*/\1/p' | head -1 | sed 's/ ([A-Z0-9]*)$//')
+          if [ -z "$APP_IDENTITY" ] || [ -z "$INSTALL_IDENTITY" ]; then
+            echo "Could not find signing identities in keychain:"
+            security find-identity -v "$KEYCHAIN_PATH"
+            exit 1
+          fi
+          echo "App identity:       $APP_IDENTITY"
+          echo "Installer identity: $INSTALL_IDENTITY"
+          echo "APP_IDENTITY=$APP_IDENTITY" >> "$GITHUB_ENV"
+          echo "INSTALL_IDENTITY=$INSTALL_IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+        shell: bash
+
+      # Replicates vpk's generated plist plus the mic/system-audio usage descriptions, without which TCC kills the app on mic or tap access.
+      - name: Generate Info.plist (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          SHORT_VERSION="$(echo "$VERSION" | sed 's/-.*//').0"
+          sed -e "s/{{VERSION}}/$VERSION/" -e "s/{{SHORT_VERSION}}/$SHORT_VERSION/" \
+            ui/flickSnap.Ui/Assets/Info.plist > "$RUNNER_TEMP/Info.plist"
+          cat "$RUNNER_TEMP/Info.plist"
+        shell: bash
+
+      - name: Pack (macOS)
+        if: runner.os == 'macOS'
+        run: >
+          vpk pack --packId flickSnap --packTitle flickSnap --packAuthors "Denis Chepel"
+          --packVersion "$VERSION" --packDir publish --mainExe flickSnap
+          --runtime ${{ matrix.rid }} --channel "$CHANNEL" -o releases
+          --icon ui/flickSnap.Ui/Assets/flicksnap-default.icns
+          --plist "$RUNNER_TEMP/Info.plist"
+          --signEntitlements ui/flickSnap.Ui/Assets/flickSnap.entitlements
+          --signAppIdentity "$APP_IDENTITY" --signInstallIdentity "$INSTALL_IDENTITY"
+          --notaryProfile velopack-profile --keychain "$KEYCHAIN_PATH"
+        shell: bash
+
+      # Merges into the draft created above and leaves it a draft for the publish job to flip.
+      - name: Upload to GitHub Releases
+        run: >
+          vpk upload github --repoUrl "$REPO_URL" --token "$GH_TOKEN"
+          --channel "$CHANNEL" -o releases
+          --tag "$TAG" --releaseName "$TAG"
+          --merge true --publish false --pre ${{ inputs.prerelease }}
+        shell: bash
+
+  # Runs alongside the vpk jobs: vpk only writes a release body when it creates the release,
+  # and this draft already exists, so the two cannot race over the description.
+  notes:
+    name: release notes
+    needs: draft
+    uses: ./.github/workflows/release-notes.yml
+    with:
+      from_sha: ${{ needs.draft.outputs.from_sha }}
+      to_sha: ${{ needs.draft.outputs.to_sha }}
+      release_tag: ${{ needs.draft.outputs.tag }}
+    secrets:
+      OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
+
+  publish:
+    name: publish release
+    needs: [draft, release, notes]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.draft.outputs.tag }}
+    steps:
+      - name: Publish draft release
+        run: |
+          gh release edit "$TAG" --repo ${{ github.repository }} --draft=false
+          echo "Published release $TAG"

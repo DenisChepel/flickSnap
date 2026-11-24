@@ -1,0 +1,76 @@
+//! FlickSnap's global keyboard hook: registered hotkeys, one-shot gesture recording and the keystroke
+//! observe stream, all from one hook per process. An rlib only: linked into `flicksnap_capture`,
+//! `flicksnap_recorder` and `flicksnap_interop`, whose `flicksnap_hotkeys_*` exports serve it to FlickSnap.Ui.
+//!
+//! - [`supervise`] keeps a hook coming back by itself (retry, stale-grant back-off, the recovery
+//!   policy per OS, registrations with stable ids): `Supervisor` for a host with an event loop
+//!   (the standby capturer), `Supervised` with its own thread for the rest (flicksnap_interop).
+//! - [`Key`] is the only key type for global hotkeys anywhere in FlickSnap; the C# `HotkeyKey` is
+//!   generated from the same table. The only other key maps live inside this crate: `Key` to
+//!   Windows VK and `Key` to macOS CGKeyCode / NX media keytype.
+//! - A [`Gesture`]'s text form (`Control+Alt+Shift+Meta+<Key>`) is the one wire format: settings,
+//!   the capturer's `--hk-*` flags and the status echo.
+//! - The hook callback only decides suppression and enqueues; consumers pull [`Event`]s from
+//!   [`Events`]. It never calls user code, so neither the capturer nor C# can stall it. Matching
+//!   and suppression share one snapshot inside the callback, so a press is never swallowed
+//!   without firing, or fired without being swallowed (bar a press racing an `unregister`).
+//!
+//! Limitations:
+//!
+//! - Windows: elevated foreground windows don't reach a medium-IL hook. Win+L and Ctrl+Alt+Del
+//!   can't be suppressed (Win+L can still be recorded; registering it fires but Windows still
+//!   locks). AltGr is Ctrl+Alt (as with SharpHook, Avalonia and RegisterHotKey), so a registered
+//!   `Control+Alt+X` also swallows AltGr+X — and `Alt+E` never eats AltGr+E.
+//! - Windows: a hook Windows removed silently (repeated callback timeouts, e.g. a debugger pause)
+//!   stays removed: there is no watchdog. Detecting it needs a keyboard raw-input sink, and with
+//!   one registered Windows skips the process's own LL hook whenever its own window is focused.
+//!   For the same reason a host process must not register keyboard raw input itself.
+//! - macOS: needs the Accessibility permission (`start` fails with `PermissionDenied`, never
+//!   prompts; losing it later ends the hook with `Event::Stopped` within about a second, as does a
+//!   tap that times out a 6th time within 10 s). Secure Input (password fields, in any app) hides
+//!   all keys from the tap. A MacBook's top row sends its printed functions (brightness, Mission
+//!   Control, media) unless Fn is held or "Use F1, F2, etc. keys as standard function keys" is on,
+//!   so an F-key gesture fires only then. Media keys reach the tap only from a keyboard: AirPods,
+//!   the Touch Bar and Control Center go through MediaRemote and are never seen; media-key
+//!   swallowing must be verified live on current macOS. Media keys are decoded on the main thread
+//!   (AppKit), so a host using media-key gestures or recording must service its main run loop or
+//!   main dispatch queue (Avalonia and winit do); a media key the main thread does not get to
+//!   within 50 ms passes undecoded, its up included if its down was swallowed (once no media
+//!   gesture or recording remains, such a press is forgotten at the next undecoded event). Keys are
+//!   named by position: on an ISO keyboard too, the key left of 1 is `Oem3` and the one beside left
+//!   Shift `OemBackslash`. As in Avalonia.Native, two keys share a name: on JIS, Yen and the key
+//!   left of Return are both `OemPipe`; keypad `=` is `OemPlus`, like the main `=`.
+//! - Linux: no backend yet; `start` fails with `Unsupported`.
+
+// Used by the backends only.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+mod core;
+mod error;
+mod gesture;
+mod hotkeys;
+mod key;
+mod modifiers;
+/// The system-reserved gesture table per OS (filled when the C# IsSystemReserved table moves here).
+pub mod reserved;
+/// The supervised hook: retry, stale-grant back-off and the recovery policy in one place.
+pub mod supervise;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod winstate;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(windows, target_os = "macos")))]
+mod unsupported;
+#[cfg(windows)]
+mod windows;
+
+pub use std::sync::mpsc::RecvTimeoutError;
+
+pub use error::{Error, ERROR_CODES, INVALID_GESTURE_CODE, STALE_GRANT_CODE};
+pub use gesture::{Gesture, ParseGestureError};
+pub use hotkeys::{Event, Events, HotkeyId, Hotkeys, KeyEvent, REVOKED_REASON};
+pub use key::Key;
+pub use modifiers::Modifiers;
+pub use reserved::Os;
+#[cfg(windows)]
+pub use windows::take_foreground;

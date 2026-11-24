@@ -1,0 +1,147 @@
+use std::env;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Links the FFmpeg libraries from the obs-deps bundle and generates bindings
+/// from its headers. Import libraries (Windows), dylibs (macOS) and shared
+/// objects (Linux) all live in the bundle's `lib` dir; headers in `include`.
+///
+/// On Linux the "bundle" is the pinned BtbN FFmpeg that flicksnap_obs_sys links libobs
+/// against (see flicksnap_build_support). It is not downloaded by the OBS configure
+/// there, so instead of waiting for flicksnap_obs_sys this script materialises it
+/// itself through the same locked, idempotent routine — which also lets
+/// flicksnap_vid2gif build on Linux without building OBS first.
+fn main() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "windows" && target_os != "macos" && target_os != "linux" {
+        panic!("flicksnap_ffmpeg_sys: unsupported CARGO_CFG_TARGET_OS `{target_os}`");
+    }
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let obs_src = flicksnap_build_support::obs_src();
+    let deps_dir = obs_src.join(".deps");
+    if target_os != "linux" {
+        // Windows and macOS take FFmpeg from the obs-deps bundle the OBS
+        // configure downloads; Linux fetches its own pin and needs no OBS.
+        flicksnap_build_support::require_obs_submodule(&obs_src, "flicksnap_ffmpeg_sys");
+    }
+    let deps = if target_os == "linux" {
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        flicksnap_build_support::linux::ensure_ffmpeg(&deps_dir, &arch).root
+    } else {
+        wait_for_deps(&obs_src)
+    };
+    let include = deps.join("include");
+    let lib = deps.join("lib");
+
+    println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    for name in ["avformat", "avcodec", "avfilter", "avutil"] {
+        println!("cargo:rustc-link-lib=dylib={name}");
+    }
+    // Consumed by dependents as DEP_FFMPEG_DEPS_ROOT / _LIB / _BIN (links key
+    // is `ffmpeg`), so they resolve the SAME bundle this crate linked against
+    // instead of scanning `.deps` themselves — and only after it exists.
+    println!("cargo:deps_root={}", deps.display());
+    println!("cargo:deps_lib={}", lib.display());
+    println!("cargo:deps_bin={}", deps.join("bin").display());
+    if target_os == "macos" {
+        // For this crate's own test binaries. (Downstream binaries emit their
+        // own rpaths — link-args do not propagate across crates.)
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/Frameworks");
+    }
+    if target_os == "linux" {
+        // For this crate's own test binaries, as on macOS. The bundle's
+        // libraries carry a $ORIGIN RUNPATH, so their siblings resolve too.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    }
+
+    generate_bindings(&manifest_dir, &include);
+}
+
+/// Locates the non-qt6 obs-deps bundle containing the FFmpeg headers **for the
+/// target architecture**.
+///
+/// The bundles are downloaded by the OBS CMake configure that flicksnap_obs_sys runs,
+/// and cargo may schedule this build script before (or concurrently with)
+/// that download on a fresh checkout — so poll instead of failing
+/// immediately. Incremental builds hit the happy path instantly.
+///
+/// Waiting specifically for this target's bundle matters on Windows ARM64: the
+/// build also downloads the x86 and x64 bundles, and one of those can land
+/// first (see flicksnap_build_support::target_obs_deps_bundle). Hanging on to the
+/// deadline and then failing loudly beats a silent mislink.
+fn wait_for_deps(obs_src: &Path) -> PathBuf {
+    let deps_dir = obs_src.join(".deps");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut announced = false;
+    loop {
+        // Headers for the bindings, import libraries / dylibs for the link.
+        if let Some(found) = flicksnap_build_support::target_obs_deps_bundle(obs_src, &["include/libavcodec", "lib"]) {
+            println!(
+                "cargo:warning=flicksnap_ffmpeg_sys: using obs-deps bundle {}",
+                found.display()
+            );
+            return found;
+        }
+        if Instant::now() >= deadline {
+            let seen: Vec<String> = std::fs::read_dir(&deps_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "flicksnap_ffmpeg_sys: no obs-deps bundle with FFmpeg headers for target arch `{}` found \
+                 under {} after waiting 10 minutes (present: {seen:?}). The bundle is downloaded \
+                 by the OBS build (flicksnap_obs_sys); run `cargo rec` (`cargo build -p flicksnap_recorder`) \
+                 at least once before building flicksnap_vid2gif/flicksnap_ffmpeg_sys on their own.",
+                env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default(),
+                deps_dir.display()
+            );
+        }
+        if !announced {
+            eprintln!(
+                "flicksnap_ffmpeg_sys: waiting for the obs-deps download (flicksnap_obs_sys CMake configure) \
+                 to populate {}...",
+                deps_dir.display()
+            );
+            announced = true;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn generate_bindings(manifest_dir: &Path, include: &Path) {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let bindings = bindgen::Builder::default()
+        .header(manifest_dir.join("wrapper.h").to_str().unwrap())
+        .clang_arg(format!("-I{}", include.display()))
+        .allowlist_function("av_.*")
+        .allowlist_function("avformat_.*")
+        .allowlist_function("avcodec_.*")
+        .allowlist_function("avfilter_.*")
+        .allowlist_function("avio_.*")
+        .allowlist_type("AV.*")
+        .allowlist_var("AV_.*")
+        .allowlist_var("AVFMT_.*")
+        .allowlist_var("AVIO_.*")
+        .allowlist_var("FF_.*")
+        .allowlist_var("LIBAV.*")
+        // Defined by hand in lib.rs: these expand through casts/function-like
+        // macros bindgen's evaluator cannot fold, and hand definitions must
+        // not collide if a future bindgen learns to.
+        .blocklist_item("AV_NOPTS_VALUE")
+        .blocklist_item("AVERROR_.*")
+        .derive_default(true)
+        .generate()
+        .expect("flicksnap_ffmpeg_sys: failed to generate bindings");
+
+    bindings
+        .write_to_file(out_dir.join("bindings.rs"))
+        .expect("flicksnap_ffmpeg_sys: failed to write bindings");
+}

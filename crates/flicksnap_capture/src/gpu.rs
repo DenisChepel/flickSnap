@@ -1,0 +1,276 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::Result;
+
+use crate::gxi::{self, BlendMode, CreateMark, PipelineDesc, SamplerFilter, ShaderId};
+use crate::telemetry::startup::WorkerTimings;
+
+pub mod desktop;
+pub mod overlay;
+
+#[cfg(windows)]
+pub mod region_devices {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use crate::gxi::{CreateMark, Device, Instance, Queue};
+    use crate::system::{MonitorInfo, SystemInterop};
+
+    type Key = (String, Option<(u32, u32)>);
+    type Slot = Arc<Mutex<Option<(Device, Queue)>>>;
+    static DEVICES: LazyLock<Mutex<HashMap<Key, Slot>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Each display has its own immediate context. A device outlives a capture,
+    /// but the compositor windows, swapchains and per-cycle buffers do not.
+    pub fn get(instance: &Instance, monitor: &MonitorInfo, mut mark: impl FnMut(CreateMark)) -> anyhow::Result<(Device, Queue)> {
+        let slot = DEVICES
+            .lock()
+            .unwrap()
+            .entry((monitor.name.clone(), monitor.adapter_id))
+            .or_default()
+            .clone();
+        let mut device = slot.lock().unwrap();
+        if let Some((gpu, queue)) = device
+            .as_ref()
+            .filter(|(gpu, _)| gpu.is_available())
+        {
+            mark(CreateMark::AdapterSelected);
+            mark(CreateMark::DeviceReady);
+            return Ok((gpu.clone(), queue.clone()));
+        }
+        let created = Device::create(instance, monitor.adapter_id, mark)?;
+        *device = Some(created.clone());
+        Ok(created)
+    }
+
+    pub fn warm() {
+        let _ = std::thread::Builder::new()
+            .name("region-gpu-warmup".into())
+            .spawn(|| {
+                crate::system::lower_thread_priority();
+                let instance = Instance::new();
+                for monitor in SystemInterop::all_monitors() {
+                    if let Err(err) = get(&instance, &monitor, |_| {}) {
+                        log::warn!("could not warm capture device: {err:#}");
+                    }
+                }
+            });
+    }
+}
+
+/// Stage-A output: GPU device + queue + compiled shaders + format-agnostic
+/// resources. Created on the render worker thread with no window or surface.
+pub struct DeviceBundle {
+    pub device: gxi::Device,
+    pub queue: gxi::Queue,
+    pub adapter_name: String,
+    pub desktop_pipeline: gxi::RenderPipeline,
+    pub crosshair_pipeline: gxi::RenderPipeline,
+    pub desktop_sampler: gxi::Sampler,
+}
+
+/// GPU state used during the render loop. Assembled from `DeviceBundle`
+/// and the uploaded desktop snapshot *after* frame 0 has been presented —
+/// the loop is the first thing that can need either.
+///
+pub struct WindowGpu {
+    pub device: gxi::Device,
+    pub queue: gxi::Queue,
+    pub pipeline: gxi::RenderPipeline,
+    /// The crosshair pass (Stage A, like the desktop pipeline: it must
+    /// track the mouse from the first visible frames).
+    pub crosshair: gxi::RenderPipeline,
+    /// The selection border + handles pass. Built alongside the UI pipeline
+    /// (a selection needs user interaction, which needs a visible
+    /// overlay), so on a cold start the border appears a beat after the
+    /// desktop — the same policy as the rest of the deferred stack.
+    pub selection: Option<gxi::RenderPipeline>,
+    #[allow(dead_code)]
+    pub adapter_name: String,
+    pub snapshot: Option<Arc<desktop::DesktopSnapshot>>,
+}
+
+// ── Stage A: device + pipelines (no window needed) ──────────────────
+
+pub fn stage_a_create_device(
+    instance: gxi::Instance,
+    monitor: &crate::system::MonitorInfo,
+    live_region: bool,
+    t_start: Instant,
+    timings: &WorkerTimings,
+) -> Result<DeviceBundle> {
+    timings
+        .prep_start
+        .set_once(t_start.elapsed());
+
+    let mark = |mark| match mark {
+        CreateMark::AdapterSelected => timings
+            .prep_adapter
+            .set_once(t_start.elapsed()),
+        CreateMark::DeviceReady => timings
+            .prep_device
+            .set_once(t_start.elapsed()),
+    };
+    #[cfg(windows)]
+    let (device, queue) = if live_region {
+        region_devices::get(&instance, monitor, mark)?
+    } else {
+        gxi::Device::create(&instance, monitor.adapter_id, mark)?
+    };
+    #[cfg(not(windows))]
+    let (device, queue) = {
+        let _ = live_region;
+        gxi::Device::create(&instance, monitor.adapter_id, mark)?
+    };
+    let adapter_name = device.adapter_name().to_string();
+
+    // What frame 0 draws (one triangle sampling the desktop snapshot)
+    // plus the crosshair pass, which must exist the moment the overlay
+    // is visible — the mouse is being tracked from the first frames.
+    // Every other pipeline in the process (selection and the UI
+    // stack) is compiled off this path.
+    let desktop_sampler = device.create_sampler("desktop snapshot sampler", SamplerFilter::Nearest);
+    let desktop_pipeline = device.create_pipeline(&PipelineDesc {
+        label: "desktop pipeline",
+        shader: ShaderId::Desktop,
+        vertex: None,
+        blend: BlendMode::Replace,
+    });
+    let crosshair_pipeline = overlay::create_crosshair_pipeline(&device);
+
+    timings
+        .prep_pipelines
+        .set_once(t_start.elapsed());
+
+    Ok(DeviceBundle {
+        device,
+        queue,
+        adapter_name,
+        desktop_pipeline,
+        crosshair_pipeline,
+        desktop_sampler,
+    })
+}
+
+// ── Assemble final WindowGpu ────────────────────────────────────────
+
+pub fn finalize_window_gpu(bundle: DeviceBundle, snapshot: Option<Arc<desktop::DesktopSnapshot>>) -> WindowGpu {
+    WindowGpu {
+        device: bundle.device,
+        queue: bundle.queue,
+        pipeline: bundle.desktop_pipeline,
+        crosshair: bundle.crosshair_pipeline,
+        selection: None,
+        adapter_name: bundle.adapter_name,
+        snapshot,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Headless smoke test: create a real device on the active backend and
+    /// compile every production pipeline. On D3D11 this validates the
+    /// precompiled SM 5.0 blobs, the input layouts against each VS
+    /// signature, and the blend/rasterizer state setup — the failure modes
+    /// that otherwise only surface on the first live overlay frame. Skips
+    /// (rather than fails) on machines with no usable GPU so CI runners
+    /// without an adapter stay green.
+    #[test]
+    fn create_device_and_all_pipelines() {
+        let instance = gxi::Instance::new();
+        let (device, queue) = match gxi::Device::create(&instance, None, |_| {}) {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("skipping: no usable GPU device ({err:#})");
+                return;
+            }
+        };
+
+        let _desktop = device.create_pipeline(&PipelineDesc {
+            label: "desktop pipeline (test)",
+            shader: ShaderId::Desktop,
+            vertex: None,
+            blend: BlendMode::Replace,
+        });
+        let _selection = overlay::create_selection_pipeline(&device);
+        let _crosshair = overlay::create_crosshair_pipeline(&device);
+        let _egui = crate::ui::gpu::egui_painter::EguiPainter::new(&device);
+
+        // The bind-group tables the constructors above do NOT build —
+        // Desktop (the largest register walk, mixed VS/PS visibility, and
+        // the frame-0 critical path) and Egui — plus both queue
+        // upload paths (write_buffer: d3d11 Map/WRITE_DISCARD incl. its size
+        // assert; write_texture: UpdateSubresource with a sub-rectangle
+        // D3D11_BOX, the path egui's font atlas takes). On d3d11 this
+        // validates the runtime b/t/s register recomputation and
+        // per-stage slot split against each table — the exact contract
+        // shared with build.rs.
+        use crate::gxi::{BindingRes, TexFormat, TextureDesc};
+        let tex_desc = |label| TextureDesc {
+            label,
+            width: 2,
+            height: 2,
+            format: TexFormat::Bgra8Unorm,
+        };
+        let immutable = device.create_texture_with_data(&queue, &tex_desc("smoke immutable tex"), &[0u8; 16]);
+        let atlas = device.create_texture(&tex_desc("smoke atlas tex"));
+        queue.write_texture(&atlas, (1, 1), (1, 1), &[0u8; 4]);
+        let ubo = device.create_uniform_buffer("smoke ubo", 80);
+        queue.write_buffer(&ubo, 0, &[0u8; 80]);
+        let ib = device.create_index_buffer("smoke ib", 12);
+        queue.write_buffer(&ib, 0, &[0u8; 12]);
+        let sampler = device.create_sampler("smoke sampler", SamplerFilter::Nearest);
+        let _linear = device.create_sampler("smoke linear sampler", SamplerFilter::Linear);
+        let _desktop_bg = device.create_bind_group(
+            "smoke desktop bind group",
+            ShaderId::Desktop,
+            &[
+                BindingRes::Uniform(&ubo),
+                BindingRes::Texture(&immutable),
+                BindingRes::Sampler(&sampler),
+                BindingRes::Texture(&atlas),
+                BindingRes::Texture(&atlas),
+            ],
+        );
+        let _egui_bg = device.create_bind_group(
+            "smoke egui bind group",
+            ShaderId::Egui,
+            &[
+                BindingRes::Uniform(&ubo),
+                BindingRes::Texture(&atlas),
+                BindingRes::Sampler(&sampler),
+            ],
+        );
+        let _overlay_bg = device.create_bind_group(
+            "smoke overlay bind group",
+            ShaderId::Selection,
+            &[
+                BindingRes::Uniform(&ubo),
+                BindingRes::Texture(&immutable),
+                BindingRes::Sampler(&sampler),
+            ],
+        );
+        let _crosshair_bg = device.create_bind_group(
+            "smoke crosshair bind group",
+            ShaderId::Crosshair,
+            &[
+                BindingRes::Uniform(&ubo),
+                BindingRes::Texture(&immutable),
+                BindingRes::Sampler(&sampler),
+            ],
+        );
+
+        // GPU timing is always on, so `GpuTimings::new` must build on
+        // the active backend (headlessly there is no surface to drive a
+        // frame through, so constructibility plus an empty poll is what
+        // this test can pin).
+        let mut timings = gxi::GpuTimings::new(&device, &queue).expect("GpuTimings::new failed on a healthy device");
+        assert!(
+            timings.poll_completed(&device).is_empty(),
+            "no frames were submitted, so no samples can have landed"
+        );
+    }
+}

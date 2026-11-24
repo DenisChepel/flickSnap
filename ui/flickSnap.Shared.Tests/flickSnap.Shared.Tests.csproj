@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\flickSnap.Shared\flickSnap.Shared.csproj" />
+    <ProjectReference Include="..\flickSnap.Upload\flickSnap.Upload.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- skips (locally) or fails (FLICKSNAP_INTEROP_REQUIRED=1) a test that needs flicksnap_interop -->
+    <Compile Include="..\flickSnap.Interop\Testing\InteropTestGate.cs" Link="InteropTestGate.cs" />
+  </ItemGroup>
+</Project>

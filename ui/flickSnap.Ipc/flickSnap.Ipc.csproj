@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The helper protocol's C# side (crates/flicksnap_capture/HELPER_PROTOCOL.md §7): the message
+       types and codecs generated from crates/flicksnap_ipc into Generated/HelperMessages.g.cs, and the
+       locator, client and child plumbing around them. No package references, so FlickSnap.Ui,
+       FlickSnap.VideoSDK and FlickSnap.VideoRender can all use it. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>FlickSnap.Ipc</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- NativeProbe (the one helper and library probe), EnvVars, and the flicksnap_interop wrappers
+         behind the stdout guard, the kill-on-close job and the foreground grant. -->
+    <ProjectReference Include="..\flickSnap.Interop\flickSnap.Interop.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="flickSnap.Ipc.Tests" />
+    <!-- for HelperLocator.Override, the seam DenoiseGeneratorTests and MatteGeneratorTests use -->
+    <InternalsVisibleTo Include="flickSnap.VideoSDK.Tests" />
+  </ItemGroup>
+</Project>

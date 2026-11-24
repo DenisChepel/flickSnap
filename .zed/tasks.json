@@ -1,0 +1,30 @@
+[
+  {
+    "label": "Build FlickSnap.Ui (Debug)",
+    "command": "dotnet",
+    "args": [
+      "build",
+      "${ZED_WORKTREE_ROOT}/ui/flickSnap.Ui/flickSnap.Ui.csproj",
+      "-p:Configuration=Debug",
+    ],
+  },
+  {
+    "label": "Build flicksnap_capture (Debug)",
+    "command": "cargo",
+    "args": ["build", "-p", "flicksnap_capture"],
+  },
+  {
+    "label": "Rebuild All",
+    "command": "dotnet",
+    "args": [
+      "build",
+      "${ZED_WORKTREE_ROOT}/ui/flickSnap.Ui/flickSnap.Ui.csproj",
+      "-p:Configuration=Debug",
+      ";",
+      "cargo",
+      "build",
+      "-p",
+      "flicksnap_capture",
+    ],
+  },
+]

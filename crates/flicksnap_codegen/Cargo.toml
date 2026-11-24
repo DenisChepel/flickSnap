@@ -1,0 +1,39 @@
+[package]
+name = "flicksnap_codegen"
+version = "1.0.0"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The only code that writes into ui/: every Rust-to-C# mirror (the flicksnap_interop bindings, the
+# public interop enums, the ABI fingerprint, the helper protocol codecs, the hotkey key table and
+# status codes, the shared environment variable names, the typed contract constants and the
+# session.json golden sample), plus the lint that enforces flicksnap_interop's crate rules.
+# `cargo codegen` regenerates; `cargo test -p flicksnap_codegen` fails on any stale, missing or
+# orphaned output and on any rule violation. Never shipped. Never depends on flicksnap_interop (it
+# reads crates/flicksnap_interop/src/ffi as files), nor on flicksnap_ai or anything from the recorder stack.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "flicksnap_codegen"
+path = "src/main.rs"
+
+[dependencies]
+flicksnap_hotkeys.workspace = true
+flicksnap_ipc.workspace = true
+# Contracts and session only, never flicksnap_desktop or flicksnap_telemetry.
+flicksnap_shared.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+# Pinned exactly, not caret: its output is committed and compared byte for byte, so a patch
+# release that changed one space would fail the gate for whoever updated the lockfile first.
+csbindgen = "=1.9.8"
+# span-locations: the lint reports file:line.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }

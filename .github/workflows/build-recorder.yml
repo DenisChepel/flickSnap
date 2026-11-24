@@ -1,0 +1,259 @@
+name: Build recorder
+
+# Reusable build of the recorder stack (crates/flicksnap_recorder, flicksnap_share_region,
+# flicksnap_vid2gif and libobs from the obs-studio submodule, built by flicksnap_obs_sys
+# via CMake) for the packaged desktop platforms: recorder-win-x64,
+# recorder-win-arm64, recorder-osx-arm64 and recorder-osx-x64.
+# build-recorder-linux.yml is the Linux twin; the shared steps live in
+# .github/actions/setup-obs-build. They are two workflows rather than one with
+# skipped legs because a caller's `needs` waits on every job of a reusable
+# workflow (ci.yml's package job must not wait on Linux), and skipped matrix
+# legs show up in the run as unexpanded `${{ matrix.* }}` names.
+#
+# Each desktop artifact `recorder-<rid>` holds one archive, `recorder-<rid>.zip`,
+# whose members sit at the archive root; ci.yml's package job unpacks it into
+# publish/recorder/, the folder HelperLocator resolves. Staging is
+# tools/staging/stage-recorder.sh, the same script build.sh runs.
+#
+# These and build-recorder-linux.yml are the only CI jobs that check out the
+# submodules. libobs is 20-40 min cold, so the OBS build tree is cached per OS
+# and arch (see .github/actions/setup-obs-build).
+#
+# No step tags the tagless obs-studio checkout for OBS's `git describe --tags`
+# version discovery: the top-level configure gets -DOBS_VERSION_OVERRIDE, and
+# the Windows child configures that ignore it are covered by flicksnap_obs_sys's
+# ensure_obs_version_tag, which tags HEAD before every configure.
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows: Visual Studio generator (newest installed VS, -A per arch),
+  # flicksnap_obs_sys builds libobs into target/obs-<arch>, and the flicksnap_recorder
+  # build.rs assembles a self-contained runtime tree in target/release. That
+  # whole tree, zipped, is the artifact. Each arch builds natively on its
+  # matching runner (windows-2022 = x64, windows-11-arm = arm64), so no
+  # --target / cross toolchain is needed.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: recorder (${{ matrix.rid }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # flicksnap_obs_sys picks the CMake generator from the newest installed VS
+          # (vswhere), so either VS 2022 or VS 2026 images work. windows-11-arm
+          # moved to the VS 2026 image in Oct 2026; x64 stays on windows-2022.
+          - rid: win-x64
+            arch: x64
+            runner: windows-2022
+          - rid: win-arm64
+            arch: arm64
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v7
+        with:
+          # obs-studio must be recursive: obs-browser / obs-websocket submodule
+          # dirs must EXIST even though disabled, or their CMakeLists FATAL_ERROR.
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Toolchain diagnostics
+        run: |
+          cmake --version
+          rustc --version
+          cargo --version
+          Write-Host "Target arch: ${{ matrix.arch }}"
+          Write-Host "LIBCLANG_PATH=$env:LIBCLANG_PATH"
+          if (Test-Path "$env:LIBCLANG_PATH\libclang.dll") {
+            Write-Host "libclang.dll: found"
+          } else {
+            Write-Host "::warning::libclang.dll not found at LIBCLANG_PATH ($env:LIBCLANG_PATH) - bindgen may fail"
+          }
+
+      - name: Set up the OBS build caches
+        uses: ./.github/actions/setup-obs-build
+        with:
+          arch: ${{ matrix.arch }}
+          obs-build-path: target/obs-${{ matrix.arch }}
+
+      - name: Build (release)
+        run: cargo build --release -p flicksnap_recorder -p flicksnap_share_region -p flicksnap_vid2gif
+
+      - name: Test (release, unit tests only)
+        run: |
+          # flicksnap_recorder links obs.dll (import lib). Its build.rs assembles
+          # the runtime DLLs in target/release, which cargo test puts on the
+          # test executables' PATH.
+          cargo test --release -p flicksnap_recorder -p flicksnap_obs_platform -p flicksnap_share_region
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # flicksnap_vid2gif links the bundled FFmpeg DLLs; its tests are fully
+          # self-contained (repo fixtures + generated raw inputs + a GIF
+          # byte-stream validator). flicksnap_ffmpeg_sys verifies linkage + ABI version.
+          cargo test --release -p flicksnap_vid2gif
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --release -p flicksnap_ffmpeg_sys
+
+      # The runtime tree flicksnap_recorder's build.rs assembled in target/release,
+      # plus the VC++ runtime the /MD-built libobs, plugins and FFmpeg DLLs import.
+      - name: Stage artifact
+        shell: bash
+        run: tools/staging/stage-recorder.sh "${{ matrix.rid }}" target/release "dist/recorder-${{ matrix.rid }}"
+
+      # Archive in the build job so the artifact is one file with the members at
+      # the archive root; ci.yml expands it into publish/recorder.
+      - name: Archive bundle
+        run: |
+          $dist = "dist/recorder-${{ matrix.rid }}"
+          Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip" -CompressionLevel Optimal
+          Get-Item "$dist.zip" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: recorder-${{ matrix.rid }}
+          path: dist/recorder-${{ matrix.rid }}.zip
+          if-no-files-found: error
+          # Already a zip; re-deflating it only costs time.
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # macOS: Xcode generator, flicksnap_obs_sys builds libobs.framework. Both slices
+  # run on the arm64 macos-26 runner; the x64 slice is cross-compiled via
+  # `--target x86_64-apple-darwin` (build.rs forwards the arch to
+  # CMAKE_OSX_ARCHITECTURES; OBS's macOS prebuilt deps are universal). The Stage
+  # step (stage-recorder.sh) assembles a self-contained, relocatable bundle
+  # (framework + graphics modules + dep dylibs + plugins), rewrites rpaths to
+  # @executable_path, and the Archive step zips it with ditto (symlinks and
+  # modes intact) for upload. release.yml's vpk pack then signs and notarizes
+  # the whole recorder/ tree inside the app bundle (Contents/MacOS/recorder/).
+  # ---------------------------------------------------------------------------
+  macos:
+    name: recorder (${{ matrix.rid }})
+    # macos-26, not the macos-15 the app jobs use (see build-rust.yml): OBS
+    # 32.2.2's CMake requires the macOS 26.5 SDK (Xcode 26.5+). Pinned rather
+    # than macos-latest so the image only changes on purpose. Both the arm64
+    # (native) and x64 (cross) slices run on this arm64 runner.
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-arm64
+            arch: arm64
+            triple: aarch64-apple-darwin
+            target_flag: ""
+            outdir: target/release
+          - rid: osx-x64
+            arch: x64
+            triple: x86_64-apple-darwin
+            target_flag: --target x86_64-apple-darwin
+            outdir: target/x86_64-apple-darwin/release
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Select full Xcode
+        run: |
+          # build.rs uses the Xcode generator + enable_language(Swift); the CLT
+          # alone are not enough. The image's default Xcode.app is current.
+          sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Ensure cmake (>= 3.28)
+        run: |
+          cmake --version || brew install cmake
+          cmake --version
+
+      # The x64 slice cross-compiles, so its target must be installed.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Toolchain diagnostics
+        run: |
+          rustc --version
+          cargo --version
+          clang --version
+          echo "Target: ${{ matrix.triple }}"
+
+      # flicksnap_obs_sys has no build-dir override on macOS; the OBS build lands in
+      # its OUT_DIR, under the per-target output dir.
+      - name: Set up the OBS build caches
+        uses: ./.github/actions/setup-obs-build
+        with:
+          arch: ${{ matrix.arch }}
+          obs-build-path: ${{ matrix.outdir }}/build/flicksnap_obs_sys/*/out
+
+      - name: Build (release)
+        run: cargo build --release -p flicksnap_recorder -p flicksnap_share_region -p flicksnap_vid2gif ${{ matrix.target_flag }}
+
+      - name: Test (release, unit tests only)
+        # Only the arm64 slice is native to the arm64 runner; the x64 slice is
+        # cross-compiled and cannot execute here (no Rosetta). The same unit
+        # tests run on the arm64 mac and on both Windows arches, so coverage is
+        # preserved.
+        if: matrix.arch == 'arm64'
+        run: |
+          cargo test --release -p flicksnap_recorder -p flicksnap_obs_platform -p flicksnap_share_region ${{ matrix.target_flag }}
+          # flicksnap_vid2gif links the FFmpeg dylibs directly — its integration tests
+          # are self-contained (repo fixtures + generated raw video inputs).
+          cargo test --release -p flicksnap_vid2gif ${{ matrix.target_flag }}
+          cargo test --release -p flicksnap_ffmpeg_sys ${{ matrix.target_flag }}
+
+      # The arm64 slice also runs a vid2gif conversion and a foreign dlopen of
+      # the dep dylibs; the cross-compiled x64 slice cannot execute here.
+      - name: Stage artifact (self-contained bundle)
+        run: tools/staging/stage-recorder.sh "${{ matrix.rid }}" "${{ matrix.outdir }}" "dist/recorder-${{ matrix.rid }}"
+
+      # The staged tree is correct (755 executables, symlinked dylib aliases,
+      # a symlinked libobs.framework), but actions/upload-artifact does not
+      # preserve modes and follows symlinks, so uploading the tree ships 644
+      # binaries, triplicated dylibs and a framework codesign rejects as
+      # "bundle format is ambiguous". Archive here and upload the archive;
+      # ci.yml's package job unzips it. ditto keeps symlinks and modes; no
+      # --keepParent so members sit at the archive root (the layout consumers
+      # unzip into a directory of their own); --norsrc so no xattrs become
+      # `._*` AppleDouble entries (embedded code signatures live in the
+      # Mach-O, nothing here needs a resource fork).
+      - name: Archive bundle
+        run: |
+          set -euo pipefail
+          dist="dist/recorder-${{ matrix.rid }}"
+          zip="$dist.zip"
+          ditto -c -k --norsrc "$dist" "$zip"
+          echo "symlink entries: $(zipinfo "$zip" | grep -c '^l' || true)"
+          zipinfo "$zip" | grep -E ' (flicksnap_recorder|flicksnap_vid2gif|obs-ffmpeg-mux)$'
+          [ "$(zipinfo "$zip" | grep -c '^l')" -gt 0 ] || { echo "::error::archive lost its symlinks"; exit 1; }
+          zipinfo "$zip" | grep -E ' flicksnap_recorder$' | grep -q '^-rwx' || { echo "::error::archive lost the execute bit"; exit 1; }
+          ls -la "$zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: recorder-${{ matrix.rid }}
+          path: dist/recorder-${{ matrix.rid }}.zip
+          if-no-files-found: error
+          # Already a zip; re-deflating it only costs time.
+          compression-level: 0

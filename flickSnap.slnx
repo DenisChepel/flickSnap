@@ -1,0 +1,18 @@
+<Solution>
+  <Project Path="ui/flickSnap.Drawing/flickSnap.Drawing.csproj" />
+  <Project Path="ui/flickSnap.Drawing.Tests/flickSnap.Drawing.Tests.csproj" />
+  <Project Path="ui/flickSnap.Geometry/flickSnap.Geometry.csproj" />
+  <Project Path="ui/flickSnap.Interop/flickSnap.Interop.csproj" />
+  <Project Path="ui/flickSnap.Interop.Tests/flickSnap.Interop.Tests.csproj" />
+  <Project Path="ui/flickSnap.Ipc/flickSnap.Ipc.csproj" />
+  <Project Path="ui/flickSnap.Ipc.Tests/flickSnap.Ipc.Tests.csproj" />
+  <Project Path="ui/flickSnap.Shared/flickSnap.Shared.csproj" />
+  <Project Path="ui/flickSnap.Shared.Tests/flickSnap.Shared.Tests.csproj" />
+  <Project Path="ui/flickSnap.Ui/flickSnap.Ui.csproj" />
+  <Project Path="ui/flickSnap.Upload/flickSnap.Upload.csproj" />
+  <Project Path="ui/flickSnap.VideoRender/flickSnap.VideoRender.csproj" />
+  <Project Path="ui/flickSnap.VideoSDK/flickSnap.VideoSDK.csproj" />
+  <Project Path="ui/flickSnap.VideoSDK.Tests/flickSnap.VideoSDK.Tests.csproj" />
+  <Project Path="tools/cursor-generator/CursorGenerator.csproj" />
+  <Project Path="tools/background-tiles/BackgroundTiles.csproj" />
+</Solution>

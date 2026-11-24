@@ -1,0 +1,316 @@
+//! Screens (README section 4.2), a thin layer over `flicksnap_desktop::screens`, the list
+//! the capture overlay and the share-region prompt read too. Coordinates are the `DesktopScreen`
+//! contract: physical virtual-desktop pixels on Windows, CoreGraphics global points with a
+//! top-left origin on macOS. macOS answers from CoreGraphics only (thread-safe), so it knows no
+//! work area. Elsewhere the list is empty and the lookups answer `FLICKSNAP_S_NONE`.
+
+use flicksnap_desktop::screens::{self, Fallback, OsError, Screen};
+use flicksnap_shared::geometry::{RectExt, ScreenPoint, ScreenRect};
+
+use crate::error::{Error, Result};
+use crate::ffi::status::{FLICKSNAP_OK, FLICKSNAP_S_NONE};
+use crate::ffi::types::{FlickSnapPoint, FlickSnapRect};
+use crate::{panic, util};
+
+/// One screen (64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FlickSnapScreen {
+    pub bounds: FlickSnapRect,
+    /// The work area (bounds minus taskbar / Dock); equal to `bounds` when `work_area_known` is 0.
+    pub work_area: FlickSnapRect,
+    /// Effective DPI / 96 (Windows); mode pixel width / point width (macOS).
+    pub scale: f64,
+    /// 0 = unknown (an OS answer of 0 or 1, NaN or infinity).
+    pub refresh_hz: f64,
+    /// HMONITOR (Windows) or CGDirectDisplayID (macOS).
+    pub display_id: u64,
+    pub is_primary: u8,
+    /// 1 on Windows (rcWork); 0 on macOS (CoreGraphics has no work area).
+    pub work_area_known: u8,
+    pub _reserved: [u8; 6],
+}
+
+/// What `flicksnap_screens_at_point` / `flicksnap_screens_at_rect` answer when nothing matches.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlickSnapScreenFallback {
+    /// `FLICKSNAP_S_NONE`.
+    None = 0,
+    /// The nearest screen.
+    Nearest = 1,
+    /// The primary screen.
+    Primary = 2,
+}
+
+crate::convert::ffi_enum!(FlickSnapScreenFallback: i32 { None, Nearest, Primary });
+
+/// Every screen, written into `out` up to `capacity` entries; `out_count` always receives the full
+/// count (`capacity` 0 with a null `out` is a sizing probe, README B7). An empty desktop is
+/// `FLICKSNAP_OK` with a count of 0.
+///
+/// Status: `FLICKSNAP_OK`; `FLICKSNAP_E_INVALID_ARG` for a null `out_count`, or a null `out` with a
+/// non-zero `capacity`; `FLICKSNAP_E_OS` when the OS enumeration failed (`EnumDisplayMonitors` /
+/// `CGGetActiveDisplayList`), code in `flicksnap_last_error_code`.
+///
+/// Thread: any thread.
+#[no_mangle]
+pub unsafe extern "C" fn flicksnap_screens_list(out: *mut FlickSnapScreen, capacity: u32, out_count: *mut u32) -> i32 {
+    panic::guard("flicksnap_screens_list", || list(out, capacity, out_count))
+}
+
+unsafe fn list(out: *mut FlickSnapScreen, capacity: u32, out_count: *mut u32) -> Result {
+    let out_count = util::out(out_count, "out_count")?;
+    let out = util::slice_mut(out, capacity as usize, "out")?;
+    let screens = screens::list().map_err(os_error)?;
+    for (slot, screen) in out.iter_mut().zip(&screens) {
+        *slot = to_ffi(screen);
+    }
+    // the total, not what fitted: that is what lets a caller size and call again
+    *out_count = u32::try_from(screens.len()).unwrap_or(u32::MAX);
+    Ok(FLICKSNAP_OK)
+}
+
+/// The screen containing the point, or the `fallback` (a `FlickSnapScreenFallback`) when none does.
+/// Windows asks `MonitorFromPoint` (`MONITOR_DEFAULTTONULL` / `NEAREST` / `PRIMARY`); macOS picks
+/// from the CoreGraphics list the same way. `out` is written only on `FLICKSNAP_OK`.
+///
+/// Status: `FLICKSNAP_OK`; `FLICKSNAP_S_NONE` when the point is on no screen and the fallback is None (or
+/// the desktop has no screen at all); `FLICKSNAP_E_INVALID_ARG` for a null `out` or an unknown
+/// `fallback`; `FLICKSNAP_E_OS`.
+///
+/// Thread: any thread.
+#[no_mangle]
+pub unsafe extern "C" fn flicksnap_screens_at_point(x: i32, y: i32, fallback: i32, out: *mut FlickSnapScreen) -> i32 {
+    panic::guard("flicksnap_screens_at_point", || at_point(x, y, fallback, out))
+}
+
+unsafe fn at_point(x: i32, y: i32, fallback: i32, out: *mut FlickSnapScreen) -> Result {
+    let out = util::out(out, "out")?;
+    let fallback = FlickSnapScreenFallback::from_raw(fallback)?.into();
+    write_found(out, screens::at_point(ScreenPoint::new(x, y), fallback))
+}
+
+/// The screen with the largest overlap with `rect`, or the `fallback` when none overlaps. The rect
+/// is `x, y, x + width, y + height` exactly as `MonitorFromRect` takes it; an empty rect is looked
+/// up by its top-left point. `out` is written only on `FLICKSNAP_OK`.
+///
+/// Status: `FLICKSNAP_OK`; `FLICKSNAP_S_NONE`; `FLICKSNAP_E_INVALID_ARG` for a null `rect` or `out`, or an
+/// unknown `fallback`; `FLICKSNAP_E_OS`.
+///
+/// Thread: any thread.
+#[no_mangle]
+pub unsafe extern "C" fn flicksnap_screens_at_rect(rect: *const FlickSnapRect, fallback: i32, out: *mut FlickSnapScreen) -> i32 {
+    panic::guard("flicksnap_screens_at_rect", || at_rect(rect, fallback, out))
+}
+
+unsafe fn at_rect(rect: *const FlickSnapRect, fallback: i32, out: *mut FlickSnapScreen) -> Result {
+    let rect = util::input(rect, "rect")?;
+    let out = util::out(out, "out")?;
+    let fallback = FlickSnapScreenFallback::from_raw(fallback)?.into();
+    write_found(out, screens::at_rect(to_rect(rect), fallback))
+}
+
+/// The primary screen (the one at the desktop origin). `out` is written only on `FLICKSNAP_OK`.
+///
+/// Status: `FLICKSNAP_OK`; `FLICKSNAP_S_NONE` on a desktop without one (a headless session, or a platform
+/// without a screen list); `FLICKSNAP_E_INVALID_ARG` for a null `out`; `FLICKSNAP_E_OS`.
+///
+/// Thread: any thread.
+#[no_mangle]
+pub unsafe extern "C" fn flicksnap_screens_primary(out: *mut FlickSnapScreen) -> i32 {
+    panic::guard("flicksnap_screens_primary", || primary(out))
+}
+
+unsafe fn primary(out: *mut FlickSnapScreen) -> Result {
+    let out = util::out(out, "out")?;
+    write_found(out, screens::primary())
+}
+
+/// The refresh rate of the screen containing each of `count` points, read from ONE screen list:
+/// `out_hz[i]` is that screen's rate for `points[i]` (the `flicksnap_screens_at_point` rule, fallback
+/// None), 0 when no screen contains the point or the screen reports none. The macOS caller passes
+/// the centres of Avalonia's screens, whose bounds and work areas it keeps, to fill in the rates.
+///
+/// Status: `FLICKSNAP_OK`; `FLICKSNAP_E_INVALID_ARG` for a null `points` or `out_hz` with a non-zero
+/// `count`; `FLICKSNAP_E_OS` when the OS enumeration failed.
+///
+/// Thread: any thread.
+#[no_mangle]
+pub unsafe extern "C" fn flicksnap_screens_refresh_at(points: *const FlickSnapPoint, count: u32, out_hz: *mut f64) -> i32 {
+    panic::guard("flicksnap_screens_refresh_at", || refresh_at(points, count, out_hz))
+}
+
+unsafe fn refresh_at(points: *const FlickSnapPoint, count: u32, out_hz: *mut f64) -> Result {
+    let points = util::slice(points, count as usize, "points")?;
+    let out_hz = util::slice_mut(out_hz, count as usize, "out_hz")?;
+    if points.is_empty() {
+        return Ok(FLICKSNAP_OK);
+    }
+    let screens = screens::list().map_err(os_error)?;
+    for (hz, point) in out_hz.iter_mut().zip(points) {
+        *hz = screens::select_at_point(&screens, ScreenPoint::new(point.x, point.y), Fallback::None)
+            .and_then(|screen| screen.refresh_hz)
+            .unwrap_or(0.0);
+    }
+    Ok(FLICKSNAP_OK)
+}
+
+impl From<FlickSnapScreenFallback> for Fallback {
+    fn from(value: FlickSnapScreenFallback) -> Self {
+        match value {
+            FlickSnapScreenFallback::None => Fallback::None,
+            FlickSnapScreenFallback::Nearest => Fallback::Nearest,
+            FlickSnapScreenFallback::Primary => Fallback::Primary,
+        }
+    }
+}
+
+fn write_found(out: &mut FlickSnapScreen, found: std::result::Result<Option<Screen>, OsError>) -> Result {
+    match found.map_err(os_error)? {
+        Some(screen) => {
+            *out = to_ffi(&screen);
+            Ok(FLICKSNAP_OK)
+        }
+        None => Ok(FLICKSNAP_S_NONE),
+    }
+}
+
+pub(crate) fn os_error(e: OsError) -> Error {
+    Error::os(e.code, e.message)
+}
+
+pub(crate) fn to_rect(r: &FlickSnapRect) -> ScreenRect {
+    ScreenRect::from_xy_size(r.x, r.y, r.width, r.height)
+}
+
+fn from_rect(r: &ScreenRect) -> FlickSnapRect {
+    FlickSnapRect {
+        x: r.origin.x,
+        y: r.origin.y,
+        width: r.size.width,
+        height: r.size.height,
+    }
+}
+
+fn to_ffi(screen: &Screen) -> FlickSnapScreen {
+    let bounds = from_rect(&screen.bounds);
+    FlickSnapScreen {
+        bounds,
+        work_area: screen
+            .work_area
+            .as_ref()
+            .map_or(bounds, from_rect),
+        scale: screen.scale,
+        refresh_hz: screen.refresh_hz.unwrap_or(0.0),
+        display_id: screen.id,
+        is_primary: util::to_flag(screen.is_primary),
+        work_area_known: util::to_flag(screen.work_area.is_some()),
+        _reserved: [0; 6],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::status::FlickSnapInteropStatus;
+    use std::mem::{offset_of, size_of};
+    use std::ptr;
+
+    #[test]
+    fn layouts_are_pinned() {
+        assert_eq!(size_of::<FlickSnapScreen>(), 64);
+        assert_eq!(offset_of!(FlickSnapScreen, bounds), 0);
+        assert_eq!(offset_of!(FlickSnapScreen, work_area), 16);
+        assert_eq!(offset_of!(FlickSnapScreen, scale), 32);
+        assert_eq!(offset_of!(FlickSnapScreen, refresh_hz), 40);
+        assert_eq!(offset_of!(FlickSnapScreen, display_id), 48);
+        assert_eq!(offset_of!(FlickSnapScreen, is_primary), 56);
+        assert_eq!(offset_of!(FlickSnapScreen, work_area_known), 57);
+        assert_eq!(offset_of!(FlickSnapScreen, _reserved), 58);
+    }
+
+    #[test]
+    fn an_unknown_work_area_reads_as_the_bounds() {
+        let screen = Screen {
+            id: 9,
+            bounds: ScreenRect::from_xy_size(-10, 20, 300, 200),
+            work_area: None,
+            scale: 2.0,
+            refresh_hz: None,
+            is_primary: true,
+            pixel_width: 600,
+            pixel_height: 400,
+            device_name: String::new(),
+        };
+        let ffi = to_ffi(&screen);
+        assert_eq!(
+            ffi.bounds,
+            FlickSnapRect {
+                x: -10,
+                y: 20,
+                width: 300,
+                height: 200
+            }
+        );
+        assert_eq!(ffi.work_area, ffi.bounds);
+        assert_eq!((ffi.work_area_known, ffi.is_primary, ffi.display_id), (0, 1, 9));
+        assert_eq!((ffi.scale, ffi.refresh_hz), (2.0, 0.0));
+    }
+
+    #[test]
+    fn null_arguments_and_unknown_fallbacks_are_invalid_arg() {
+        let invalid = FlickSnapInteropStatus::InvalidArg as i32;
+        let mut count = 0u32;
+        let mut screen = FlickSnapScreen::default();
+        let rect = FlickSnapRect::default();
+        assert_eq!(unsafe { flicksnap_screens_list(ptr::null_mut(), 0, ptr::null_mut()) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_list(ptr::null_mut(), 4, &mut count) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_at_point(0, 0, 0, ptr::null_mut()) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_at_point(0, 0, 3, &mut screen) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_at_point(0, 0, -1, &mut screen) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_at_rect(ptr::null(), 0, &mut screen) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_at_rect(&rect, 0, ptr::null_mut()) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_at_rect(&rect, 7, &mut screen) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_primary(ptr::null_mut()) }, invalid);
+        let mut hz = [0.0f64; 1];
+        let point = FlickSnapPoint::default();
+        assert_eq!(unsafe { flicksnap_screens_refresh_at(ptr::null(), 1, hz.as_mut_ptr()) }, invalid);
+        assert_eq!(unsafe { flicksnap_screens_refresh_at(&point, 1, ptr::null_mut()) }, invalid);
+        assert_eq!(
+            unsafe { flicksnap_screens_refresh_at(ptr::null(), 0, ptr::null_mut()) },
+            FLICKSNAP_OK
+        );
+        // nothing was written on any of those paths
+        assert_eq!(screen, FlickSnapScreen::default());
+    }
+
+    #[test]
+    fn refresh_at_agrees_with_at_point_for_each_point() {
+        let mut list = [FlickSnapScreen::default(); 16];
+        let mut count = 0u32;
+        assert_eq!(unsafe { flicksnap_screens_list(list.as_mut_ptr(), 16, &mut count) }, FLICKSNAP_OK);
+        let mut points: Vec<FlickSnapPoint> = list[..(count as usize).min(16)]
+            .iter()
+            .map(|s| FlickSnapPoint {
+                x: s.bounds.x + s.bounds.width / 2,
+                y: s.bounds.y + s.bounds.height / 2,
+            })
+            .collect();
+        points.push(FlickSnapPoint {
+            x: i32::MIN / 2,
+            y: i32::MIN / 2,
+        }); // on no screen
+        let mut hz = vec![-1.0f64; points.len()];
+        let status = unsafe { flicksnap_screens_refresh_at(points.as_ptr(), points.len() as u32, hz.as_mut_ptr()) };
+        assert_eq!(status, FLICKSNAP_OK);
+        for (point, hz) in points.iter().zip(&hz) {
+            let mut screen = FlickSnapScreen::default();
+            let expected = match unsafe { flicksnap_screens_at_point(point.x, point.y, 0, &mut screen) } {
+                FLICKSNAP_OK => screen.refresh_hz,
+                _ => 0.0,
+            };
+            assert_eq!(*hz, expected, "{point:?}");
+        }
+    }
+}

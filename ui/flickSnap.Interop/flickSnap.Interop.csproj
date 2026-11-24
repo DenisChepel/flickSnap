@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The C# side of crates/flicksnap_interop, the one native library FlickSnap loads in-process: the
+       generated bindings (Generated/*.g.cs, `cargo codegen`), the loader and the public wrappers.
+       Every [DllImport] in the solution lives here and is generated. Deliberately no
+       PackageReference and no ProjectReference: FlickSnap.Shared, FlickSnap.Ipc, FlickSnap.VideoSDK and
+       FlickSnap.Ui all reference this leaf, so anything added here is added to all of them. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>FlickSnap.Interop</RootNamespace>
+    <!-- The generated bindings are raw pointers and function pointers throughout. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- CA2255: [ModuleInitializer] in library code is the advanced scenario it allows here: the
+         DllImport resolver must be in place before the first P/Invoke in any host, and installing
+         it does no I/O. -->
+    <NoWarn>$(NoWarn);CA2007;CA2255</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="flickSnap.Interop.Tests" />
+    <InternalsVisibleTo Include="flickSnap.VideoSDK.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- InteropTestGate is source-linked into every test project that touches natives (it needs
+         xunit, which this project must not reference). -->
+    <Compile Remove="Testing\**" />
+    <None Include="Testing\**" />
+  </ItemGroup>
+  <!-- Debug only: the same dev walk-up the loader does, so a missing library is a build warning
+       with the command that fixes it instead of a dialog at first launch. -->
+  <Target Name="WarnWhenInteropLibraryMissing" AfterTargets="Build" Condition="'$(Configuration)' == 'Debug'">
+    <PropertyGroup>
+      <_FlickSnapCargoRoot>$([MSBuild]::GetDirectoryNameOfFileAbove('$(MSBuildProjectDirectory)', 'Cargo.toml'))</_FlickSnapCargoRoot>
+      <_FlickSnapInteropLib Condition="$([MSBuild]::IsOSPlatform('Windows'))">flicksnap_interop.dll</_FlickSnapInteropLib>
+      <_FlickSnapInteropLib Condition="$([MSBuild]::IsOSPlatform('OSX'))">libflicksnap_interop.dylib</_FlickSnapInteropLib>
+      <_FlickSnapInteropLib Condition="'$(_FlickSnapInteropLib)' == ''">libflicksnap_interop.so</_FlickSnapInteropLib>
+      <_FlickSnapInteropFound>false</_FlickSnapInteropFound>
+      <_FlickSnapInteropFound Condition="'$(FLICKSNAP_INTEROP_PATH)' != ''">true</_FlickSnapInteropFound>
+      <_FlickSnapInteropFound Condition="'$(_FlickSnapCargoRoot)' != '' And (Exists('$(_FlickSnapCargoRoot)/target/debug/$(_FlickSnapInteropLib)') Or Exists('$(_FlickSnapCargoRoot)/target/release/$(_FlickSnapInteropLib)') Or Exists('$(_FlickSnapCargoRoot)/target/debug/deps/$(_FlickSnapInteropLib)') Or Exists('$(_FlickSnapCargoRoot)/target/release/deps/$(_FlickSnapInteropLib)'))">true</_FlickSnapInteropFound>
+    </PropertyGroup>
+    <Warning Condition="'$(_FlickSnapInteropFound)' != 'true'"
+             Text="$(_FlickSnapInteropLib) was not found under target/debug or target/release: FlickSnap.Ui, FlickSnap.VideoRender and the interop tests need it. Build it with: cargo build -p flicksnap_interop" />
+  </Target>
+</Project>

@@ -1,0 +1,99 @@
+//! Scrolling capture — the second half of the feature.
+//!
+//! By the time this binary runs the overlay (`flicksnap_capture`) has
+//! already done its part: the user picked a region, pressed SCROLL,
+//! clicked the point to scroll at, and the overlay wrote `action.txt` =
+//! `scroll X,Y,W,H PX,PY HWND` and exited. FlickSnap.Ui reads that marker,
+//! puts its border window up around the region, and spawns *this* process
+//! to do the mechanical part — scroll the target window a step at a time,
+//! photograph the region after each step, stitch the frames into one tall
+//! image, and write a finished session the shell can hand straight to the
+//! editor.
+//!
+//! It is a separate binary from the overlay because it shares nothing with
+//! it at runtime: no window, no event loop, no GPU. Starting any of that
+//! would put pixels on screen in front of the very content it is about to
+//! photograph.
+//!
+//! Windows and macOS. The loop, the caps, the stitcher, the protocol and the
+//! session output are the same code on both; everything that touches the OS
+//! — injecting a wheel, parking the cursor, resolving and raising the target
+//! window, photographing the region — lives behind [`input`] and [`frame`],
+//! which each have a `win` and a `mac` half. The two platforms differ in one
+//! way that reaches the shared code: on Windows the region and the point are
+//! physical virtual-desktop pixels, on macOS they are CG points, so nothing
+//! here may compare a coordinate against a *pixel* count taken from a
+//! captured frame (see `drive`'s note on the viewport height).
+//!
+//! Layout:
+//! - [`drive`]: the loop, the caps, and the helper-protocol conversation with the shell.
+//! - [`input`] — synthetic wheel injection, cursor parking, abort polling.
+//! - [`frame`] — one screenshot of the fixed region.
+//! - [`stitch`] — frame registration and the composite.
+//! - [`output`] — `desktop.png` / `cropped.png` / `session.json`.
+//!
+//! The protocol is the `scroll` catalog of `crates/flicksnap_capture/HELPER_PROTOCOL.md`
+//! (§4.4); the command line is documented in `crates/flicksnap_capture/CAPTURE_PROTOCOL.md` §2.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+// FlickSnap ships on Windows and macOS only (the overlay's `system` module has no
+// third backend either), and a driver that compiled elsewhere without an
+// input or capture path would be a binary that cannot do anything.
+#[cfg(not(any(windows, target_os = "macos")))]
+compile_error!("flicksnap_scroll_driver supports Windows and macOS only");
+
+mod cli;
+mod drive;
+mod frame;
+mod input;
+mod output;
+mod stitch;
+
+#[macro_use]
+extern crate log;
+
+#[macro_use]
+extern crate anyhow;
+
+use clap::Parser;
+use flicksnap_ipc::catalog::scroll;
+
+fn main() {
+    // `hello` first, with stdout claimed: from here on only the protocol
+    // channel reaches the pipe, and every other print lands on stderr.
+    let out = flicksnap_ipc::open::<scroll::Event>("flicksnap_scroll_driver");
+
+    let args = cli::CliArgs::parse();
+
+    // Terminal logging goes to stderr only; the shell pumps it into its own
+    // diagnostics. The file mirror is the session's `scroll.log` rather than
+    // `capture.log`: the overlay already wrote the latter into this very
+    // directory, and truncating it would erase the diagnostics for the half
+    // of the capture that came first.
+    let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = vec![simplelog::TermLogger::new(
+        log::LevelFilter::Info,
+        simplelog::Config::default(),
+        simplelog::TerminalMode::Stderr,
+        simplelog::ColorChoice::Auto,
+    )];
+    let log_file = args
+        .session_dir
+        .as_ref()
+        .and_then(|dir| std::fs::File::create(dir.join("scroll.log")).ok());
+    if let Some(file) = log_file {
+        loggers.push(simplelog::WriteLogger::new(
+            log::LevelFilter::Info,
+            simplelog::Config::default(),
+            std::io::LineWriter::new(file),
+        ));
+    }
+    flicksnap_telemetry::install_logger(simplelog::CombinedLogger::new(loggers));
+
+    // Every exit goes through flicksnap_ipc::lifetime::exit, never a drop of this
+    // guard, so the session is ended and the queue flushed by the exit hook.
+    let _sentry = flicksnap_telemetry::init("flicksnap_scroll_driver");
+    flicksnap_ipc::lifetime::on_exit(flicksnap_telemetry::shutdown_hook);
+
+    drive::run(args, out)
+}

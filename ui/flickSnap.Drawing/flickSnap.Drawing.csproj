@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>FlickSnap.Drawing</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.5" />
+    <!-- the Skia lease, for ink that blends with what is under it (the highlighter) -->
+    <PackageReference Include="Avalonia.Skia" Version="12.1.5" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="flickSnap.Drawing.Tests" />
+    <InternalsVisibleTo Include="flickSnap.Drawing.Benchmarks" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\flickSnap.Geometry\flickSnap.Geometry.csproj" />
+    <ProjectReference Include="..\flickSnap.Shared\flickSnap.Shared.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Cursors\*.cur" />
+  </ItemGroup>
+</Project>

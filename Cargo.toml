@@ -1,0 +1,152 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flicksnap_ai", "crates/flicksnap_capture", "crates/flicksnap_codegen", "crates/flicksnap_hotkeys", "crates/flicksnap_interop",
+    "crates/flicksnap_ipc", "crates/flicksnap_platform", "crates/flicksnap_desktop", "crates/flicksnap_shared", "crates/flicksnap_telemetry", "crates/flicksnap_scroll_driver", "crates/flicksnap_shell_ext",
+    "crates/flicksnap_build_support", "crates/flicksnap_ffmpeg_sys", "crates/flicksnap_obs", "crates/flicksnap_obs_platform",
+    "crates/flicksnap_obs_sys", "crates/flicksnap_recorder", "crates/flicksnap_share_region", "crates/flicksnap_vid2gif",
+]
+# Plain `cargo build/test` stays fast and toolchain-light: the recorder stack (libobs via CMake,
+# 20-40 min cold, needs the obs-studio submodule + cmake + LLVM) builds only when asked: `cargo rec`.
+# flicksnap_codegen is a default member so a plain `cargo test` runs its gate (every generated C# file
+# current, every flicksnap_interop crate rule); flicksnap_interop so a plain `cargo build` puts the library
+# where the dotnet dev walk-up finds it.
+default-members = [
+    "crates/flicksnap_ai", "crates/flicksnap_capture", "crates/flicksnap_codegen", "crates/flicksnap_hotkeys", "crates/flicksnap_interop",
+    "crates/flicksnap_ipc", "crates/flicksnap_platform", "crates/flicksnap_desktop", "crates/flicksnap_shared", "crates/flicksnap_telemetry", "crates/flicksnap_scroll_driver", "crates/flicksnap_shell_ext",
+]
+
+[workspace.package]
+version = "0.0.0-local"
+authors = ["Caelan Sayler <git@caesay.com>"]
+repository = "https://github.com/DenisChepel/flickSnap"
+keywords = ["update", "install", "velopack", "squirrel", "automatic-updates"]
+categories = ["development-tools"]
+license = "GPL-3.0-or-later"
+edition = "2021"
+rust-version = "1.89"
+
+[workspace.dependencies]
+# What two FlickSnap processes must agree on, as pure logic: geometry, the session.json and OCR
+# contracts, the colour, share-region and H.264 rules, and the contract tables.
+flicksnap_shared = { path = "crates/flicksnap_shared" }
+# The OS desktop queries: the window list, monitors, screen grab and cursor.
+flicksnap_desktop = { path = "crates/flicksnap_desktop" }
+# The Sentry setup every reporting process shares. Never a dependency of flicksnap_interop.
+flicksnap_telemetry = { path = "crates/flicksnap_telemetry" }
+# The global hotkey hook: an rlib linked into flicksnap_capture and flicksnap_interop (FlickSnap.Ui reaches it
+# through flicksnap_interop's flicksnap_hotkeys_* exports).
+flicksnap_hotkeys = { path = "crates/flicksnap_hotkeys" }
+# Leaf OS primitives (permissions, physical key state, the foreground grant) shared by every crate
+# that asks those questions. flicksnap_interop and flicksnap_codegen are never dependencies, so they have
+# no entry here.
+flicksnap_platform = { path = "crates/flicksnap_platform" }
+# The helper protocol: message catalogs, exit codes, the stdio channel (crates/flicksnap_capture/HELPER_PROTOCOL.md).
+flicksnap_ipc = { path = "crates/flicksnap_ipc" }
+# The recorder stack's internal crates (libobs/FFmpeg bindings and the platform layer).
+flicksnap_obs_sys = { path = "crates/flicksnap_obs_sys" }
+flicksnap_obs = { path = "crates/flicksnap_obs" }
+flicksnap_obs_platform = { path = "crates/flicksnap_obs_platform" }
+flicksnap_ffmpeg_sys = { path = "crates/flicksnap_ffmpeg_sys" }
+# Build-dependency only: the Linux FFmpeg pin and staging helpers shared by the
+# build scripts (crates/flicksnap_build_support).
+flicksnap_build_support = { path = "crates/flicksnap_build_support" }
+anyhow = "1.0"
+# The input-capture sidecar's `cursor_image` rows carry sprite planes as
+# base64-encoded PNG (crates/flicksnap_recorder/src/cursor_sprite.rs).
+base64 = "0.23"
+# 0.72+ required: bindgen 0.71 + libclang 22 intermittently emitted opaque
+# 1-byte structs (vec2/vec3/vec4/obs_transform_info/obs_audio_data/
+# obs_source_frame) whose layout asserts then fail with E0080. See the
+# assert_no_opaque_regressions guard in crates/flicksnap_obs_sys/build.rs.
+bindgen = "0.72"
+ctrlc = { version = "3", features = ["termination"] }
+clap = "4.6"
+image = { version = "0.25", default-features = false }
+# flicksnap_vid2gif's animated WebP encoder (WebPAnimEncoder). Vendors libwebp's C source and
+# links it statically: the bundled FFmpeg has no libwebp encoder.
+libwebp-sys = "0.14"
+euclid = "0.22"
+libc = "0.2"
+log = "0.4"
+simplelog = "0.12"
+winit = "0.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# flicksnap_ai's inference runtime. Default features: ort-sys downloads
+# pyke's prebuilt, attested ONNX Runtime binaries per target and links the
+# runtime statically; execution-provider features (directml/coreml) are
+# enabled per target in flicksnap_ai's own manifest, since no one binary
+# build carries every EP. copy-dylibs stages the EP helper dylib
+# (DirectML.dll) beside the built exe; CI packages it from there.
+# NOTE: pyke's libs are compiled /MD — flicksnap_ai's build.rs swaps that
+# one binary off this workspace's `+crt-static` at link time (see there).
+# Default features minus `tracing`: with `tracing` on and no subscriber
+# installed, ONNX Runtime's own log lines (EP registration failures, nodes
+# falling back to the CPU) vanish silently — without it they go to stderr,
+# which the spawner already pumps into its diagnostic ring.
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-native",
+    "copy-dylibs",
+    "api-27",
+] }
+# flicksnap_ai's STFT/ISTFT for the 48 kHz denoiser.
+realfft = "3.5"
+bytemuck = "1"
+# System-font lookup for the OCR bubbles' glyph fallback: fontdb finds and memory-maps the
+# curated faces, skrifa (the same version epaint shapes with) checks a face parses and whether
+# the bundled Cascadia already covers a page.
+fontdb = { version = "0.24", default-features = false, features = ["memmap"] }
+skrifa = "0.44"
+# Immediate-mode UI (layout, widgets, text) for the capture overlay; painted through gxi.
+egui = { version = "0.37", default-features = false, features = ["bytemuck"] }
+# SVG rasterisation into egui textures (resvg under the hood) and live plots for the debug panel.
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+egui_plot = "0.38"
+arboard = "3.6"
+rfd = { version = "0.17", default-features = false }
+xdialog = "4.1"
+windows = "0.62"
+objc2 = "0.6"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+# build-time shader precompilation (crates/flicksnap_capture/build.rs): WGSL to HLSL on
+# Windows, WGSL to MSL source on macOS. Build time only; never in a binary.
+naga = "30.0"
+libloading = "0.9"
+# rustls keeps every target off OpenSSL/schannel, and debug-images/log/anyhow are what make the reports symbolicated and readable.
+sentry = { version = "0.49", default-features = false, features = [
+    "anyhow",
+    "backtrace",
+    "contexts",
+    "debug-images",
+    "log",
+    "panic",
+    "release-health",
+    "reqwest",
+    "rustls",
+] }
+
+[profile.release]
+opt-level = 3
+# Thin rather than fat: fat LTO's single-threaded link was ~70% of CI wall clock, and these binaries gain little from it (render work lands on the GPU, ONNX Runtime is prebuilt C++).
+lto = "thin"
+# Line tables only, in a companion .pdb/.dSYM that CI uploads to Sentry — enough for readable stack traces, and the only split mode Windows-MSVC supports.
+debug = 1
+split-debuginfo = "packed"
+debug-assertions = false
+overflow-checks = false
+incremental = false
+# One unit per crate, so nothing is left to cross-unit inlining that the optimizer could have done directly.
+codegen-units = 1
+rpath = false
+# panic stays at the default unwind so one render worker's panic cannot take the whole capture down.

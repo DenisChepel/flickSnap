@@ -1,0 +1,277 @@
+//! Cross-platform standby control plane: the `capture` catalog of FlickSnap's helper
+//! protocol (crates/flicksnap_capture/HELPER_PROTOCOL.md §4.5). JSON lines on stdin carry
+//! complete CLI snapshots and explicit capture requests; the quit path (`quit`, EOF,
+//! a signal, a dead stdout) means the shell is done with us. The screenshot hotkeys
+//! are the shell's: it turns a press into the same `capture` request as a tray click.
+
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::SystemTime;
+
+use clap::Parser;
+use flicksnap_ipc::catalog::capture::{self, CaptureResult, Event};
+use flicksnap_ipc::catalog::ErrorCode;
+use flicksnap_ipc::Inbound;
+use winit::application::ApplicationHandler;
+use winit::event_loop::{ActiveEventLoop, ControlFlow as LoopFlow, EventLoop, EventLoopProxy};
+use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
+
+use crate::protocol::out;
+use crate::settings::{CaptureMode, CliArgs};
+
+/// What the event loop is handed from stdin.
+enum Input {
+    Settings(Vec<String>),
+    Capture(CaptureMode),
+    /// A malformed line, answered with `bad_command` in arrival order.
+    Invalid(String),
+}
+
+pub struct Standby {
+    input_rx: mpsc::Receiver<Input>,
+    parent_gone: Arc<AtomicBool>,
+    capture_active: Arc<AtomicBool>,
+}
+
+impl Standby {
+    pub fn new(proxy: EventLoopProxy<()>) -> anyhow::Result<Self> {
+        let parent_gone = Arc::new(AtomicBool::new(false));
+        let capture_active = Arc::new(AtomicBool::new(false));
+
+        // The quit path. Between captures it wakes the loop, which returns
+        // from `wait` and ends with `done{stopped}`. Mid-capture the overlay
+        // owns the main thread and `wait` is not listening, so the process
+        // ends from here: the overlay closes without writing the session.
+        // SeqCst pairs with wait()'s store(capture_active)-then-load(parent_gone):
+        // the total order guarantees at least one side sees the other, so a
+        // quit racing a capture request either exits here or is caught by wait()'s
+        // re-check, never a fully orphaned capture.
+        let parent_gone_quit = Arc::clone(&parent_gone);
+        let capture_active_quit = Arc::clone(&capture_active);
+        let proxy_quit = proxy.clone();
+        flicksnap_ipc::lifetime::install(
+            move |reason| {
+                parent_gone_quit.store(true, Ordering::SeqCst);
+                let _ = proxy_quit.send_event(());
+                if capture_active_quit.load(Ordering::SeqCst) {
+                    let spawned = std::thread::Builder::new()
+                        .name("standby-quit".into())
+                        .spawn(move || {
+                            log::info!("quit ({reason:?}) during a capture; closing the overlay");
+                            crate::finish(CaptureResult::Stopped, None)
+                        });
+                    if spawned.is_err() {
+                        flicksnap_ipc::lifetime::exit(flicksnap_ipc::exit::OK);
+                    }
+                }
+            },
+            capture::QUIT_GRACE + flicksnap_ipc::SELF_EXIT_MARGIN,
+        );
+
+        let (input_tx, input_rx) = mpsc::channel();
+        flicksnap_ipc::read_commands::<capture::Command>(move |inbound| {
+            let input = match inbound {
+                Inbound::Command(capture::Command::Settings {
+                    args,
+                }) => Input::Settings(args),
+                Inbound::Command(capture::Command::Capture {
+                    mode,
+                }) => Input::Capture(match mode {
+                    capture::CaptureMode::Region => CaptureMode::Region,
+                    capture::CaptureMode::Screen => CaptureMode::Screen,
+                    capture::CaptureMode::Window => CaptureMode::Window,
+                }),
+                Inbound::Malformed {
+                    reason,
+                } => Input::Invalid(reason),
+            };
+            if input_tx.send(input).is_err() {
+                return ControlFlow::Break(());
+            }
+            let _ = proxy.send_event(());
+            ControlFlow::Continue(())
+        });
+        Ok(Self {
+            input_rx,
+            parent_gone,
+            capture_active,
+        })
+    }
+
+    /// Returns false when the quit path fired before a capture was requested.
+    pub fn wait(&mut self, args: &mut CliArgs, event_loop: &mut EventLoop<()>) -> anyhow::Result<bool> {
+        loop {
+            self.capture_active
+                .store(false, Ordering::SeqCst);
+
+            // Everything queued meanwhile is stale: a raced capture request was
+            // superseded by the overlay the user just saw, and the shell re-sends
+            // its complete settings snapshot after every `ready`. Capture requests
+            // and malformed lines are still answered, in arrival order.
+            while let Ok(input) = self.input_rx.try_recv() {
+                match input {
+                    Input::Capture(_) => out().error(ErrorCode::Rejected, "a capture was already open", false),
+                    Input::Invalid(reason) => out().error(ErrorCode::BadCommand, reason, false),
+                    Input::Settings(_) => {}
+                }
+            }
+
+            out().emit(&Event::Ready {});
+            let mut app = StandbyApp {
+                args,
+                input_rx: &self.input_rx,
+                parent_gone: &self.parent_gone,
+                selected: None,
+            };
+            event_loop.run_app_on_demand(&mut app)?;
+
+            let Some(selected) = app.selected else {
+                return Ok(false);
+            };
+            self.capture_active
+                .store(true, Ordering::SeqCst);
+            if self.parent_gone.load(Ordering::SeqCst) {
+                // EOF raced the capture request and the reader thread may already be gone —
+                // without it the mid-capture kill switch is disarmed, so don't start.
+                return Ok(false);
+            }
+            let root = args
+                .session_root
+                .as_deref()
+                .expect("clap requires session root");
+            match create_session_dir(root) {
+                Ok(session) => {
+                    args.session_dir = Some(session.clone());
+                    args.capture_mode = selected;
+                    out().emit(&Event::Session {
+                        dir: session.to_string_lossy().into_owned(),
+                    });
+                    return Ok(true);
+                }
+                Err(err) => {
+                    // Environmental (root deleted, disk full, ACL): not worth a process
+                    // exit that burns one of the shell's crash-fallback strikes. Report
+                    // and go back to waiting; the shell clears its overlay gate on this.
+                    log::error!("failed to create session dir in {}: {err}", root.display());
+                    out().error(ErrorCode::IoFailed, format!("failed to create session dir: {err}"), false);
+                }
+            }
+        }
+    }
+}
+
+struct StandbyApp<'a> {
+    args: &'a mut CliArgs,
+    input_rx: &'a mpsc::Receiver<Input>,
+    parent_gone: &'a AtomicBool,
+    selected: Option<CaptureMode>,
+}
+
+impl StandbyApp<'_> {
+    fn apply_settings(&mut self, raw_args: Vec<String>) {
+        let rejection = match CliArgs::try_parse_from(std::iter::once("flicksnap_capture".to_string()).chain(raw_args)) {
+            Ok(next) if next.standby => {
+                *self.args = next;
+                return;
+            }
+            Ok(_) => "settings snapshot must include --standby".to_string(),
+            Err(err) => err.to_string(),
+        };
+        // A rejected snapshot changes nothing: the previous settings stay.
+        out().error(ErrorCode::Rejected, format!("rejected settings snapshot: {rejection}"), false);
+    }
+
+    /// One pass over everything that can need attention. Shared by `about_to_wait`
+    /// and `user_event`: on Windows, `exit()` is only observed when it is set inside
+    /// message dispatch — a wake-up whose work was deferred to the next
+    /// `about_to_wait` would park the loop in an INFINITE wait with the exit
+    /// decision already made. An exit decided in `about_to_wait` itself (a
+    /// request whose wake a capture cycle swallowed) is why every exit also sets
+    /// the control flow: see `control_flow`.
+    fn process_pending(&mut self, event_loop: &ActiveEventLoop) {
+        // The loop dispatches one final AboutToWait while unwinding after exit() —
+        // a request landing in that instant must not overwrite the selection or apply
+        // settings mid-teardown; it is drained as stale at the next wait().
+        if self.selected.is_some() || event_loop.exiting() {
+            return;
+        }
+        let exit = self.pass();
+        event_loop.set_control_flow(control_flow(exit));
+        if exit {
+            event_loop.exit();
+        }
+    }
+
+    /// The work of `process_pending`; true when the loop must exit.
+    fn pass(&mut self) -> bool {
+        if self.parent_gone.load(Ordering::SeqCst) {
+            return true;
+        }
+        while let Ok(input) = self.input_rx.try_recv() {
+            match input {
+                Input::Settings(args) => self.apply_settings(args),
+                Input::Capture(mode) => {
+                    self.selected = Some(mode);
+                    return true;
+                }
+                Input::Invalid(reason) => out().error(ErrorCode::BadCommand, reason, false),
+            }
+        }
+        false
+    }
+}
+
+/// The control flow after a pass. Exiting must not leave `Wait`: Windows
+/// checks the exit code only after the wait returns, so an exit decided in
+/// `about_to_wait` with nothing else queued would block INFINITE. `Poll`
+/// makes that wait return at once (the capture cycle sets its own flow).
+/// Otherwise blocked until stdin wakes the loop.
+fn control_flow(exit: bool) -> LoopFlow {
+    if exit {
+        LoopFlow::Poll
+    } else {
+        LoopFlow::Wait
+    }
+}
+
+impl ApplicationHandler for StandbyApp<'_> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(LoopFlow::Wait);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        self.process_pending(event_loop);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.process_pending(event_loop);
+    }
+
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _window_id: winit::window::WindowId, _event: winit::event::WindowEvent) {}
+}
+
+fn create_session_dir(root: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let path = root.join(format!("capture-{stamp}-{}", std::process::id()));
+    std::fs::create_dir(&path)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An exit decided in `about_to_wait` (the shell gone, a selection) must
+    /// not leave the loop to block in `Wait`, where Windows never gets to check
+    /// the exit code.
+    #[test]
+    fn an_exit_never_waits() {
+        assert_eq!(control_flow(true), LoopFlow::Poll);
+        assert_eq!(control_flow(false), LoopFlow::Wait);
+    }
+}

@@ -1,0 +1,179 @@
+name: Build rust
+
+# Reusable build of the Rust binaries that sit beside flickSnap in every package:
+# the capture overlay, the scrolling capture driver,
+# the in-process interop library (flicksnap_interop) flickSnap and flickSnap.VideoRender
+# load, the flicksnap_ai inference binary (with its execution-provider dylibs and
+# the VC++ CRT it needs on Windows), and on Windows the shell extension dll and
+# its sparse MSIX. ci.yml calls it once; it runs alongside build-recorder.yml and
+# build-ui.yml, and ci.yml's package job merges the three.
+#
+# Each artifact `rust-<rid>` holds one archive, `rust-<rid>.zip`, whose members
+# sit at the archive root and unpack straight into the package directory. A zip
+# rather than the loose tree because upload-artifact does not preserve unix file
+# modes, and the macOS executables need theirs.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The nbgv version ci.yml's version job computed, stamped into the Sentry release name (crates/flicksnap_telemetry/src/lib.rs) and the MSIX manifest.
+        type: string
+        required: true
+    secrets:
+      SENTRY_AUTH_TOKEN:
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: rust (${{ matrix.rid }})
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # What each leg builds and ships (flicksnap_ai only where ONNX Runtime
+          # exists, the shell extension only on Windows) comes from
+          # tools/staging/shipped.sh, the list build.sh uses too.
+          # The app jobs (here, build-ui.yml, ci.yml's tests and release.yml)
+          # stay on macos-15, where they were pinned on purpose. Only the
+          # recorder runs on macos-26, because OBS 32.2.2 needs Xcode 26.5
+          # (build-recorder.yml). Moving the app jobs over is untested.
+          - rid: win-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            msix-arch: x64
+          - rid: win-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            msix-arch: arm64
+          - rid: osx-x64
+            os: macos-15
+            target: x86_64-apple-darwin
+          - rid: osx-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    # Lifted to the job so the Sentry step can test the token in an `if:`, where secrets are unavailable but env is; no SENTRY_ORG because an org token carries the slug itself.
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+      # The Rust build has no nbgv hook, so the version ci.yml computed once is stamped into the
+      # Sentry release name (crates/flicksnap_telemetry/src/lib.rs) and the MSIX manifest.
+      FLICKSNAP_VERSION: ${{ inputs.version }}
+      OUT: target/${{ matrix.target }}/release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # rust-cache already hashes Cargo.toml, but .cargo/config.toml is named explicitly so a rustflags-only edit cannot restore a cache built with the previous flags.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rid }}-${{ hashFiles('Cargo.toml', '.cargo/config.toml') }}
+
+      # One invocation rather than one per crate, so codegen and the LTO links overlap instead of leaving the runner idle.
+      # Explicit packages: the workspace also holds the recorder crates, which build-recorder.yml builds.
+      # The ort crate's build downloads pyke's prebuilt ONNX Runtime for the target and links flicksnap_ai statically.
+      - name: Build rust binaries
+        shell: bash
+        run: |
+          # shellcheck disable=SC2046 # word-split `-p <crate>` pairs
+          cargo build --release --target ${{ matrix.target }} $(tools/staging/stage-app.sh packages ${{ matrix.rid }})
+
+      # The in-process library gets a cargo invocation of its own: built beside the packages above,
+      # cargo would unify features across them and hand it flicksnap_capture's (all of AppKit, for one).
+      # Fails on cargo's "`default-features` is ignored for X" warning (cargo wraps
+      # the key in backticks), which means a dependency line silently enables more than it asks for,
+      # and on ld64's "duplicate symbol" warning.
+      - name: Build isolated rust libraries
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/isolated-build.log"
+          : > "$log"
+          while read -r args; do
+            echo "==> cargo build --release --target ${{ matrix.target }} $args"
+            # shellcheck disable=SC2086 # word-split `-p <crate>`
+            cargo build --release --target ${{ matrix.target }} $args 2>&1 | tee -a "$log"
+          done < <(tools/staging/stage-app.sh packages-isolated ${{ matrix.rid }})
+          if grep -E ".?default-features.? is ignored|duplicate symbol" "$log"; then
+            echo "::error::the isolated build printed a default-features or duplicate symbol warning"
+            exit 1
+          fi
+
+      # The artifact check behind the isolated build: exports only flicksnap_*, no Sentry symbol, only OS
+      # libraries as dependencies (and the @rpath install name on macOS).
+      - name: Verify isolated rust libraries
+        shell: bash
+        run: tools/staging/stage-app.sh verify-isolated ${{ matrix.rid }} "$OUT"
+
+      # An LTO release build needs these symbols for readable crash reports. Upload runs when a Sentry token is configured.
+      # The recorder has no Sentry integration, so it uploads no debug files.
+      - name: Upload debug files to Sentry
+        if: env.SENTRY_AUTH_TOKEN != ''
+        shell: bash
+        run: |
+          npm install -g @sentry/cli
+          tools/staging/stage-app.sh debug-files ${{ matrix.rid }} "$OUT" | while IFS=$'\t' read -r dif bin; do
+            sentry-cli debug-files upload "$dif" "$bin"
+          done
+
+      # stage/ unpacks into the package directory beside flickSnap: the overlay, the scrolling
+      # capture driver, the interop library, LICENSE/NOTICE and flicksnap_ai with its
+      # model NOTICE, DirectML.dll and (Windows) the VC++ runtime it alone imports. release.yml signs them with the rest: vpk's
+      # Trusted Signing pass covers every dll in the pack dir, and the macOS app signing and
+      # notarization cover every Mach-O in the bundle.
+      - name: Stage rust binaries
+        shell: bash
+        run: tools/staging/stage-app.sh stage ${{ matrix.rid }} "$OUT" stage
+
+      # The version in the filename means a changed extension arrives under a fresh name that a lock on the old copy cannot block.
+      - name: Stage shell extension (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          EXT_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "flicksnap_shell_ext") | .version')
+          echo "FLICKSNAP_EXT_VERSION=$EXT_VERSION" >> "$GITHUB_ENV"
+          cp "$OUT/flicksnap_shell_ext.dll" "stage/flickSnapShellExt_${EXT_VERSION}.dll"
+        shell: bash
+
+      # Sparse package: the msix holds only the manifest + logos and /nv skips the payload validation that would reject its references to the external dll.
+      - name: Build shell extension MSIX (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP msix-staging
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item -Recurse crates/flicksnap_shell_ext/msix/Assets (Join-Path $staging Assets)
+          $manifest = (Get-Content crates/flicksnap_shell_ext/msix/AppxManifest.template.xml -Raw)
+          $manifest = $manifest.Replace('{{VERSION}}', "$env:FLICKSNAP_VERSION.0").Replace('{{ARCH}}', '${{ matrix.msix-arch }}').Replace('{{EXTVERSION}}', $env:FLICKSNAP_EXT_VERSION)
+          Set-Content -Path (Join-Path $staging AppxManifest.xml) -Value $manifest -Encoding utf8
+          $makeappx = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe' | Select-Object -Last 1
+          & $makeappx.FullName pack /d $staging /p stage/flickSnapShellExt.msix /nv /o
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        shell: pwsh
+
+      - name: Archive stage (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path stage/* -DestinationPath rust-${{ matrix.rid }}.zip
+        shell: pwsh
+
+      - name: Archive stage (macOS)
+        if: runner.os == 'macOS'
+        run: cd stage && zip -qry "../rust-${{ matrix.rid }}.zip" .
+
+      # Only ci.yml's package job reads this, later in the same run.
+      - name: Upload stage
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-${{ matrix.rid }}
+          path: rust-${{ matrix.rid }}.zip
+          if-no-files-found: error
+          # Already a zip; re-deflating it only costs time.
+          compression-level: 0
+          retention-days: 1

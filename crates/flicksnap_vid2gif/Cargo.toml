@@ -1,0 +1,28 @@
+[package]
+name = "flicksnap_vid2gif"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# The helper protocol (crates/flicksnap_capture/HELPER_PROTOCOL.md): stdio channel, the `job` catalog, lifetime.
+flicksnap_ipc = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+flicksnap_ffmpeg_sys = { workspace = true }
+# Encodes the WebP output; FFmpeg still decodes, resamples and scales (src/webp.rs).
+libwebp-sys = { workspace = true }
+
+# Sentry: panics only (init_job), one project with the rest of FlickSnap. Not on Linux, where
+# vid2gif is built in the manylinux image without the sentry/TLS tree (HELPER_PROTOCOL.md §3.4).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+flicksnap_telemetry = { workspace = true }
+
+[dev-dependencies]
+# tests/cli.rs parses the protocol lines.
+serde_json = { workspace = true }
+
+[build-dependencies]
+# Linux: stages the shared FFmpeg bundle (and, for flicksnap_recorder, libobs + plugins)
+# next to the binary with $ORIGIN RUNPATHs.
+flicksnap_build_support = { workspace = true }

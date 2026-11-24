@@ -1,0 +1,11 @@
+[package]
+name = "flicksnap_obs"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flicksnap_obs_sys = { workspace = true }
+
+[build-dependencies]
+flicksnap_build_support = { workspace = true }
