@@ -156,7 +156,7 @@ impl WindowHandle {
             #[cfg(target_os = "macos")]
             show_window_without_focus(&self.window);
             #[cfg(target_os = "macos")]
-            if let Some(ref subview) = self
+            if let Some(subview) = self
                 .render_subview
                 .as_ref()
                 .filter(|_| !self.live_region)

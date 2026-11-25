@@ -51,7 +51,8 @@ pub fn capture_region(bounds: ScreenRect, monitors: &[MonitorInfo]) -> Result<De
             if src_w == w {
                 dst.copy_from_slice(src);
             } else {
-                for (col, pixel) in dst.chunks_exact_mut(4).enumerate() {
+                let (dst_pixels, _) = dst.as_chunks_mut::<4>();
+                for (col, pixel) in dst_pixels.iter_mut().enumerate() {
                     let x = col * src_w / w * 4;
                     pixel.copy_from_slice(&src[x..x + 4]);
                 }

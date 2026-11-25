@@ -69,6 +69,7 @@ namespace FlickSnap.VideoSDK.Playback
         private const int TickIntervalMs = 16;
 
         private readonly Action<Action> _dispatch;
+        private readonly IMonotonicTime _time;
         private readonly object _stateSync = new object();
         private readonly object _lifecycleSync = new object(); // serializes seeks vs update/reopen/dispose
         private readonly PlaybackFrameSource _frameSource = new PlaybackFrameSource();
@@ -123,8 +124,14 @@ namespace FlickSnap.VideoSDK.Playback
         /// <param name="eventDispatcher">Marshals <see cref="PositionChanged"/> /
         /// <see cref="StateChanged"/> onto the UI thread. Null = raise on the calling thread.</param>
         public CompositionPlayer(Action<Action> eventDispatcher = null)
+            : this(eventDispatcher, null)
+        {
+        }
+
+        internal CompositionPlayer(Action<Action> eventDispatcher, IMonotonicTime time)
         {
             _dispatch = eventDispatcher ?? (a => a());
+            _time = time;
         }
 
         // ------------------------------------------------------------------------ pipeline model
@@ -347,7 +354,7 @@ namespace FlickSnap.VideoSDK.Playback
         {
             _options = options;
             _warp = TimeWarp.Build(project);
-            _clock = new PlaybackClock { Rate = _playbackRate };
+            _clock = new PlaybackClock(_time) { Rate = _playbackRate };
 
             var map = ProjectTimelineMap.Build(project);
             _project = project;

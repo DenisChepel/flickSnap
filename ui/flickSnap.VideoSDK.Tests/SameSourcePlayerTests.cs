@@ -122,6 +122,13 @@ namespace FlickSnap.VideoSDK.Tests
 
         private static long Ticks(double seconds) => (long)(seconds * Second);
 
+        private sealed class ControlledTime : IMonotonicTime
+        {
+            private long _ticks;
+            public TimeSpan Elapsed => TimeSpan.FromTicks(Volatile.Read(ref _ticks));
+            public void AdvanceTo(double seconds) => Volatile.Write(ref _ticks, Ticks(seconds));
+        }
+
         // ------------------------------------------------------------------------------ helpers
 
         private static bool WaitUntil(Func<bool> condition, int timeoutMs = 15000)
@@ -1145,8 +1152,6 @@ namespace FlickSnap.VideoSDK.Tests
             // two clips of one lane on one line of source: the lane stopped at the end of the first,
             // so the second enters through a hop and does not wait for a decoder to catch up
             var project = NewProject();
-            // the clips are long enough that a loaded machine's late tick still lands inside them:
-            // a hop that only runs once the playhead has left its clip has nothing to land
             var sourceId = AddSource(project, EncodeFixture(10));
             AddClip(project, AddRow(project), sourceId, 0, 6, 0);
             var row = AddRow(project);
@@ -1156,17 +1161,28 @@ namespace FlickSnap.VideoSDK.Tests
 
             using var factory = new CpuSurfaceFactory();
             using var cache = new FrameTextureCache(factory);
-            using var player = new CompositionPlayer();
+            var time = new ControlledTime();
+            using var player = new CompositionPlayer(eventDispatcher: null, time: time);
             await player.OpenAsync(project, Options());
+            await player.SeekAsync(TimeSpan.Zero, SeekMode.Exact);
 
             Assert.True(WaitUntil(() => LanePts(player, cache, sourceId, 1) is not null));
-            int seeks = player.VideoSeekCount(lane1);
+            int initialSeeks = player.VideoSeekCount(lane1);
+            int ticks = 0;
+            player.PositionChanged += (_, _) => Interlocked.Increment(ref ticks);
 
             player.Play();
-            Assert.True(WaitUntil(() => player.VideoSeekCount(lane1) > seeks), "entering the first clip did not hop");
+            time.AdvanceTo(0.75);
+            Assert.True(WaitUntil(() => player.VideoSeekCount(lane1) > initialSeeks), "entering the first clip did not hop");
 
-            Assert.True(WaitUntil(() => player.Position.Ticks >= Ticks(2.5)), $"pos={player.Position}");
+            time.AdvanceTo(2.5);
+            int ticksAtGap = Volatile.Read(ref ticks);
+            // A tick can already be in flight when time advances. Two notifications
+            // guarantee the transport saw the gap and cleared the lane's offset.
+            Assert.True(WaitUntil(() => Volatile.Read(ref ticks) >= ticksAtGap + 2), "the transport did not process the gap");
             int afterFirst = player.VideoSeekCount(lane1);
+
+            time.AdvanceTo(3.25);
             Assert.True(WaitUntil(() => player.VideoSeekCount(lane1) > afterFirst), "entering the second clip did not hop");
             Assert.True(WaitUntil(() => LanePts(player, cache, sourceId, 1) >= Ticks(7)),
                 $"pts={LanePts(player, cache, sourceId, 1)}");
