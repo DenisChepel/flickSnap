@@ -97,8 +97,7 @@ pub mod tokens {
     /// White text at 80 %: the accelerator letter beside a `key`-style
     /// icon.
     pub const FG_80: Color32 = white_alpha(204);
-    /// White text at 70 %: the readout's second line (the × sign or the
-    /// "words" caption).
+    /// White text at 70 %: the OCR readout's "words" caption.
     pub const FG_70: Color32 = white_alpha(179);
 
     /// `key` style: a 40 pt square holding the icon and the accelerator
@@ -150,8 +149,7 @@ pub mod tokens {
     /// the air.
     pub const DIVIDER_BLOCK: f32 = 2.0 * DIVIDER_PAD_V + DIVIDER.width;
 
-    /// 11 pt "W / × / H" readout, set on 1 em line boxes so the three
-    /// lines sit tight.
+    /// 11 pt OCR word count, set on 1 em line boxes.
     pub const READOUT_FONT: f32 = 11.0;
     pub const READOUT_LINE: f32 = 11.0;
     pub const READOUT_PAD_H: f32 = 4.0;

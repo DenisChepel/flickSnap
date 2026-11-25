@@ -142,7 +142,7 @@ impl PanelButtonSet {
         }
     }
 
-    /// What sits between the emblem and the buttons.
+    /// What sits between the emblem and the buttons on the single strip.
     pub const fn body(self) -> Body {
         match self {
             Self::Normal | Self::Ocr => Body::Readout,
@@ -217,34 +217,6 @@ impl PanelButtonSet {
 pub enum PanelLayout {
     Single,
     Double,
-}
-
-/// What the tray's readout slot shows beside the emblem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Readout {
-    /// The capture strip: the selection's size, "W / × / H".
-    Size { width: i32, height: i32 },
-    /// The OCR strip: how many words were lifted, "N / words".
-    Words(usize),
-}
-
-impl Readout {
-    /// The word count of a lifted result: whitespace-separated runs of
-    /// the newline-joined `full_text`, which is what COPY hands over.
-    pub fn words_in(text: &str) -> Self {
-        Self::Words(text.split_whitespace().count())
-    }
-
-    /// The readout a slot is sized from. A word count reserves five
-    /// digits — digits are tabular, so every count up to 99 999 lays out
-    /// the same width — and the strip does not grow and shrink as the
-    /// count changes. A size is measured as it is.
-    pub fn for_measure(self) -> Self {
-        match self {
-            Self::Words(n) => Self::Words(n.max(99_999)),
-            size => size,
-        }
-    }
 }
 
 /// Which fill a group of buttons sits on.
@@ -525,7 +497,7 @@ pub const SCROLL_PICK_HINT: &str = "Resize the selection to the scrolling area, 
 /// What a set puts between the emblem and its buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Body {
-    /// The two-line readout: the selection's size, or the word count.
+    /// The OCR word count.
     Readout,
     /// A wrapped instruction, sitting straight on the chassis — no fill
     /// of its own, the way the readout has none.
@@ -939,16 +911,6 @@ mod tests {
                 .len(),
             3
         );
-    }
-
-    /// The count the OCR readout shows is the number of whitespace-
-    /// separated runs across every line, since `full_text` joins the
-    /// lines with newlines.
-    #[test]
-    fn readout_counts_words_across_lines() {
-        assert_eq!(Readout::words_in(""), Readout::Words(0));
-        assert_eq!(Readout::words_in("   \n  "), Readout::Words(0));
-        assert_eq!(Readout::words_in("one two\nthree  four\n"), Readout::Words(4));
     }
 
     /// The tips are one-line verb phrases: a chip long enough to wrap

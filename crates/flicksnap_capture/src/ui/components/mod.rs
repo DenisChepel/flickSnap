@@ -98,8 +98,7 @@ pub struct OverlayInputs {
     pub overlays_visible: bool,
     /// The hint comet's body and head colours ([`hints::trail::comet_colors`]).
     pub comet: (Color32, Color32),
-    /// The "W x H" pill, on the host holding the cursor while a selection
-    /// is being dragged out.
+    /// The "W x H" pill on the host at the selection's top-left corner.
     pub area: Option<area::show::AreaInputs>,
     /// The Tips & Hotkeys panel, on the host holding the cursor.
     pub tips: Option<tips::show::TipsInputs>,
@@ -232,11 +231,7 @@ mod tests {
             features: PanelFeatures::ALL,
             style: ButtonStyle::KeyHint,
             accent: Color32::from_rgb(0x2F, 0x7C, 0xAE),
-            readout: panel::model::Readout::Size {
-                width: selection.width(),
-                height: selection.height(),
-            },
-            selection,
+            word_count: 0,
             anchor: intersect_rects(monitor.bounds, selection).expect("the selection is on this monitor"),
         }
     }

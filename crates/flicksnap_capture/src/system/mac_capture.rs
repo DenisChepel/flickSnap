@@ -7,7 +7,7 @@ use objc2_core_graphics::{CGDisplayCreateImage, CGImage, CGWindowImageOption, CG
 
 use crate::system::MonitorInfo;
 use flicksnap_desktop::{grab, CGPoint, CGRect, CGSize, ImageBytes};
-use flicksnap_shared::geometry::{RectExt, ScreenRect};
+use flicksnap_shared::geometry::ScreenRect;
 
 pub struct DesktopBitmap {
     pub bgra: Vec<u8>,

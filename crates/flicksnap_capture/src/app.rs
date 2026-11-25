@@ -2344,6 +2344,9 @@ impl ApplicationHandler for App {
                 }
 
                 if cycle.settings.live_selection() && !cycle.input.captured {
+                    if cycle.input.dragging {
+                        broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
+                    }
                     if cycle.input.mouse_down {
                         broadcast_mouse_state(&self.windows, &cycle.input);
                     }

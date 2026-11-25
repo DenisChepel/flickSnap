@@ -1,6 +1,6 @@
 //! The button panel shown once a selection is captured: one floating tray
 //! (the design shared with the C# recording / share-region / scrolling
-//! strips) holding the FlickSnap emblem, the "W × H" readout and the action
+//! strips) holding the FlickSnap emblem and the action
 //! buttons in their groups (the accent group first, then the grey ones),
 //! anchored beneath or beside the selection.
 //!
@@ -11,7 +11,7 @@
 //! on their own row with full labels, and the hand-offs and the two ways
 //! out on a second row as accelerator tiles sitting straight on the
 //! chassis, the hand-offs left and the ways out flush right. Stood on its
-//! end it becomes the emblem beside the readout, the labelled actions one
+//! end it becomes the emblem above the labelled actions, one
 //! per line, and the rest in a two-column grid. `--panel-buttons` picks
 //! the presentation for the single strip only; the double one draws both
 //! presentations itself.

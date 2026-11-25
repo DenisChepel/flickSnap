@@ -1,5 +1,5 @@
 use flicksnap_desktop::{WindowDescription, WindowFilter};
-use flicksnap_shared::geometry::ScreenRect;
+use flicksnap_shared::geometry::{RectExt, ScreenRect};
 
 use super::mac_corners::CgBounds;
 use super::{mac_corners, MonitorInfo, WindowTarget};

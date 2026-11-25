@@ -28,7 +28,7 @@
 use egui::{pos2, vec2, Rect, Vec2};
 
 use super::assets;
-use super::model::{Body, ButtonDef, ButtonStyle, GroupTone, PanelButtonSet, PanelFeatures, PanelLayout, Readout};
+use super::model::{Body, ButtonDef, ButtonStyle, GroupTone, PanelButtonSet, PanelFeatures, PanelLayout};
 use super::place::{self, Axis, Fit, Footprint, Near};
 use super::theme::{self, tokens};
 use super::widgets;
@@ -147,7 +147,7 @@ pub type MeasuredButton = (usize, &'static ButtonDef, f32);
 /// paints it uses the width the pass that sized the tray measured.
 #[derive(Clone, Copy, PartialEq)]
 pub enum MeasuredBody {
-    Readout(Readout),
+    Readout(usize),
     Hint { text: &'static str, wrap: f32 },
 }
 
@@ -204,9 +204,9 @@ pub struct StripMetrics {
 impl StripMetrics {
     /// Measure one set under one feature switch set. Only valid inside a
     /// run: `Context::fonts_mut` panics before the first pass.
-    pub fn measure(ctx: &egui::Context, set: PanelButtonSet, features: PanelFeatures, style: ButtonStyle, readout: Readout) -> Self {
+    pub fn measure(ctx: &egui::Context, set: PanelButtonSet, features: PanelFeatures, style: ButtonStyle, word_count: usize) -> Self {
         let body = match set.body() {
-            Body::Readout => MeasuredBody::Readout(readout),
+            Body::Readout => MeasuredBody::Readout(word_count),
             Body::Hint(text) => {
                 let (wrap, _) = hint_wrap(ctx, text);
                 MeasuredBody::Hint {
@@ -240,8 +240,9 @@ impl StripMetrics {
             })
             .collect();
         let body_along = match body {
-            MeasuredBody::Readout(readout) => {
-                let galley = ctx.fonts_mut(|f| f.layout_job(widgets::readout_job(readout.for_measure())));
+            MeasuredBody::Readout(word_count) => {
+                // Reserve five tabular digits so the tray stays put as the count changes.
+                let galley = ctx.fonts_mut(|f| f.layout_job(widgets::readout_job(word_count.max(99_999))));
                 thick.max(galley.size().x + 2.0 * tokens::READOUT_PAD_H)
             }
             MeasuredBody::Hint {
@@ -321,25 +322,8 @@ impl StripMetrics {
 /// [`PanelFeatures`], and the layout closes the hole rather than leaving a
 /// gap where it was.
 ///
-/// A row is the emblem over the readout in one head column, the accent
-/// actions beside the emblem with their full labels, and the odds and
-/// ends beside the readout as accelerator tiles — the hand-offs left, the
-/// ways out flush right. A column is the emblem beside the readout, then
-/// the accent actions one per line at the tray's full width, then the odds
-/// and ends `DOUBLE_COLS` to a line.
-///
-/// The emblem and the readout take one button's box each and centre their
-/// contents in it, so both sit square over what is under them: in a row
-/// that box is `head`, the same width for the two of them; in a column it
-/// is one grid cell, so the emblem lands dead centre over the first
-/// column of tiles and the readout over the second.
-///
-/// In a row the emblem is followed by a full `GAP`, not the single
-/// strip's tighter `EMBLEM_GAP`: it heads a column of buttons rather than
-/// a run, so it has to take exactly one button's room — a tile and a gap
-/// — or everything under it would start half a step to its left. In a
-/// column the two head boxes are flush, like the grid cells they sit
-/// over.
+/// The emblem spans both rows in the horizontal tray. In the vertical
+/// tray it sits above the full-width actions and the two-column grid.
 ///
 /// Switching enough of the accent actions off leaves the first row
 /// shorter than the second, which reads as a tray with a bite out of its
@@ -351,12 +335,6 @@ impl StripMetrics {
 /// (`widgets::divider`), which is the separation a row gets for free from
 /// pushing its ways out to the far end.
 pub struct DoubleMetrics {
-    /// What the readout says: the selection's size.
-    pub readout: Readout,
-    /// The head column of a row-mode tray — the emblem above the readout,
-    /// both as wide as the wider of the two, so the accent row and the
-    /// second row start at the same x.
-    pub head: f32,
     /// The accent run of the first row: labelled buttons with their row
     /// lengths.
     pub primary: Vec<MeasuredButton>,
@@ -375,9 +353,7 @@ pub struct DoubleMetrics {
     /// same buttons out in table order either way.
     pub promoted: Vec<MeasuredButton>,
     /// The width this measure would want in a column: enough for the
-    /// widest labelled button, for the emblem beside the readout and for
-    /// `DOUBLE_COLS` tiles side by side — and a whole multiple of
-    /// `DOUBLE_COLS`, so the grid splits it evenly.
+    /// widest labelled button and for `DOUBLE_COLS` tiles side by side.
     ///
     /// Only `Strip::col_inner` reads it, and only off a measure taken
     /// with every switch on; the width the tray is laid out at is passed
@@ -388,7 +364,7 @@ pub struct DoubleMetrics {
 impl DoubleMetrics {
     /// Measure the capture strip under one feature switch set. Only valid
     /// inside a run: `Context::fonts_mut` panics before the first pass.
-    pub fn measure(ctx: &egui::Context, features: PanelFeatures, readout: Readout) -> Self {
+    pub fn measure(ctx: &egui::Context, features: PanelFeatures) -> Self {
         let mut primary = Vec::new();
         let mut attached = Vec::new();
         let mut bare: Vec<Vec<MeasuredButton>> = Vec::new();
@@ -418,10 +394,6 @@ impl DoubleMetrics {
         let mut tail = bare.pop().unwrap_or_default();
         let funcs: Vec<MeasuredButton> = bare.concat();
 
-        let galley = ctx.fonts_mut(|f| f.layout_job(widgets::readout_job(readout.for_measure())));
-        let body_along = galley.size().x + 2.0 * tokens::READOUT_PAD_H;
-        let head = tokens::EMBLEM_SLOT.max(body_along);
-
         // Even the two rows up: with the first row the shorter of the two
         // there is a tile-sized hole above the ways out, so the first of
         // them moves up into it. Never the last one — a row of ways out
@@ -442,21 +414,14 @@ impl DoubleMetrics {
             .chain(attached.iter())
             .map(|(_, _, along)| *along)
             .fold(tokens::KEY_TILE, f32::max);
-        // In a column the emblem and the readout are one grid cell each,
-        // flush, so the tray has to be at least `DOUBLE_COLS` of the wider
-        // of the two — otherwise one of them would be squeezed narrower
-        // than the tiles it sits over and stop looking centred on them.
-        let head_row = cols * head;
         // The grid's buttons are left-aligned at the labelled buttons'
         // padding so every icon in a column sits at one x, so a cell has
         // to be wide enough for a tile carrying that padding — wider than
         // the plain `KEY_TILE` the second row of a wide tray uses.
         let grid_floor = cols * widgets::key_button_length(ctx, tokens::LABEL_PAD_H);
-        let col_inner = (widest_primary.max(head_row).max(grid_floor) / cols).ceil() * cols;
+        let col_inner = (widest_primary.max(grid_floor) / cols).ceil() * cols;
 
         Self {
-            readout,
-            head,
             primary,
             attached,
             funcs,
@@ -472,12 +437,6 @@ impl DoubleMetrics {
             .iter()
             .map(|(_, _, along)| *along)
             .sum()
-    }
-
-    /// One row's length: the head column, the gap after the emblem and
-    /// the run itself.
-    fn row_len(head: f32, buttons: &[MeasuredButton]) -> f32 {
-        head + tokens::GAP + Self::run_len(buttons)
     }
 
     /// One gap between a row's two clusters — none when either of them is
@@ -529,10 +488,12 @@ impl DoubleMetrics {
                 // The gap before a right-aligned cluster is the least it
                 // may be; that cluster usually pushes it much wider.
                 let finishers: Vec<MeasuredButton> = self.finishers().copied().collect();
-                let first =
-                    Self::row_len(self.head, &finishers) + Self::gap_between(&finishers, &self.promoted) + Self::run_len(&self.promoted);
-                let second = Self::row_len(self.head, &self.funcs) + Self::gap_between(&self.funcs, &self.tail) + Self::run_len(&self.tail);
-                vec2(first.max(second), 2.0 * tokens::DOUBLE_ROW + tokens::GAP)
+                let first = Self::run_len(&finishers) + Self::gap_between(&finishers, &self.promoted) + Self::run_len(&self.promoted);
+                let second = Self::run_len(&self.funcs) + Self::gap_between(&self.funcs, &self.tail) + Self::run_len(&self.tail);
+                vec2(
+                    tokens::EMBLEM_SLOT + tokens::GAP + first.max(second),
+                    2.0 * tokens::DOUBLE_ROW + tokens::GAP,
+                )
             }
             Axis::Column => {
                 let mut len = tokens::DOUBLE_ROW;
@@ -555,7 +516,7 @@ impl DoubleMetrics {
     /// The air between one row's two clusters, so the right-hand one ends
     /// flush with the tray's edge whatever the other row is doing.
     fn spacer(&self, content_width: f32, left: f32, right: &[MeasuredButton]) -> f32 {
-        let used = self.head + tokens::GAP + left + Self::run_len(right);
+        let used = left + Self::run_len(right);
         (content_width - used).max(0.0)
     }
 }
@@ -567,10 +528,10 @@ pub enum Strip {
 }
 
 impl Strip {
-    pub fn measure(ctx: &egui::Context, set: PanelButtonSet, features: PanelFeatures, style: ButtonStyle, readout: Readout) -> Self {
+    pub fn measure(ctx: &egui::Context, set: PanelButtonSet, features: PanelFeatures, style: ButtonStyle, word_count: usize) -> Self {
         match set.layout() {
-            PanelLayout::Single => Self::Single(StripMetrics::measure(ctx, set, features, style, readout)),
-            PanelLayout::Double => Self::Double(DoubleMetrics::measure(ctx, features, readout)),
+            PanelLayout::Single => Self::Single(StripMetrics::measure(ctx, set, features, style, word_count)),
+            PanelLayout::Double => Self::Double(DoubleMetrics::measure(ctx, features)),
         }
     }
 
@@ -599,37 +560,13 @@ fn outer_px(content: Vec2, ppp: f32) -> (i32, i32) {
     (((content.x + pad) * ppp).round() as i32, ((content.y + pad) * ppp).round() as i32)
 }
 
-/// The readout each set would show, given the current inputs: the size
-/// for the capture strip, the word count for the OCR strip. Before any
-/// text is lifted the count is unknown, and zero stands in: the "words"
-/// caption is the wide line, so the slot's width does not depend on the
-/// number.
-fn readout_for(set: PanelButtonSet, p: &PanelInputs) -> Readout {
-    match (set, p.readout) {
-        // The scroll-pick strip shows an instruction, not a readout; the
-        // value is carried along unused so `measure` stays one signature.
-        (PanelButtonSet::ScrollPick, r) => r,
-        (PanelButtonSet::Normal, _) => Readout::Size {
-            width: p.selection.width(),
-            height: p.selection.height(),
-        },
-        (PanelButtonSet::Ocr, words @ Readout::Words(_)) => words,
-        (
-            PanelButtonSet::Ocr,
-            Readout::Size {
-                ..
-            },
-        ) => Readout::Words(0),
-    }
-}
-
 /// The width one set draws at when the tray stands on its end: its own,
 /// measured with every switch on, so flipping a feature can never move
 /// the tray's edge. Two sets may want different widths — the capture
 /// strip's grid is twice a tile wide and the OCR strip is one — the same
 /// way they have always drawn rows of different lengths.
 fn col_inner_for(ctx: &egui::Context, p: &PanelInputs, set: PanelButtonSet) -> f32 {
-    Strip::measure(ctx, set, PanelFeatures::ALL, p.style, readout_for(set, p)).col_inner()
+    Strip::measure(ctx, set, PanelFeatures::ALL, p.style, p.word_count).col_inner()
 }
 
 /// The longest box either set can become in each orientation with every
@@ -647,7 +584,7 @@ fn union_fit(ctx: &egui::Context, p: &PanelInputs, ppp: f32) -> Fit {
         },
     };
     for &set in PanelButtonSet::UNION {
-        let m = Strip::measure(ctx, set, PanelFeatures::ALL, p.style, readout_for(set, p));
+        let m = Strip::measure(ctx, set, PanelFeatures::ALL, p.style, p.word_count);
         let col_inner = m.col_inner();
         let (w, h) = outer_px(m.content_size(Axis::Row, col_inner), ppp);
         fit.row.len = fit.row.len.max(w);
@@ -670,7 +607,7 @@ fn measure_and_place(
     let ppp = monitor.dpi_scale.max(0.1);
     let mut fit = union_fit(ctx, p, ppp);
     let col_inner = col_inner_for(ctx, p, p.set);
-    let m = Strip::measure(ctx, p.set, p.features, p.style, p.readout);
+    let m = Strip::measure(ctx, p.set, p.features, p.style, p.word_count);
     // A set outside the union (the scroll-picker) is not in `fit`, and the
     // side cascade's "does the strip fit along the monitor" test has to be
     // asked about the strip that is actually up — otherwise a two-line
@@ -914,15 +851,8 @@ fn single_strip(
 
 /// The capture strip's two-row chassis.
 ///
-/// A row: the emblem over the readout in one head column, the finishing
-/// actions beside the emblem with their full labels (the accent block
-/// with its grey tail — see `finishing_run`), and beside the readout the
-/// hand-offs left and the ways out flush right, those six straight on the
-/// chassis with no fill under them.
-///
-/// A column: the emblem beside the readout, then the finishing actions
-/// one per line at the tray's full width, then the same six two to a
-/// line with a rule across the break.
+/// In a row, the emblem sits beside both button rows. In a column, it
+/// sits above the finishing actions and the grid.
 fn double_strip(
     ui: &mut egui::Ui,
     m: &DoubleMetrics,
@@ -942,36 +872,37 @@ fn double_strip(
         .sum();
     match axis {
         Axis::Row => {
-            let width = m.content_size(Axis::Row, col_inner).x;
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing = vec2(0.0, tokens::GAP);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    widgets::emblem(ui, vec2(m.head, row));
-                    ui.add_space(tokens::GAP);
-                    if m.finishers().next().is_some() {
-                        finishing_run(ui, m, p, |b| vec2(b.2, row), (label, grey), out, hovered);
-                    }
-                    // The way out lifted up here to even the rows: flush
-                    // right, straight above the one left below it.
-                    if !m.promoted.is_empty() {
-                        ui.add_space(m.spacer(width, finishers_len, &m.promoted));
-                        for measured in &m.promoted {
+            let size = m.content_size(Axis::Row, col_inner);
+            let width = size.x - tokens::EMBLEM_SLOT - tokens::GAP;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                widgets::emblem(ui, vec2(tokens::EMBLEM_SLOT, size.y));
+                ui.add_space(tokens::GAP);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, tokens::GAP);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        if m.finishers().next().is_some() {
+                            finishing_run(ui, m, p, |b| vec2(b.2, row), (label, grey), out, hovered);
+                        }
+                        // The promoted action aligns with the one below it.
+                        if !m.promoted.is_empty() {
+                            ui.add_space(m.spacer(width, finishers_len, &m.promoted));
+                            for measured in &m.promoted {
+                                button(ui, p, measured, vec2(measured.2, row), tile, out, hovered);
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        for measured in &m.funcs {
                             button(ui, p, measured, vec2(measured.2, row), tile, out, hovered);
                         }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    widgets::readout(ui, m.readout, vec2(m.head, row));
-                    ui.add_space(tokens::GAP);
-                    for measured in &m.funcs {
-                        button(ui, p, measured, vec2(measured.2, row), tile, out, hovered);
-                    }
-                    ui.add_space(m.spacer(width, DoubleMetrics::run_len(&m.funcs), &m.tail));
-                    for measured in &m.tail {
-                        button(ui, p, measured, vec2(measured.2, row), tile, out, hovered);
-                    }
+                        ui.add_space(m.spacer(width, DoubleMetrics::run_len(&m.funcs), &m.tail));
+                        for measured in &m.tail {
+                            button(ui, p, measured, vec2(measured.2, row), tile, out, hovered);
+                        }
+                    });
                 });
             });
         }
@@ -988,14 +919,7 @@ fn double_strip(
             let ways_out: Vec<&MeasuredButton> = m.ways_out().collect();
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, tokens::GAP);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    // One grid cell each, flush: the emblem is then dead
-                    // centre over the first column of tiles and the
-                    // readout over the second.
-                    widgets::emblem(ui, vec2(cell, row));
-                    widgets::readout(ui, m.readout, vec2(cell, row));
-                });
+                widgets::emblem(ui, vec2(col_inner, row));
                 if m.finishers().next().is_some() {
                     finishing_run(ui, m, p, |_| vec2(col_inner, row), (label, grey), out, hovered);
                 }
@@ -1040,9 +964,6 @@ pub fn show(ctx: &egui::Context, p: &PanelInputs, monitor: UiMonitor, visible: b
     // here rather than drawn as egui's placeholder glyph.
     assets::preload(ctx);
     let ppp = monitor.dpi_scale.max(0.1);
-    // The size readout prints the UNCLIPPED selection, so a rect straddling
-    // two monitors keeps showing its true size; only placement uses the
-    // clipped anchor.
     let (m, col_inner, side, rect_px) = measure_and_place(ctx, p, monitor);
     let axis = side.axis();
     let local = egui::pos2(
@@ -1107,22 +1028,12 @@ mod tests {
     const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x7C, 0xAE);
 
     fn inputs(set: PanelButtonSet, features: PanelFeatures, style: ButtonStyle, selection: ScreenRect, monitor: UiMonitor) -> PanelInputs {
-        let readout = match set {
-            // The scroll-pick strip has no readout; the value is carried
-            // through unused, as the shell carries it.
-            PanelButtonSet::Normal | PanelButtonSet::ScrollPick => Readout::Size {
-                width: selection.width(),
-                height: selection.height(),
-            },
-            PanelButtonSet::Ocr => Readout::Words(1234),
-        };
         PanelInputs {
             set,
             features,
             style,
             accent: ACCENT,
-            readout,
-            selection,
+            word_count: 1234,
             anchor: crate::selection::intersect_rects(monitor.bounds, selection).expect("the selection overlaps the monitor"),
         }
     }
@@ -1301,20 +1212,15 @@ mod tests {
     /// digits never change the strip.
     #[test]
     fn ocr_readout_shows_words_and_the_caption_sets_the_width() {
-        let job = widgets::readout_job(Readout::Words(1234));
+        let job = widgets::readout_job(1234);
         assert_eq!(job.text, "1234\nwords");
-        let size = widgets::readout_job(Readout::Size {
-            width: 600,
-            height: 400,
-        });
-        assert_eq!(size.text, "600\n\u{00D7}\n400");
 
         let mon = hd(1.0);
         let mut h = Harness::new(mon);
         let mut widths = Vec::new();
         for n in [0, 7, 1234, 99_999] {
             let p = PanelInputs {
-                readout: Readout::Words(n),
+                word_count: n,
                 ..inputs(PanelButtonSet::Ocr, PanelFeatures::ALL, ButtonStyle::KeyHint, row_selection(), mon)
             };
             h.run(&p, None);
@@ -1530,7 +1436,7 @@ mod tests {
         }
     }
 
-    /// The design, as a row: the emblem over the readout in one head
+    /// The design, as a row: the emblem spanning both rows in one head
     /// column, the five accent actions on the first row with their labels
     /// on, and on the second row the hand-offs left and the ways out flush
     /// with the tray's right padding. In Inter the labelled run is the
@@ -1611,7 +1517,7 @@ mod tests {
         assert_eq!(out.clicked, Some(Command::Upload), "{out:?}");
     }
 
-    /// The design, as a column: the emblem beside the readout, the accent
+    /// The design, as a column: the emblem above the accent
     /// actions one per line at the tray's full width, then the rest two to
     /// a line.
     #[test]
@@ -1666,54 +1572,6 @@ mod tests {
                 assert!((right.left() - left.right()).abs() <= 0.5, "{line:?}");
             }
         }
-    }
-
-    /// The emblem and the readout each take one grid cell in a column, so
-    /// the emblem is centred over the first column of tiles and the
-    /// readout over the second. A cell narrower than either of them would
-    /// squeeze it off centre.
-    #[test]
-    fn capture_column_heads_are_one_cell_each() {
-        let mon = monitor(rect(0, 0, 1920, 1300), 1.0);
-        let mut h = Harness::new(mon);
-        let p = inputs(
-            PanelButtonSet::Normal,
-            PanelFeatures::ALL,
-            ButtonStyle::KeyHint,
-            rect(100, 300, 400, 998),
-            mon,
-        );
-        h.run(&p, None);
-        let area = h.area_rect();
-        let mut rects: Vec<Rect> = h
-            .interactive_rects()
-            .into_iter()
-            .filter(|r| r.height() <= tokens::DOUBLE_ROW + 0.5)
-            .collect();
-        rects.sort_by(|a, b| {
-            a.top()
-                .total_cmp(&b.top())
-                .then(a.left().total_cmp(&b.left()))
-        });
-        let cell = (area.width() - 2.0 * tokens::PAD) / tokens::DOUBLE_COLS as f32;
-
-        // The measured head box is a cell, and a cell holds it whole.
-        let raw = h.raw_input(None, &[]);
-        let mut head = 0.0;
-        let full = h.ctx.run_ui(raw, |ui| {
-            head = DoubleMetrics::measure(ui.ctx(), PanelFeatures::ALL, p.readout).head;
-        });
-        full.drop_without_applying_deltas();
-        assert!(cell + 0.01 >= head, "a {cell} pt cell cannot hold a {head} pt head box");
-
-        // Which puts the emblem's centre on the first tile column's, since
-        // both are the middle of the same cell.
-        let first_tile = rects[4];
-        let emblem_centre = area.left() + tokens::PAD + cell / 2.0;
-        assert!(
-            (first_tile.center().x - emblem_centre).abs() <= 0.5,
-            "{first_tile:?} is not under the emblem at {emblem_centre} in {area:?}"
-        );
     }
 
     /// A column stacks the ways out flush against the hand-offs, so it

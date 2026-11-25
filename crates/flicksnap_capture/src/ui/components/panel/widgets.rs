@@ -1,5 +1,5 @@
 //! The tray's four pieces as egui widgets: the two button styles, the
-//! size readout and the emblem.
+//! OCR word count and the emblem.
 //!
 //! Only the buttons are interactive. The readout and the emblem allocate
 //! space and paint into it, so the tray body under them is dead in the
@@ -15,7 +15,7 @@ use egui::{
 };
 
 use super::assets;
-use super::model::{ButtonDef, Readout};
+use super::model::ButtonDef;
 use super::theme::{self, tokens};
 
 /// An icon and a piece of text in a rounded segment. The two panel styles
@@ -211,35 +211,24 @@ pub fn underlined_label(def: &ButtonDef) -> LayoutJob {
 }
 
 /// The readout stacked on 1 em line boxes so the lines sit tight. Bold
-/// numbers at 85 %; the × sign and the "words" caption regular at 70 % so
-/// they read as separators, not as another number.
-pub fn readout_job(readout: Readout) -> LayoutJob {
+/// number at 85 % and the regular "words" caption at 70 %.
+pub fn readout_job(word_count: usize) -> LayoutJob {
     let f = |family: egui::FontFamily, color: Color32| TextFormat {
         font_id: egui::FontId::new(tokens::READOUT_FONT, family),
         color,
         line_height: Some(tokens::READOUT_LINE),
         ..Default::default()
     };
-    let bold = || f(crate::ui::fonts::SEMIBOLD.clone(), tokens::FG_85);
-    let dim = || f(egui::FontFamily::Proportional, tokens::FG_70);
     let mut job = LayoutJob {
         halign: egui::Align::Center,
         ..Default::default()
     };
-    match readout {
-        Readout::Size {
-            width,
-            height,
-        } => {
-            job.append(&format!("{width}\n"), 0.0, bold());
-            job.append("\u{00D7}\n", 0.0, dim());
-            job.append(&height.to_string(), 0.0, bold());
-        }
-        Readout::Words(n) => {
-            job.append(&format!("{n}\n"), 0.0, bold());
-            job.append("words", 0.0, dim());
-        }
-    }
+    job.append(
+        &format!("{word_count}\n"),
+        0.0,
+        f(crate::ui::fonts::SEMIBOLD.clone(), tokens::FG_85),
+    );
+    job.append("words", 0.0, f(egui::FontFamily::Proportional, tokens::FG_70));
     job
 }
 
@@ -279,8 +268,10 @@ pub fn hint(ui: &mut Ui, text: &str, wrap_width: f32, slot: Vec2) -> egui::Rect 
 /// leaves the glyphs riding high, more so at every DPI step.
 /// `mesh_bounds` is the glyphs' own extent, relative to the galley's
 /// origin (`halign: Center` puts that origin on the block's centre line).
-pub fn readout(ui: &mut Ui, readout: Readout, slot: Vec2) -> egui::Rect {
-    let galley = ui.painter().layout_job(readout_job(readout));
+pub fn readout(ui: &mut Ui, word_count: usize, slot: Vec2) -> egui::Rect {
+    let galley = ui
+        .painter()
+        .layout_job(readout_job(word_count));
     let (rect, _) = ui.allocate_exact_size(slot, Sense::hover());
     ui.painter()
         .galley(ink_centred(rect, &galley), galley, tokens::FG_85);

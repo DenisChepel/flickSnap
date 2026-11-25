@@ -32,7 +32,7 @@ use crate::telemetry::startup::StartupTimings;
 use crate::ui::command::Command;
 use crate::ui::components::debug::model::{LineBuf, MonitorPanelData, PrimaryPanelData};
 use crate::ui::components::debug::resources::ResourcePoller;
-use crate::ui::components::panel::model::{ButtonStyle, PanelButtonSet, PanelFeatures, Readout};
+use crate::ui::components::panel::model::{ButtonStyle, PanelButtonSet, PanelFeatures};
 use crate::ui::components::panel::theme;
 use crate::ui::components::{self, accent_color32, area, hints, ocr, scope, tips, InputCtx, OverlayInputs};
 use crate::ui::egui_frame::{EguiFrame, TextureShadow};
@@ -113,13 +113,8 @@ pub struct PanelInputs {
     pub style: ButtonStyle,
     /// The user's capture accent: the primary group's fill.
     pub accent: Color32,
-    /// What the readout slot shows: the selection's size on the capture
-    /// strip, the lifted word count on the OCR strip. Unused by the
-    /// scroll-pick strip, whose body is the instruction.
-    pub readout: Readout,
-    /// The selection as the user made it: the size readout prints this,
-    /// so a rect straddling two monitors keeps showing its true size.
-    pub selection: ScreenRect,
+    /// The lifted word count for the OCR strip.
+    pub word_count: usize,
     /// The selection clipped to the host's monitor: what placement
     /// anchors to.
     pub anchor: ScreenRect,
@@ -172,18 +167,12 @@ fn panel_inputs(ui_monitors: &[UiMonitor], input: &InteractionState, settings: &
         .iter()
         .position(|m| m.bounds == monitor.bounds)?;
     let anchor = intersect_rects(monitor.bounds, selection)?;
-    let readout = match (&set, &input.ocr) {
-        (
-            PanelButtonSet::Ocr,
-            OcrState::Lifted {
-                outcome,
-                ..
-            },
-        ) => Readout::words_in(&outcome.full_text),
-        _ => Readout::Size {
-            width: selection.width(),
-            height: selection.height(),
-        },
+    let word_count = match &input.ocr {
+        OcrState::Lifted {
+            outcome,
+            ..
+        } => outcome.full_text.split_whitespace().count(),
+        _ => 0,
     };
     Some((
         index,
@@ -192,8 +181,7 @@ fn panel_inputs(ui_monitors: &[UiMonitor], input: &InteractionState, settings: &
             features: settings.panel_features,
             style: settings.panel_buttons,
             accent: accent_color32(settings.accent_color),
-            readout,
-            selection,
+            word_count,
             anchor,
         },
     ))
@@ -958,11 +946,7 @@ mod tests {
             features: PanelFeatures::ALL,
             style: ButtonStyle::KeyHint,
             accent: Color32::from_rgb(0x2F, 0x7C, 0xAE),
-            readout: Readout::Size {
-                width: selection.width(),
-                height: selection.height(),
-            },
-            selection,
+            word_count: 0,
             anchor: selection,
         };
         let visible = |on: bool, pointer: Option<Pos2>| HostInputs {
