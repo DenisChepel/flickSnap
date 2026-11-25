@@ -31,7 +31,7 @@ namespace FlickSnap.Config
         /// toolbar. <see cref="ToolType.Eraser"/> is also a name the removed raster build persisted,
         /// so old settings files can still carry it in the toolbar lists; it is dropped as if it
         /// were unknown.</summary>
-        private static bool IsOverlayOnly(ToolType tool) => tool == ToolType.Eraser;
+        private static bool IsOverlayOnly(ToolType tool) => tool is ToolType.Eraser or ToolType.Laser;
 
         /// <summary>Resolves an effective toolbar order from persisted keys and the current
         /// defaults: keeps the persisted keys that are still known (dropping unknown ones —

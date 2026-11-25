@@ -225,7 +225,7 @@ namespace FlickSnap.Drawing
             TrimToCap();
 
             LastChangeKind = HistoryChangeKind.Append;
-            RaiseStateChangedEvent(SerializeDocument(_drawingCanvas));
+            RaiseStateChangedEvent(DocumentForRaise());
         }
 
         /// <summary>
@@ -386,7 +386,7 @@ namespace FlickSnap.Drawing
             _debugShadowJson = SerializeDocument(_drawingCanvas);
 #endif
             LastChangeKind = HistoryChangeKind.Undo;
-            RaiseStateChangedEvent(SerializeDocument(_drawingCanvas));
+            RaiseStateChangedEvent(DocumentForRaise());
         }
 
         public void Redo()
@@ -404,7 +404,7 @@ namespace FlickSnap.Drawing
             _debugShadowJson = SerializeDocument(_drawingCanvas);
 #endif
             LastChangeKind = HistoryChangeKind.Redo;
-            RaiseStateChangedEvent(SerializeDocument(_drawingCanvas));
+            RaiseStateChangedEvent(DocumentForRaise());
         }
 
         /// <summary>
@@ -423,6 +423,13 @@ namespace FlickSnap.Drawing
             };
             return (JsonObject)JsonSerializer.SerializeToNode(state, GraphicsSerializer.Options);
         }
+
+        /// <summary>The whole document for an append/undo/redo raise — or null when nothing consumes
+        /// <see cref="DrawingCanvas.StateUpdated"/> (Draw on Screen, headless canvases). Serializing
+        /// is O(document) and the canvas only ever grows in a long Draw on Screen session, so
+        /// doing it for nobody made every stroke slower than the last.</summary>
+        private JsonObject DocumentForRaise() =>
+            _drawingCanvas.HasStateUpdatedSubscribers ? SerializeDocument(_drawingCanvas) : null;
 
         private void RaiseStateChangedEvent(JsonObject state)
         {

@@ -69,6 +69,37 @@ namespace FlickSnap.Drawing.Ink
 
         private List<Point> _outline = new List<Point>(); // figure scratch
 
+        // the same figures as loops, for the Skia draws (InkRun); kept through Compact
+        private List<InkRun> _chunkRuns = new List<InkRun>();
+        private InkRun _tailRun;
+        private Point[] _lastLoop; // the loop the last ToFigure / DotGeometry made
+
+        /// <summary>
+        /// One figure as its outline loop, smoothed the way <see cref="FreehandStroke.ToGeometry"/>
+        /// smooths it (quadratics through the edge midpoints), so its path is the geometry's.
+        /// </summary>
+        private sealed class LoopRun : InkRun
+        {
+            private readonly Point[] _loop;
+
+            public LoopRun(Point[] loop) => _loop = loop;
+
+            protected override SkiaSharp.SKPath BuildPath()
+            {
+                var path = new SkiaSharp.SKPath { FillType = SkiaSharp.SKPathFillType.Winding };
+                int n = _loop.Length;
+                if (n == 0)
+                    return path;
+
+                static SkiaSharp.SKPoint P(Point p) => new SkiaSharp.SKPoint((float)p.X, (float)p.Y);
+                path.MoveTo(P(Mid(_loop[n - 1], _loop[0])));
+                for (int i = 0; i < n; i++)
+                    path.QuadTo(P(_loop[i]), P(Mid(_loop[i], _loop[(i + 1) % n])));
+                path.Close();
+                return path;
+            }
+        }
+
         public FreehandStrokeBuilder(double size)
         {
             _size = size;
@@ -87,6 +118,18 @@ namespace FlickSnap.Drawing.Ink
 
         /// <summary>Union of the two pieces' bounds, in the samples' (origin-local) space.</summary>
         public Rect Bounds => _bounds;
+
+        public InkRun[] Runs
+        {
+            get
+            {
+                var runs = new InkRun[_chunkRuns.Count + (_tailRun != null ? 1 : 0)];
+                _chunkRuns.CopyTo(runs);
+                if (_tailRun != null)
+                    runs[^1] = _tailRun;
+                return runs;
+            }
+        }
 
         /// <summary>Centreline points whose edge vertices are final.</summary>
         public int OutlineSettled => _outlineSettled;
@@ -137,7 +180,9 @@ namespace FlickSnap.Drawing.Ink
             // a click or a flicksnap has its own rules (the dot, the dash); batch them
             if (n <= 2)
             {
-                _tail = BuildGeometry(samples, _size);
+                FreehandStroke.BuildOutline(samples, _size, _outline);
+                _tail = ToGeometry(_outline);
+                _tailRun = new LoopRun(_outline.ToArray());
                 _bounds = _tail.Bounds;
                 return;
             }
@@ -183,6 +228,7 @@ namespace FlickSnap.Drawing.Ink
             BuildTailVertices(hasTip, tip);
 
             _tail = _tailIsDot ? DotGeometry(_tailTip) : BuildTail(_openStart);
+            _tailRun = new LoopRun(_lastLoop);
             _bounds = _settled != null ? _settledBounds.Union(_tail.Bounds) : _tail.Bounds;
         }
 
@@ -207,6 +253,7 @@ namespace FlickSnap.Drawing.Ink
                     continue;
 
                 _chunks.Add(BuildSegment(_openStart, end));
+                _chunkRuns.Add(new LoopRun(_lastLoop));
                 _openStart = OverlapStart(end);
                 sealed_ = true;
                 k = 0;
@@ -320,6 +367,7 @@ namespace FlickSnap.Drawing.Ink
         {
             _outline.Clear();
             AddOutline(left, right, _outline, _points[0].P, startCap, tip, _tailRadius);
+            _lastLoop = _outline.ToArray();
             return ToGeometry(_outline);
         }
 
@@ -327,6 +375,7 @@ namespace FlickSnap.Drawing.Ink
         {
             _outline.Clear();
             AddDot(point, _size, _outline);
+            _lastLoop = _outline.ToArray();
             return ToGeometry(_outline);
         }
 

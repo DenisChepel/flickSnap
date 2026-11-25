@@ -171,6 +171,10 @@
     <value>Ruler</value>
     <comment>Draw on Screen tool button tooltip: drag a frame to measure an area; its size in pixels shows under it.</comment>
   </data>
+  <data name="Draw_Tool_Laser" xml:space="preserve">
+    <value>Laser pointer</value>
+    <comment>Draw on Screen tool button tooltip: drag to leave a glowing trail that fades out on its own, for pointing things out; it never draws anything that stays.</comment>
+  </data>
   <data name="Draw_Tool_Line" xml:space="preserve">
     <value>Line</value>
     <comment>Draw on Screen tool button tooltip: draws a straight line.</comment>

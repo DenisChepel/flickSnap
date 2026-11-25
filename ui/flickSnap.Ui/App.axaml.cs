@@ -35,15 +35,6 @@ namespace FlickSnap
         private bool _captureWarmFaulted;
         private bool _exiting;
 
-        /// <summary>
-        /// True while the process is going down for a reason the user did not ask for — an OS
-        /// shutdown/logoff, or a background update restart. Editors closing under it keep their
-        /// session's <see cref="SessionInfo.OpenEditor"/> marker, so the next start reopens them
-        /// (Settings ▸ Editor ▸ Restore sessions). A deliberate exit from the tray leaves it false:
-        /// the user closed FlickSnap, and with it the editors.
-        /// </summary>
-        public static bool KeepOpenEditorsOnExit { get; private set; }
-
         public override void Initialize()
         {
             AvaloniaXamlLoader.Load(this);
@@ -324,8 +315,10 @@ namespace FlickSnap
                 // start receiving command line arguments forwarded from secondary instances
                 _processor.Ready();
 
-                if (!firstRun && SettingsRoot.Current.Editor.RestoreSessionsOnFlickSnapStart)
-                    EditorWindow.ShowAllPreviouslyActiveSessions();
+                // nothing is reopened at start: a marker still set here is left over from a
+                // process that died with an editor open (a hang, a crash, a kill), and reopening
+                // the document it died on would only walk the user back into it
+                EditorWindow.ClearStaleOpenMarkers();
 
                 // who started the process decides whether this is the user's launch at all. An
                 // automated launch stays in the tray: the OS login item and the updater's
@@ -882,14 +875,11 @@ namespace FlickSnap
             }
         }
 
-        /// <param name="keepOpenEditors">The exit is not one the user asked for (see
-        /// <see cref="KeepOpenEditorsOnExit"/>): open editors are reopened on the next start.</param>
-        public async void ExitApp(bool keepOpenEditors = false)
+        public async void ExitApp()
         {
             if (_exiting)
                 return;
             _exiting = true;
-            KeepOpenEditorsOnExit = keepOpenEditors;
 
             // finish/cancel an active recording FIRST (bounded by the capturer's stop timeout):
             // exiting mid-recording otherwise flushes a valid video.mp4 via stdin EOF but never
@@ -949,8 +939,7 @@ namespace FlickSnap
             }
 
             // close all open windows first so per-window persistence runs before the process dies
-            // (EditorWindow.Closing renders the session preview and clears OpenEditor unless
-            // KeepOpenEditorsOnExit, §5.7).
+            // (EditorWindow.Closing renders the session preview and clears OpenEditor, §5.7).
             CloseAllWindows();
 
             ShutdownGlobalHotkeys();
@@ -979,9 +968,6 @@ namespace FlickSnap
             // OS session ending / explicit lifetime shutdown — close editor windows so their
             // Closing persistence runs (§5.7), persist settings, release the single-instance
             // pipe, and let the shutdown proceed.
-
-            // the OS is ending the session, not the user closing FlickSnap: editors stay marked open.
-            KeepOpenEditorsOnExit = true;
 
             // best-effort only (cannot await here without holding up the OS): the mp4 itself is
             // flushed by the recorder on stdin EOF regardless (§1.2); this races to also register

@@ -266,7 +266,7 @@ mod tests {
     /// The scroll-picker's reticle is the hidden pointer's stand-in over
     /// the selection's interior — but the strip can BE inside the
     /// selection (the picker is locked to a row, so a region with no room
-    /// beneath it gets `Side::Inside`), and there the ordinary pointer is
+    /// beneath it gets an inside row), and there the ordinary pointer is
     /// back. Drawing the reticle around a pointer that is really on a
     /// button is what this pins against: `compose` takes the answer from
     /// the tray it laid out in the same pass.

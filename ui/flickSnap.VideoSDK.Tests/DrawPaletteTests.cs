@@ -78,12 +78,13 @@ namespace FlickSnap.VideoSDK.Tests
         }
 
         [Fact]
-        public void Tools_in_toolbar_order_with_eraser_last()
+        public void Tools_in_toolbar_order_with_the_laser_between_ruler_and_eraser()
         {
             Assert.Equal(new[]
             {
                 ToolType.Pointer, ToolType.Brush, ToolType.Arrow, ToolType.Line, ToolType.Rectangle,
-                ToolType.Ellipse, ToolType.Text, ToolType.Count, ToolType.MeasureArea, ToolType.Eraser,
+                ToolType.Ellipse, ToolType.Text, ToolType.Count, ToolType.MeasureArea, ToolType.Laser,
+                ToolType.Eraser,
             }, DrawPalette.Tools);
         }
 
@@ -92,9 +93,10 @@ namespace FlickSnap.VideoSDK.Tests
         {
             Assert.Equal("Draw_Tool_Brush", DrawPalette.ToolKey(ToolType.Brush));
             Assert.Equal("Draw_Tool_Eraser", DrawPalette.ToolKey(ToolType.Eraser));
+            Assert.Equal("Draw_Tool_Laser", DrawPalette.ToolKey(ToolType.Laser));
             Assert.Equal("Draw_Tool_Pointer", DrawPalette.ToolKey(ToolType.Pointer));
             Assert.Equal(
-                new[] { "IconToolPointerTailless", "IconToolBrush", "IconToolArrow", "IconToolLine", "IconToolRectangleRounded", "IconToolEllipse", "IconToolText", "IconToolNumericCountPlain", "IconToolMeasureArea", "IconToolEraser" },
+                new[] { "IconToolPointerTailless", "IconToolBrush", "IconToolArrow", "IconToolLine", "IconToolRectangleRounded", "IconToolEllipse", "IconToolText", "IconToolNumericCountPlain", "IconToolMeasureArea", "IconToolLaser", "IconToolEraser" },
                 DrawPalette.Tools.Select(DrawPalette.ToolIconKey));
         }
 

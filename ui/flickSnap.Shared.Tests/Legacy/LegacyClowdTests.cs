@@ -110,8 +110,6 @@ namespace FlickSnap.Shared.Tests
 
             var loaded = SettingsService.Load(NewSettings);
 
-            // the compiled-in default is true, so false can only have come from the old key
-            Assert.False(loaded.Editor.RestoreSessionsOnFlickSnapStart);
             Assert.True(loaded.Uploads.ProviderConfig.ContainsKey("FlickSnapUploadProvider"));
             Assert.False(loaded.Uploads.ProviderConfig.ContainsKey("ClowdUploadProvider"));
         }

@@ -73,6 +73,13 @@ namespace FlickSnap.Drawing.History
             if (!_pending)
                 return;
 
+            // nobody persists this canvas: nothing to serialize the document for
+            if (!_canvas.HasStateUpdatedSubscribers)
+            {
+                Cancel();
+                return;
+            }
+
             // scratch-deferral (see class doc): never serialize the live document while a tool
             // drag or a text/image edit is in progress — keep the tail armed and retry after the
             // scratch state resolves (the drag-end/edit-end discrete commit supersedes it anyway).

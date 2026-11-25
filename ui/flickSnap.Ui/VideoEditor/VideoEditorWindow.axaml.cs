@@ -472,20 +472,7 @@ namespace FlickSnap.UI.VideoEditor
 
         /// <summary>Opens (or focuses) the editor for a recording session. Falls back to the OS
         /// video player with a notice when in-process playback is unavailable.</summary>
-        public static void ShowSession(SessionInfo session) => ShowSession(session, restoring: false);
-
-        /// <summary>Reopens an editor that was still open when FlickSnap last went down without the
-        /// user closing it (see <see cref="App.KeepOpenEditorsOnExit"/>) — in the background, like
-        /// the image editor's restored windows. The stale marker is dropped first: an editor that
-        /// does open writes a fresh one, and one that can no longer open (recording gone, video
-        /// editing switched off) must not keep the session pinned against cleanup forever.</summary>
-        internal static void RestoreSession(SessionInfo session)
-        {
-            session.OpenEditor = null;
-            ShowSession(session, restoring: true);
-        }
-
-        private static void ShowSession(SessionInfo session, bool restoring)
+        public static void ShowSession(SessionInfo session)
         {
             if (session == null)
                 return;
@@ -547,13 +534,6 @@ namespace FlickSnap.UI.VideoEditor
             }
 
             var wnd = new VideoEditorWindow(session, videoPath, exitOnClose: false);
-            if (restoring)
-            {
-                wnd.ShowActivated = false;
-                wnd.Show();
-                return;
-            }
-
             wnd.Show();
             wnd.Activate();
         }
@@ -2863,8 +2843,7 @@ namespace FlickSnap.UI.VideoEditor
 
             var discarded = DiscardEmptyProject();
 
-            // left marked across an unrequested exit, so the next start reopens it
-            if (_session != null && !discarded && !App.KeepOpenEditorsOnExit)
+            if (_session != null && !discarded)
                 _session.OpenEditor = null;
 
             SaveWindowState();

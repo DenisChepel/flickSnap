@@ -25,15 +25,16 @@ pub enum Side {
     Right,
     /// A column to the left, bottom-anchored.
     Left,
-    /// A row pulled up inside the anchor: the unconditional fallback.
-    Inside,
+    /// A row or column tucked inside the anchor.
+    Inside(Axis),
 }
 
 impl Side {
     pub fn axis(self) -> Axis {
         match self {
-            Side::Below | Side::Inside => Axis::Row,
+            Side::Below => Axis::Row,
             Side::Right | Side::Left => Axis::Column,
+            Side::Inside(axis) => axis,
         }
     }
 }
@@ -50,6 +51,15 @@ pub struct Footprint {
 pub struct Fit {
     pub row: Footprint,
     pub col: Footprint,
+}
+
+impl Fit {
+    pub fn fits_on(self, axis: Axis, bounds: ScreenRect) -> bool {
+        match axis {
+            Axis::Row => self.row.len <= bounds.width() && self.row.thick <= bounds.height(),
+            Axis::Column => self.col.len <= bounds.height() && self.col.thick <= bounds.width(),
+        }
+    }
 }
 
 /// `min_distance` is clearance kept from the bounds edge in the fit test;
@@ -103,45 +113,42 @@ pub fn place(
     (side, rect)
 }
 
-const CASCADE: [Side; 4] = [Side::Below, Side::Right, Side::Left, Side::Inside];
+const CASCADE: [Side; 5] = [
+    Side::Below,
+    Side::Right,
+    Side::Left,
+    Side::Inside(Axis::Row),
+    Side::Inside(Axis::Column),
+];
 
 /// A candidate fits when the box's THICKNESS in that orientation fits the
-/// free space on that side AND the longest strip fits the bounds ALONG the
-/// strip. Neither test depends on what the strip currently holds, so a
-/// content change can never flip the orientation. When no candidate passes
-/// both tests the thickness alone decides.
+/// free space on that side and the full footprint fits the monitor.
+/// Inside, prefer a row whenever it fits. When no candidate fully fits,
+/// the free space across the strip alone decides.
 fn choose_side(anchor: ScreenRect, bounds: ScreenRect, fit: Fit, near: Near, lock: Option<Axis>) -> Side {
     // `min_distance` is subtracted so the box never hugs the bounds edge;
     // negative means "no space".
     let bottom = (bounds.bottom() - anchor.bottom()).max(0) - near.min_distance;
     let right = (bounds.right() - anchor.right()).max(0) - near.min_distance;
     let left = (anchor.left() - bounds.left()).max(0) - near.min_distance;
-    let row_fits = fit.row.len <= bounds.width();
-    let col_fits = fit.col.len <= bounds.height();
     let across = |side: Side| match side {
         Side::Below => bottom >= fit.row.thick,
         Side::Right => right >= fit.col.thick,
         Side::Left => left >= fit.col.thick,
-        Side::Inside => true,
-    };
-    let along = |side: Side| match side.axis() {
-        Axis::Row => row_fits,
-        Axis::Column => col_fits,
+        Side::Inside(_) => true,
     };
     let allowed = |s: Side| lock.is_none_or(|axis| s.axis() == axis);
     CASCADE
         .into_iter()
         .filter(|&s| allowed(s))
-        .find(|&s| across(s) && along(s))
+        .find(|&s| across(s) && fit.fits_on(s.axis(), bounds))
         .or_else(|| {
             CASCADE
                 .into_iter()
                 .filter(|&s| allowed(s))
                 .find(|&s| across(s))
         })
-        // `Inside` is a row, so a row lock always has this fallback; a
-        // column lock falls back to its own last candidate.
-        .unwrap_or(Side::Inside)
+        .unwrap_or(Side::Inside(lock.unwrap_or(Axis::Row)))
 }
 
 /// Top-left of a `size` box on `side`, before the bounds clamp. Integer
@@ -167,7 +174,11 @@ fn origin(side: Side, anchor: ScreenRect, bounds: ScreenRect, size: (i32, i32), 
         // No bounds pull-back here: the clamp in `place` does it, which is
         // what keeps a negative-origin bounds a pure translation.
         Side::Left => (anchor.left() - near.max_distance - w, anchor.bottom() - h),
-        Side::Inside => (centred, anchor.bottom() - h - 2 * near.max_distance),
+        Side::Inside(Axis::Row) => (centred, anchor.bottom() - h - 2 * near.max_distance),
+        Side::Inside(Axis::Column) => (
+            anchor.right() - w - 2 * near.max_distance,
+            anchor.bottom() - h - 2 * near.max_distance,
+        ),
     }
 }
 
@@ -236,7 +247,7 @@ mod tests {
 
     #[test]
     fn inside_when_nothing_fits_across() {
-        assert_eq!(placed(HD, HD), (rect(660, 994, 600, 56), Side::Inside));
+        assert_eq!(placed(HD, HD), (rect(660, 994, 600, 56), Side::Inside(Axis::Row)));
     }
 
     #[test]
@@ -247,7 +258,7 @@ mod tests {
         // Room to the right and left, but the column is taller than the
         // bounds; a row fits, so Inside wins over Right.
         let short = rect(0, 0, 1920, 400);
-        assert_eq!(placed(rect(100, 300, 300, 60), short).1, Side::Inside);
+        assert_eq!(placed(rect(100, 300, 300, 60), short).1, Side::Inside(Axis::Row));
     }
 
     #[test]
@@ -293,7 +304,7 @@ mod tests {
         let (r, side) = placed(rect(10, 50, 480, 330), small);
         assert_eq!(
             (side, r.left(), r.right()),
-            (Side::Inside, -100, 500),
+            (Side::Inside(Axis::Row), -100, 500),
             "the head overflows the left"
         );
     }

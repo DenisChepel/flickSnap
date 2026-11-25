@@ -160,6 +160,19 @@ namespace FlickSnap.VideoSDK.Tests
             Assert.Equal(DrawPalette.DefaultTool, DrawOnScreenState.Initial.Freeze(ToolType.Highlighter).Tool);
         }
 
+        /// <summary>The laser puts no ink down: it is not a drawing tool, so a frozen session does
+        /// not open with it, and picking a colour while it is in hand hands over the brush.</summary>
+        [Fact]
+        public void Laser_is_not_a_drawing_tool()
+        {
+            Assert.False(DrawOnScreenState.IsDrawingTool(ToolType.Laser));
+            Assert.Equal(DrawPalette.DefaultTool, DrawOnScreenState.Initial.Freeze(ToolType.Laser).Tool);
+
+            var laser = DrawOnScreenState.Initial.PickTool(ToolType.Laser);
+            Assert.True(laser.IsToolLit(ToolType.Laser));
+            Assert.Equal(ToolType.Brush, laser.SelectColor(2).Tool);
+        }
+
         [Fact]
         public void Freeze_preserves_the_remembered_color_and_size()
         {

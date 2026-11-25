@@ -17,7 +17,7 @@ namespace FlickSnap.VideoSDK.Tests
     public class DrawHotkeysTests
     {
         [Fact]
-        public void Tools_take_the_image_editor_letters_and_S_and_X_for_select_and_eraser()
+        public void Tools_take_the_image_editor_letters_and_S_X_K_for_select_eraser_laser()
         {
             var expected = new Dictionary<ToolType, Key>
             {
@@ -31,6 +31,7 @@ namespace FlickSnap.VideoSDK.Tests
                 [ToolType.Count] = Key.C,
                 [ToolType.Eraser] = Key.X,
                 [ToolType.MeasureArea] = Key.M,
+                [ToolType.Laser] = Key.K,
             };
 
             foreach (var tool in DrawPalette.Tools)

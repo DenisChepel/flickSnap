@@ -48,21 +48,16 @@ namespace FlickSnap.Drawing.Ink
 
         /// <summary>
         /// One piece of the stroke as its hulls, <see cref="HullVertices"/> vertices each, in
-        /// origin-local space; immutable once built. The Skia path is made on first use by the
-        /// render thread and kept (it is the only thread that reads it).
+        /// origin-local space; immutable once built.
         /// </summary>
-        internal sealed class Run
+        internal sealed class Run : InkRun
         {
             public readonly Point[] Hulls;
-            private SKPath _path;
 
             public Run(Point[] hulls) => Hulls = hulls;
 
-            public SKPath GetPath()
+            protected override SKPath BuildPath()
             {
-                if (_path != null)
-                    return _path;
-
                 var path = new SKPath { FillType = SKPathFillType.Winding };
                 for (int i = 0; i < Hulls.Length; i += HullVertices)
                 {
@@ -72,7 +67,7 @@ namespace FlickSnap.Drawing.Ink
                     path.Close();
                 }
 
-                return _path = path;
+                return path;
             }
         }
 
@@ -138,12 +133,13 @@ namespace FlickSnap.Drawing.Ink
 
         /// <summary>The pieces as hulls — the sealed chunks, then the tail — for painting. A new
         /// array each call: the caller may hold it while the stroke keeps growing.</summary>
-        internal Run[] Runs
+        public InkRun[] Runs
         {
             get
             {
-                var runs = new Run[_chunkRuns.Count + (_tailRun != null ? 1 : 0)];
-                _chunkRuns.CopyTo(runs);
+                var runs = new InkRun[_chunkRuns.Count + (_tailRun != null ? 1 : 0)];
+                for (int i = 0; i < _chunkRuns.Count; i++)
+                    runs[i] = _chunkRuns[i];
                 if (_tailRun != null)
                     runs[^1] = _tailRun;
                 return runs;

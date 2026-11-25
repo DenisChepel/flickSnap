@@ -86,7 +86,7 @@ pub mod tokens {
     /// a change on it.
     pub const HOVER_VEIL_PRIMARY: f32 = 0.28;
     /// Hover veil on a button sitting straight on the chassis (the
-    /// capture strip's second row): white at 18 %. The chassis is darker
+    /// capture strip): white at 18 %. The chassis is darker
     /// than the segment grey, so the grey group's 12 % step would land
     /// short of `SEG_FILL` and the button would not read as lit at all.
     pub const HOVER_VEIL_BARE: f32 = shared::HOVER_VEIL_BARE_ALPHA;
@@ -116,23 +116,8 @@ pub mod tokens {
     /// label (`TrayPrimaryButton.axaml`), so the two read the same.
     pub const LABEL_FONT: f32 = 12.0;
 
-    /// `label` style — the capture strip's primary row: the icon beside
-    /// the full Title-case label, on the same `KEY_TILE` row height as
-    /// the accelerator tiles beneath it, so the two rows line up.
-    pub const LABEL_PAD_H: f32 = 8.0;
-    pub const LABEL_GAP: f32 = 6.0;
-
-    /// The capture strip's row height, and the pitch of its column-mode
-    /// button rows: one `key` tile.
-    pub const DOUBLE_ROW: f32 = KEY_TILE;
-    /// How many columns the capture strip's secondary buttons form when
-    /// the tray stands on its end.
-    pub const DOUBLE_COLS: usize = 2;
-
-    /// The rule between the capture column's hand-offs and its ways out.
-    /// A row gets that separation for free — the ways out are pushed to
-    /// the far end of their row — but a column stacks them flush against
-    /// the hand-offs, so it needs a break drawn.
+    /// The rule before the capture strip's ways out: upright across a
+    /// row, flat along a column.
     ///
     /// White at 12 %: a line you notice as a change of texture rather
     /// than as a border. It stops short of either edge for the same
@@ -141,12 +126,12 @@ pub mod tokens {
         width: 1.0,
         color: white_alpha(31),
     };
-    /// Air above and below the rule.
+    /// Air on either side of the rule.
     pub const DIVIDER_PAD_V: f32 = 4.0;
     /// How far the rule stops short of either edge.
     pub const DIVIDER_INSET: f32 = 8.0;
-    /// The whole block the rule takes in the stack: the air, the line,
-    /// the air.
+    /// The whole block the rule takes along the strip: the air, the
+    /// line, the air.
     pub const DIVIDER_BLOCK: f32 = 2.0 * DIVIDER_PAD_V + DIVIDER.width;
 
     /// 11 pt OCR word count, set on 1 em line boxes.

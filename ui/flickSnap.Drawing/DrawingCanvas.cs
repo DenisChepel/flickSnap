@@ -423,6 +423,7 @@ namespace FlickSnap.Drawing
         internal ToolPen ToolPen { get; }
         internal ToolBrush ToolBrush { get; }
         internal ToolEraser ToolEraser { get; }
+        internal ToolLaser ToolLaser { get; }
 
         private ToolDesc CurrentTool;
 
@@ -548,6 +549,11 @@ namespace FlickSnap.Drawing
             _artworkView = new ArtworkView(this);
             VisualChildren.Add(_artworkView);
 
+            // above the artwork and below any Children overlay: the laser pointer's trails, which
+            // animate on their own visual so a fading trail never re-records the document
+            LaserLayer = new Laser.LaserLayer();
+            VisualChildren.Add(LaserLayer);
+
             MeasureUnits.Changed += OnMeasureUnitsChanged;
             GraphicsList = new GraphicCollection(this);
 
@@ -557,6 +563,7 @@ namespace FlickSnap.Drawing
             ToolPen = new ToolPen();
             ToolBrush = new ToolBrush();
             ToolEraser = new ToolEraser();
+            ToolLaser = new ToolLaser();
 
             // the create lambdas close over this canvas, so a new graphic starts out with the
             // property-bar values for every skill its type declares
@@ -653,6 +660,8 @@ namespace FlickSnap.Drawing
             // overlay-only (not in the editor's toolbar or ToolRegistry): no object type and no
             // skills, so SyncObjectState never creates a settings entry for it
             _toolStore[ToolType.Eraser] = Desc(ToolType.Eraser, "Eraser", ToolEraser);
+            // likewise no object type and no skills: it draws into LaserLayer, never the document
+            _toolStore[ToolType.Laser] = Desc(ToolType.Laser, "Laser", ToolLaser);
 
             _autosaveThrottle = new AutosaveThrottle(this);
             _undoManager = new UndoManager(this);
@@ -862,7 +871,7 @@ namespace FlickSnap.Drawing
 
             // the brush and highlighter cursors are drawn at the stroke's on-screen size
             if ((change.Property == ContentScaleProperty || change.Property == LineWidthProperty)
-                && (Tool == ToolType.Brush || Tool == ToolType.Highlighter) && _toolStore != null)
+                && (Tool == ToolType.Brush || Tool == ToolType.Highlighter || Tool == ToolType.Laser) && _toolStore != null)
                 CurrentTool.Instance.SetCursor(this);
             else if (change.Property == ContentOffsetProperty)
                 OnContentOffsetChanged(change.GetNewValue<Point>());
@@ -1774,6 +1783,8 @@ namespace FlickSnap.Drawing
             // ClipToBounds provides the viewport clip), same as the old graphic visuals.
             _artworkView.Measure(Size.Infinity);
             _artworkView.Arrange(new Rect(finalSize));
+            LaserLayer.Measure(Size.Infinity);
+            LaserLayer.Arrange(new Rect(finalSize));
 
 #if DEBUG
             // final-design §A.3: Visual.Effect is never used again anywhere in the canvas tree
@@ -2618,6 +2629,14 @@ namespace FlickSnap.Drawing
 
         internal double DpiZoom => TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0;
 
+        /// <summary>Canvas units per device-independent pixel at the current zoom: what keeps
+        /// something the same size on screen however far the view is zoomed.</summary>
+        internal double DipsToUnits => DpiZoom / Math.Max(1e-6, ContentScale);
+
+        /// <summary>The laser pointer's trails, over the artwork (see <see cref="ToolLaser"/>).
+        /// Never part of the document.</summary>
+        internal Laser.LaserLayer LaserLayer { get; }
+
         private Point CanvasToRoot(Point canvasPt) =>
             this.TranslatePoint(canvasPt, (Visual)TopLevel.GetTopLevel(this) ?? this) ?? canvasPt;
 
@@ -2724,6 +2743,9 @@ namespace FlickSnap.Drawing
 
             _scaleTransform2.ScaleX = ContentScale * adjustment;
             _scaleTransform2.ScaleY = ContentScale * adjustment;
+
+            if (LaserLayer != null)
+                LaserLayer.TrailWidth = Laser.LaserLayer.DefaultTrailWidth * DipsToUnits;
 
             // ui controls (resize handles) scale with canvas zoom + dpi
             GraphicsList.Dpi = CanvasUiElementScale;

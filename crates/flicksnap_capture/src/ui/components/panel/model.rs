@@ -95,9 +95,8 @@ impl PanelFeatures {
 /// Which strip of buttons the panel is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelButtonSet {
-    /// The capture strip: [UPLOAD / EDIT / VIDEO / COPY / SAVE]
-    /// [SHARE / SCROLL / OCR / SEARCH] [RESET / EXIT] (SCROLL and OCR are
-    /// Windows-only).
+    /// The capture strip: [UPLOAD SHARE SCROLL OCR SEARCH EDIT VIDEO COPY
+    /// SAVE] | [RESET EXIT] (SCROLL and OCR are Windows-only).
     Normal,
     /// The strip shown while the OCR overlay owns the selection.
     Ocr,
@@ -121,15 +120,13 @@ impl PanelButtonSet {
     /// ([`Self::axis_lock`]).
     pub const UNION: &'static [PanelButtonSet] = &[Self::Normal, Self::Ocr];
 
-    /// How this set is laid out. The capture strip is the one set whose
-    /// buttons are too many and too unlike each other to read as one
-    /// run, so it gets the two-row chassis; every other set is the
-    /// single strip they have always been.
-    pub const fn layout(self) -> PanelLayout {
-        match self {
-            Self::Normal => PanelLayout::Double,
-            Self::Ocr | Self::ScrollPick => PanelLayout::Single,
-        }
+    /// Whether this set draws its buttons as bare icons whatever
+    /// `--panel-buttons` asked for. The capture strip is one flat run of
+    /// identical icon tiles — no labels, no accelerator letters, no fills —
+    /// so the eye reads it as one toolbar; what a button does and which key
+    /// fires it are in its hover chip.
+    pub const fn icons_only(self) -> bool {
+        matches!(self, Self::Normal)
     }
 
     /// The axis this set must run along, or `None` when placement is free
@@ -145,7 +142,8 @@ impl PanelButtonSet {
     /// What sits between the emblem and the buttons on the single strip.
     pub const fn body(self) -> Body {
         match self {
-            Self::Normal | Self::Ocr => Body::Readout,
+            Self::Normal => Body::None,
+            Self::Ocr => Body::Readout,
             Self::ScrollPick => Body::Hint(SCROLL_PICK_HINT),
         }
     }
@@ -175,7 +173,7 @@ impl PanelButtonSet {
     /// order, each with its visible buttons as [`Self::visible_defs`]
     /// yields them. A group every button of which is switched off is
     /// dropped altogether: no empty fill, no gap.
-    pub fn visible_groups(self, features: PanelFeatures) -> Vec<(GroupTone, Vec<(usize, &'static ButtonDef)>)> {
+    pub fn visible_groups(self, features: PanelFeatures) -> Vec<VisibleGroup> {
         let defs = self.defs();
         let mut start = 0;
         self.groups()
@@ -187,7 +185,11 @@ impl PanelButtonSet {
                     .filter(|(_, def)| features.allows(def.command))
                     .collect();
                 start = end;
-                (!members.is_empty()).then_some((g.tone, members))
+                (!members.is_empty()).then_some(VisibleGroup {
+                    tone: g.tone,
+                    ruled: g.ruled,
+                    members,
+                })
             })
             .collect()
     }
@@ -206,17 +208,14 @@ impl PanelButtonSet {
     }
 }
 
-/// How a set arranges its chassis.
-///
-/// `Single` is the original strip: emblem, body, then the button groups
-/// in one run along the chosen axis. `Double` is the capture strip's
-/// two-row chassis — the accent actions on their own line with full
-/// labels, the odds and ends on a second line with accelerator hints —
-/// which ignores [`ButtonStyle`] and draws both presentations itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelLayout {
-    Single,
-    Double,
+/// One group as [`PanelButtonSet::visible_groups`] yields it: its tone,
+/// whether a rule goes before it, and its visible buttons with their table
+/// indices.
+#[derive(Debug, Clone)]
+pub struct VisibleGroup {
+    pub tone: GroupTone,
+    pub ruled: bool,
+    pub members: Vec<(usize, &'static ButtonDef)>,
 }
 
 /// Which fill a group of buttons sits on.
@@ -228,8 +227,8 @@ pub enum GroupTone {
     Secondary,
     /// No fill of its own: the buttons sit straight on the chassis, the
     /// way the readout and the emblem do, and only the hovered one
-    /// lights up. The capture strip's second row uses this so the six
-    /// odds and ends there read as background to the accent row above.
+    /// lights up. The whole capture strip is bare, so it reads as one
+    /// toolbar of equal buttons.
     Bare,
 }
 
@@ -240,6 +239,10 @@ pub struct ButtonGroup {
     pub tone: GroupTone,
     /// How many table entries this group covers.
     pub len: usize,
+    /// A hairline rule goes between this group and the one before it —
+    /// across a row, along a column. Only when something visible is on
+    /// both sides of it: a rule with nothing before it is never drawn.
+    pub ruled: bool,
 }
 
 /// How a button presents its def. Chosen once per run by `--panel-buttons`.
@@ -281,65 +284,35 @@ pub struct ButtonDef {
 }
 
 /// The capture-mode panel buttons in strip order, cut by
-/// [`NORMAL_GROUPS`] into three groups.
+/// [`NORMAL_GROUPS`] into two runs with a rule between them.
 ///
-/// The primary group (accent) is the four actions that finish the capture
-/// with the image in hand. The second group is the hand-offs: UPLOAD puts
-/// the capture somewhere else, SHARE and SCROLL give the region to a live
-/// helper, OCR swaps the strip for a second round of decisions, SEARCH
-/// hands the image to the shell's reverse image search. The last group is
-/// the two ways out.
+/// One flat toolbar: the optional hand-offs the shell can switch off come
+/// first, then the core actions it cannot, so the core always ends the
+/// row in the same place and a switched-off hand-off only shortens the
+/// row from the left. The ways out close it, after the rule.
 ///
 /// Accelerator keys (not stored — derived from `underline_idx`):
-///   0: Edit   — E
-///   1: Video  — V   (0x56)
-///   2: Copy   — C   (0x43)
-///   3: Save   — S   (0x53)
-///   4: Upload — U   (0x55)
-///   5: Share  — H   (0x48), underlined on the second char because every
+///   0: Upload — U   (0x55)
+///   1: Share  — H   (0x48), underlined on the second char because every
 ///      other letter of Share is spoken for (S=Save, A/R/E=Edit, Reset).
 ///      'h' is also the pre-capture color-sampler key, which does not
 ///      collide: that branch only runs while nothing is captured, and the
 ///      panel — and therefore this lookup — only exists once something is.
-///   6: Scroll — L   (0x4C), underlined on the fifth char because
+///   2: Scroll — L   (0x4C), underlined on the fifth char because
 ///      S, C and R already belong to Save, Copy and Reset
-///   7: OCR    — O   (0x4F)
-///   8: Search — A   (0x41), underlined on the third char: S, E, R and C
+///   3: OCR    — O   (0x4F)
+///   4: Search — A   (0x41), underlined on the third char: S, E, R and C
 ///      all belong to Save, Edit, Reset and Copy, which leaves A and H,
 ///      and H is Share's. The OCR strip's own SEARCH keeps its S — the
 ///      two strips are never on screen together, and the lookup is scoped
 ///      to one set.
+///   5: Edit   — E
+///   6: Video  — V   (0x56)
+///   7: Copy   — C   (0x43)
+///   8: Save   — S   (0x53)
 ///   9: Reset  — R   (0x52)
 ///  10: Exit   — X   (0x58), underlined on the second char
 const NORMAL_DEFS: &[ButtonDef] = &[
-    ButtonDef {
-        command: Command::Edit,
-        label: "Edit",
-        underline_idx: 0,
-        icon: &super::assets::EDIT,
-        tip: "Open image editor",
-    },
-    ButtonDef {
-        command: Command::Video,
-        label: "Video",
-        underline_idx: 0,
-        icon: &super::assets::VIDEO,
-        tip: "Record screen video",
-    },
-    ButtonDef {
-        command: Command::Copy,
-        label: "Copy",
-        underline_idx: 0,
-        icon: &super::assets::COPY,
-        tip: "Copy to clipboard",
-    },
-    ButtonDef {
-        command: Command::Save,
-        label: "Save",
-        underline_idx: 0,
-        icon: &super::assets::SAVE,
-        tip: "Save image to a file",
-    },
     ButtonDef {
         command: Command::Upload,
         label: "Upload",
@@ -376,6 +349,34 @@ const NORMAL_DEFS: &[ButtonDef] = &[
         tip: "Reverse image search on the web",
     },
     ButtonDef {
+        command: Command::Edit,
+        label: "Edit",
+        underline_idx: 0,
+        icon: &super::assets::EDIT,
+        tip: "Open image editor",
+    },
+    ButtonDef {
+        command: Command::Video,
+        label: "Video",
+        underline_idx: 0,
+        icon: &super::assets::VIDEO,
+        tip: "Record screen video",
+    },
+    ButtonDef {
+        command: Command::Copy,
+        label: "Copy",
+        underline_idx: 0,
+        icon: &super::assets::COPY,
+        tip: "Copy to clipboard",
+    },
+    ButtonDef {
+        command: Command::Save,
+        label: "Save",
+        underline_idx: 0,
+        icon: &super::assets::SAVE,
+        tip: "Save image to a file",
+    },
+    ButtonDef {
         command: Command::Reset,
         label: "Reset",
         underline_idx: 0,
@@ -391,36 +392,20 @@ const NORMAL_DEFS: &[ButtonDef] = &[
     },
 ];
 
-/// [Edit Video Copy Save] [Upload Share Scroll OCR Search] [Reset Exit].
+/// [Upload Share Scroll OCR Search Edit Video Copy Save] | [Reset Exit].
 ///
-/// The double-height layout ([`PanelLayout::Double`]) reads this table by
-/// TONE, not by position: the accent run and any grey run attached to it
-/// are the labelled first row, and the bare runs are the second — every
-/// one but the last is a hand-off, the last one is the ways out. So a run
-/// can be re-toned, or leave the table altogether, without a slot index
-/// somewhere else having to move with it.
-///
-/// UPLOAD is a hand-off rather than a finishing action: it puts the
-/// capture somewhere else and waits on the network, where the four accent
-/// buttons finish with the image in hand. It leads the grey run for the
-/// same reason it used to lead the accent one — it is the most-reached-for
-/// of them.
-///
-/// The `Secondary` tone has no members here at the moment. The layout
-/// still supports one — a grey run flush against the accent block, drawn
-/// as its tail rather than as a second block (`show::finishing_run`).
+/// Both runs are bare — every button looks the same and only the hovered
+/// one lights up — and the rule before the ways out is the only break.
 const NORMAL_GROUPS: &[ButtonGroup] = &[
     ButtonGroup {
-        tone: GroupTone::Primary,
-        len: 4,
-    },
-    ButtonGroup {
         tone: GroupTone::Bare,
-        len: 5,
+        len: 9,
+        ruled: false,
     },
     ButtonGroup {
         tone: GroupTone::Bare,
         len: 2,
+        ruled: true,
     },
 ];
 
@@ -481,10 +466,12 @@ const OCR_GROUPS: &[ButtonGroup] = &[
     ButtonGroup {
         tone: GroupTone::Primary,
         len: 3,
+        ruled: false,
     },
     ButtonGroup {
         tone: GroupTone::Bare,
         len: 2,
+        ruled: false,
     },
 ];
 
@@ -497,6 +484,8 @@ pub const SCROLL_PICK_HINT: &str = "Resize the selection to the scrolling area, 
 /// What a set puts between the emblem and its buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Body {
+    /// Nothing: the buttons follow the emblem directly.
+    None,
     /// The OCR word count.
     Readout,
     /// A wrapped instruction, sitting straight on the chassis — no fill
@@ -528,6 +517,7 @@ const SCROLL_PICK_DEFS: &[ButtonDef] = &[
 const SCROLL_PICK_GROUPS: &[ButtonGroup] = &[ButtonGroup {
     tone: GroupTone::Secondary,
     len: 2,
+    ruled: false,
 }];
 
 impl ButtonDef {
@@ -815,7 +805,7 @@ mod tests {
             .collect();
         assert_eq!(
             normal,
-            ["Edit", "Video", "Copy", "Save", "Upload", "Share", "Scroll", "OCR", "Search", "Reset", "Exit"]
+            ["Upload", "Share", "Scroll", "OCR", "Search", "Edit", "Video", "Copy", "Save", "Reset", "Exit"]
         );
         let ocr: Vec<&str> = PanelButtonSet::Ocr
             .defs()
@@ -837,17 +827,18 @@ mod tests {
         }
     }
 
-    /// The design: the accent group holds the actions that finish the
-    /// capture, the grey groups the hand-offs and the ways out.
+    /// The design: the capture strip is one bare run of hand-offs and core
+    /// actions and a ruled-off pair of ways out; the OCR strip keeps its
+    /// accent block.
     #[test]
     fn groups_match_the_design() {
         let labels = |set: PanelButtonSet| -> Vec<(GroupTone, Vec<&str>)> {
             set.visible_groups(PanelFeatures::ALL)
                 .into_iter()
-                .map(|(tone, members)| {
+                .map(|g| {
                     (
-                        tone,
-                        members
+                        g.tone,
+                        g.members
                             .iter()
                             .map(|(_, d)| d.label)
                             .collect(),
@@ -858,8 +849,10 @@ mod tests {
         assert_eq!(
             labels(PanelButtonSet::Normal),
             vec![
-                (GroupTone::Primary, vec!["Edit", "Video", "Copy", "Save"]),
-                (GroupTone::Bare, vec!["Upload", "Share", "Scroll", "OCR", "Search"]),
+                (
+                    GroupTone::Bare,
+                    vec!["Upload", "Share", "Scroll", "OCR", "Search", "Edit", "Video", "Copy", "Save"]
+                ),
                 (GroupTone::Bare, vec!["Reset", "Exit"]),
             ]
         );
@@ -886,10 +879,10 @@ mod tests {
         for set in PanelButtonSet::ALL {
             for features in FEATURE_COMBINATIONS {
                 let groups = set.visible_groups(features);
-                assert!(groups.iter().all(|(_, m)| !m.is_empty()), "{set:?} {features:?}");
+                assert!(groups.iter().all(|g| !g.members.is_empty()), "{set:?} {features:?}");
                 let flat: Vec<usize> = groups
                     .iter()
-                    .flat_map(|(_, m)| m.iter().map(|(i, _)| *i))
+                    .flat_map(|g| g.members.iter().map(|(i, _)| *i))
                     .collect();
                 let expected: Vec<usize> = set
                     .visible_defs(features)
@@ -898,18 +891,21 @@ mod tests {
                 assert_eq!(flat, expected, "{set:?} {features:?}");
             }
         }
-        let no_handoffs = PanelFeatures {
+        let all_off = PanelFeatures {
+            upload: false,
             share: false,
             scroll_capture: false,
+            video: false,
             ocr: false,
             image_search: false,
-            ..PanelFeatures::ALL
         };
+        // The core keeps the first run alive, so the rule always has
+        // something before it.
         assert_eq!(
             PanelButtonSet::Normal
-                .visible_groups(no_handoffs)
+                .visible_groups(all_off)
                 .len(),
-            3
+            2
         );
     }
 
@@ -953,23 +949,37 @@ mod tests {
         assert_eq!(lookup_command_by_key(PanelButtonSet::Ocr, all, 'b'), Some(Command::OcrBack));
     }
 
-    /// UPLOAD leads the grey run, not the accent one: it hands the capture
-    /// off and waits on the network, where the accent four finish with the
-    /// image in hand.
+    /// The optional hand-offs lead the strip and the core actions the
+    /// shell cannot switch off follow them, so switching a hand-off off
+    /// only ever shortens the strip from the left.
     #[test]
-    fn upload_leads_the_hand_offs() {
-        let groups = PanelButtonSet::Normal.visible_groups(PanelFeatures::ALL);
-        let (tone, members) = &groups[0];
-        assert_eq!(*tone, GroupTone::Primary);
+    fn optional_buttons_lead_and_the_core_follows() {
+        let defs = PanelButtonSet::Normal.defs();
+        let optional = |c: Command| {
+            let off = PanelFeatures {
+                upload: false,
+                share: false,
+                scroll_capture: false,
+                video: false,
+                ocr: false,
+                image_search: false,
+            };
+            !off.allows(c) && c != Command::Video
+        };
+        let first_core = defs
+            .iter()
+            .position(|d| !optional(d.command))
+            .expect("a core button");
+        assert!(defs[..first_core]
+            .iter()
+            .all(|d| optional(d.command)));
         assert!(
-            members
+            defs[first_core..]
                 .iter()
-                .all(|(_, d)| d.command != Command::Upload),
-            "UPLOAD is not an accent button"
+                .all(|d| !optional(d.command)),
+            "an optional button after the core"
         );
-        let (tone, members) = &groups[1];
-        assert_eq!(*tone, GroupTone::Bare);
-        assert_eq!(members[0].1.command, Command::Upload);
+        assert_eq!(defs[0].command, Command::Upload);
     }
 
     /// UPLOAD is a real button with the paper-plane mark; the FlickSnap logo

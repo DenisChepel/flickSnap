@@ -22,5 +22,6 @@ namespace FlickSnap
         Highlighter, // freehand translucent chisel ink
         Eraser, // overlay-only (draw on screen): deletes what it hovers/marquees; never on the editor toolbar
         MeasureArea, // overlay-only (draw on screen) ruler: a frame labelled with its size in pixels
+        Laser, // a fading pointer trail, never ink: draw on screen now, the video editor later; never on the image editor toolbar
     };
 }

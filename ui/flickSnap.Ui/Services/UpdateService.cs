@@ -391,9 +391,9 @@ namespace FlickSnap.UI
                 return;
             }
 
-            // a background restart is not the user closing FlickSnap: whatever editors are open come
-            // back after it (IdleMonitor only lets it happen when session restore is on).
-            Dispatcher.UIThread.Post(() => App.Current?.ExitApp(keepOpenEditors: silent));
+            // a background restart only ever happens with no editor open (IdleMonitor), since
+            // nothing is reopened on the next start
+            Dispatcher.UIThread.Post(() => App.Current?.ExitApp());
         }
 
         // ---- manager ----

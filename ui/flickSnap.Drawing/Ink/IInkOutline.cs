@@ -30,6 +30,11 @@ namespace FlickSnap.Drawing.Ink
         /// <summary>Union of the two pieces' bounds, in the samples' (origin-local) space.</summary>
         Rect Bounds { get; }
 
+        /// <summary>The same ink as Skia paths — the sealed pieces, then the tail — for the draws
+        /// that paint pixels rather than geometry. A new array each call: the caller may hold it
+        /// while the stroke keeps growing. Survives <see cref="Compact"/>.</summary>
+        InkRun[] Runs { get; }
+
         /// <summary>True when <see cref="Update"/> can take <paramref name="sampleCount"/> samples
         /// as a continuation of what it has; anything else needs a fresh outline.</summary>
         bool CanAppend(int sampleCount);

@@ -470,8 +470,7 @@ namespace FlickSnap.UI
             }
 
             UpdatePreview(drawingCanvas.DrawGraphicsToBitmap());
-            if (!App.KeepOpenEditorsOnExit)
-                _session.OpenEditor = null; // left marked across an unrequested exit, to reopen on start
+            _session.OpenEditor = null;
             _session = null;
         }
 
@@ -575,17 +574,16 @@ namespace FlickSnap.UI
             }
         }
 
-        public static void ShowAllPreviouslyActiveSessions()
+        /// <summary>
+        /// Drops every session's <see cref="SessionInfo.OpenEditor"/> marker. Called once at start,
+        /// before any editor exists, so every marker found is stale — left by a process that went
+        /// down with an editor open — and would otherwise pin its session against deletion and
+        /// cleanup forever. Nothing is reopened from them.
+        /// </summary>
+        public static void ClearStaleOpenMarkers()
         {
-            var sessions = SessionManager.Current.Sessions
-                                         .Where(s => s.OpenEditor != null).ToArray();
-
-            foreach (var g in sessions) {
-                if (g.OpenEditor.IsVideoEditor)
-                    VideoEditorWindow.RestoreSession(g);
-                else
-                    ShowSession(g);
-            }
+            foreach (var s in SessionManager.Current.Sessions.Where(s => s.OpenEditor != null).ToArray())
+                s.OpenEditor = null;
         }
 
         internal static IEnumerable<EditorWindow> GetOpenEditors()

@@ -25,12 +25,12 @@ namespace FlickSnap.Drawing.Ink
         /// <summary>The screen pass's share of the ink's alpha.</summary>
         internal const double GlowStrength = 0.22;
 
-        private readonly ChiselStrokeBuilder.Run[] _runs;
+        private readonly InkRun[] _runs;
         private readonly Color _color;
 
         /// <param name="runs">The stroke's pieces, local to the current transform.</param>
         /// <param name="bounds">Their bounds, in the same space.</param>
-        public HighlighterDrawOperation(ChiselStrokeBuilder.Run[] runs, Rect bounds, Color color)
+        public HighlighterDrawOperation(InkRun[] runs, Rect bounds, Color color)
         {
             _runs = runs;
             Bounds = bounds;

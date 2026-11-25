@@ -174,7 +174,6 @@ namespace FlickSnap.Shared.Tests
 
             // untouched values still come back as they were
             Assert.Equal(GestureList.Of(new HotkeyGesture(HotkeyKey.PrintScreen, HotkeyModifiers.Alt)), loaded.Hotkeys.CaptureActiveShortcut);
-            Assert.True(loaded.Editor.RestoreSessionsOnFlickSnapStart);
         }
 
         [Fact]

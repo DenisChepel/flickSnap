@@ -50,7 +50,8 @@ namespace FlickSnap.UI.DrawOnScreen
         };
 
         /// <summary>The tools, in toolbar order. <see cref="ToolType.Eraser"/> lives only here: the
-        /// editor never offers it. <see cref="ToolType.Pointer"/> is the select tool.</summary>
+        /// editor never offers it, nor the <see cref="ToolType.Laser"/>, which puts no ink down at
+        /// all. <see cref="ToolType.Pointer"/> is the select tool.</summary>
         public static IReadOnlyList<ToolType> Tools { get; } = new[]
         {
             ToolType.Pointer,
@@ -62,6 +63,7 @@ namespace FlickSnap.UI.DrawOnScreen
             ToolType.Text,
             ToolType.Count,
             ToolType.MeasureArea,
+            ToolType.Laser,
             ToolType.Eraser,
         };
 

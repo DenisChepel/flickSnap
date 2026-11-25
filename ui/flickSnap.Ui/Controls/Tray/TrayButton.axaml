@@ -147,6 +147,10 @@
             <Setter Property="RenderTransform" Value="translateX(1.5px)" />
         </Style>
 
+        <Style Selector="^.nudge-down /template/ tray|TrayGeometryIcon#_geo">
+            <Setter Property="RenderTransform" Value="translateY(1px)" />
+        </Style>
+
         <Style Selector="^[Look=Danger] /template/ tray|TrayGlyphIcon#_icon, ^[Look=DangerFilled] /template/ tray|TrayGlyphIcon#_icon">
             <Setter Property="Foreground" Value="{x:Static tray:TrayTokens.RecBrush}" />
         </Style>

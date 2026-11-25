@@ -226,15 +226,6 @@ namespace FlickSnap.Config
 
     public class SettingsEditor : SimpleNotifyObject
     {
-        [Category("Sessions")]
-        [DisplayName("Restore sessions on startup")]
-        [Description("Reopen editors left open when flickSnap restarts or the computer shuts down.")]
-        public bool RestoreSessionsOnFlickSnapStart
-        {
-            get => _restoreSessionsOnFlickSnapStart;
-            set => Set(ref _restoreSessionsOnFlickSnapStart, value);
-        }
-
         /// <summary>
         /// Chrome for the image and video editors. Not a theme — this is picked up live by editors
         /// that are already open, so the two looks can be compared side by side.
@@ -363,7 +354,6 @@ namespace FlickSnap.Config
         private int _startupPadding = 30;
         private TimeOption _deleteSessionsAfter = new TimeOption(30, TimeOptionUnit.Days);
         private Dictionary<ToolType, SavedToolSettings> _tools = new Dictionary<ToolType, SavedToolSettings>();
-        private bool _restoreSessionsOnFlickSnapStart = true;
         private double _sidebarWidth = 230;
         private List<string> _toolbarOrder;
         private List<string> _hiddenTools;

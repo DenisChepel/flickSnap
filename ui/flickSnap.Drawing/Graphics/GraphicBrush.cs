@@ -69,12 +69,6 @@ namespace FlickSnap.Drawing.Graphics
         // rather than appended to, and compacted to its geometries once the stroke is finished
         [Transient] private IInkOutline _stroke;
 
-        // the hover outline: the stroke's pieces unioned, so chunk seams and self-crossings are not
-        // outlined. A path-op over the whole stroke, so it is kept for the stroke it was made from.
-        [Transient] private Geometry _hoverOutline;
-        [Transient] private IInkOutline _hoverOutlineStroke;
-        [Transient] private int _hoverOutlineSamples;
-
         protected GraphicBrush() // serializer constructor
         { }
 
@@ -301,21 +295,19 @@ namespace FlickSnap.Drawing.Graphics
             }
         }
 
+        // the outline of the ink's filled area, with no seams where the pieces meet or the stroke
+        // crosses itself. Drawn as pixels (InkOutlineDrawOperation), never as a union of the
+        // pieces: a path union grows superlinearly with how much they overlap, and a long
+        // scribble hung the UI thread for tens of seconds the moment the pointer came to rest on it.
         internal override void DrawHoverOutline(DrawingContext ctx, IPen pen)
         {
             if (SampleCount == 0)
                 return;
 
             var stroke = GetOutline();
-            if (_hoverOutline == null || _hoverOutlineStroke != stroke || _hoverOutlineSamples != stroke.SampleCount)
-            {
-                _hoverOutline = new CombinedGeometry(GeometryCombineMode.Union, stroke.Settled ?? stroke.Tail, stroke.Tail);
-                _hoverOutlineStroke = stroke;
-                _hoverOutlineSamples = stroke.SampleCount;
-            }
-
+            var color = pen.Brush is ISolidColorBrush solid ? solid.Color : HandleColor;
             using (ctx.PushTransform(Matrix.CreateTranslation(_origin.X, _origin.Y)))
-                ctx.DrawGeometry(null, pen, _hoverOutline);
+                ctx.Custom(new InkOutlineDrawOperation(stroke.Runs, stroke.Bounds, color, pen.Thickness));
         }
 
         internal override void Draw(DrawingContext ctx, DpiScale uiscale)

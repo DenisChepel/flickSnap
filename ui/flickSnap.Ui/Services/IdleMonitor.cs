@@ -110,12 +110,10 @@ namespace FlickSnap.UI
                 return false;
             }
 
-            if ((EditorWindow.GetOpenEditors().Any() || VideoEditorWindow.GetOpenEditors().Any())
-                && SettingsRoot.Current?.Editor?.RestoreSessionsOnFlickSnapStart != true)
+            if (EditorWindow.GetOpenEditors().Any() || VideoEditorWindow.GetOpenEditors().Any())
             {
-                // reopening the editors after the restart is what makes this non-destructive; without
-                // session restore the update would silently throw away the user's open annotations.
-                reason = "editor windows are open and are not set to reopen on start";
+                // nothing is reopened after the restart, so it would close the user's editors under them
+                reason = "editor windows are open";
                 return false;
             }
 

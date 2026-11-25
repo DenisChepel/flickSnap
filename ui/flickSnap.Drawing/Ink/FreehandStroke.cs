@@ -390,14 +390,20 @@ namespace FlickSnap.Drawing.Ink
         /// </summary>
         internal static StreamGeometry BuildGeometry(ReadOnlySpan<GraphicBrush.Sample> samples, double size)
         {
+            var outline = _outline ??= new List<Point>();
+            BuildOutline(samples, size, outline);
+            return ToGeometry(outline);
+        }
+
+        /// <summary>The outline loop <see cref="BuildGeometry"/> smooths into its figure.</summary>
+        internal static void BuildOutline(ReadOnlySpan<GraphicBrush.Sample> samples, double size, List<Point> outline)
+        {
             var points = _strokePoints ??= new List<StrokePoint>();
             var left = _left ??= new List<Point>();
             var right = _right ??= new List<Point>();
-            var outline = _outline ??= new List<Point>();
 
             GetStrokePoints(samples, size, points);
             GetStrokeOutlinePoints(points, size, left, right, outline);
-            return ToGeometry(outline);
         }
 
         /// <summary>The closed, midpoint-smoothed, NonZero figure of an outline loop.</summary>

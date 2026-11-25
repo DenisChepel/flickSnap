@@ -56,6 +56,7 @@ namespace FlickSnap.UI.DrawOnScreen
         // the text tool's and the select pointer's glyphs, below the other hinted tiles'
         // (TrayTokens.KeyHintGlyphSize, 17)
         private const double TextGlyphSize = 14, PointerGlyphSize = 15.5;
+        private const double LaserGlyphSize = 19;
 
         // the mockup's gap between neighbouring colour and size tiles (its `.seg { gap: 2px }`)
         private const double DotSpacing = 2;
@@ -171,6 +172,11 @@ namespace FlickSnap.UI.DrawOnScreen
                 {
                     button.GlyphSize = PointerGlyphSize;
                     button.Classes.Add("nudge");
+                }
+                else if (tool == ToolType.Laser)
+                {
+                    button.GlyphSize = LaserGlyphSize;
+                    button.Classes.Add("nudge-down");
                 }
                 _tools.Add((tool, button));
                 primary.Children.Add(button);
@@ -444,8 +450,8 @@ namespace FlickSnap.UI.DrawOnScreen
             {
                 _sizes[i].DotColor = color;
                 _sizes[i].IsActive = i == state.SizeIndex;
-                // the ruler has no thickness to choose
-                _sizes[i].IsEnabled = !state.IsToolLit(ToolType.MeasureArea);
+                // the ruler and the laser have no thickness to choose
+                _sizes[i].IsEnabled = !state.IsToolLit(ToolType.MeasureArea) && !state.IsToolLit(ToolType.Laser);
                 SetLabel(_sizes[i], DrawPalette.Sizes[i].Key, DrawHotkeys.Size(i));
             }
 

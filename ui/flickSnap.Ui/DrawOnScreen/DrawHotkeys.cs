@@ -27,7 +27,7 @@ namespace FlickSnap.UI.DrawOnScreen
         public static SimpleKeyGesture Close { get; } = new(Key.W, KeyModifiers.Control);
 
         /// <summary>The tool letters. Shared tools take the image editor's (its ToolRegistry); the select
-        /// tool is S, and the eraser, which the editor lacks, is X.</summary>
+        /// tool is S, and the eraser and the laser, which the editor lacks, are X and K.</summary>
         public static SimpleKeyGesture Tool(ToolType tool) => new(tool switch
         {
             ToolType.Pointer => Key.S,
@@ -40,6 +40,7 @@ namespace FlickSnap.UI.DrawOnScreen
             ToolType.Count => Key.C,
             ToolType.Eraser => Key.X,
             ToolType.MeasureArea => Key.M,
+            ToolType.Laser => Key.K, // Excalidraw's laser key
             _ => throw new ArgumentOutOfRangeException(nameof(tool), tool, "Not a draw-on-screen tool."),
         });
 

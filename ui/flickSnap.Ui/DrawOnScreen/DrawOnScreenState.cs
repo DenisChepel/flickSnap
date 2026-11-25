@@ -38,9 +38,10 @@ namespace FlickSnap.UI.DrawOnScreen
         };
 
         /// <summary>Whether <paramref name="tool"/> is a toolbar tool that puts ink down: not the
-        /// select tool or the eraser, which have nothing to work on when a session opens.</summary>
+        /// select tool or the eraser, which have nothing to work on when a session opens, nor the
+        /// laser, whose trail fades away (so picking a colour or size hands over the brush).</summary>
         public static bool IsDrawingTool(ToolType tool) =>
-            tool is not (ToolType.Pointer or ToolType.Eraser) && DrawPalette.Tools.Contains(tool);
+            tool is not (ToolType.Pointer or ToolType.Eraser or ToolType.Laser) && DrawPalette.Tools.Contains(tool);
 
         /// <summary>Whether the live monitor under the mouse is magnified along with its ink.
         /// Frozen sessions zoom separately with the wheel.</summary>
