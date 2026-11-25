@@ -92,7 +92,7 @@ namespace FlickSnap
 
                 // Windows: park a never-shown window so display changes reach Avalonia's screen
                 // cache while FlickSnap is tray-only (see ScreenCacheSentinel).
-                ScreenCacheSentinel.Initialize();
+                ScreenCacheSentinel.Initialize(RefreshTrayIcon);
 
                 Startup(desktop.Args ?? Array.Empty<string>());
             }
@@ -636,6 +636,12 @@ namespace FlickSnap
             var exit = new NativeMenuItem("Exit");
             exit.Click += async (s, e) => await ExitAppWithConfirmation();
             menu.Add(exit);
+        }
+
+        private void RefreshTrayIcon()
+        {
+            if (!_exiting && _trayIcon != null)
+                _trayIcon.Icon = AppStyles.TrayIcon;
         }
 
         private void AppMenuAbout_Click(object sender, EventArgs e)

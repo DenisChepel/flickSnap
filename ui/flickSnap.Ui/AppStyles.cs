@@ -5,6 +5,7 @@ using Avalonia.Controls;
 using Avalonia.Media;
 using Avalonia.Platform;
 using FlickSnap.Config;
+using FlickSnap.Util;
 
 namespace FlickSnap
 {
@@ -12,6 +13,7 @@ namespace FlickSnap
     {
         private static WindowIcon _appIcon;
         private static WindowIcon _trayIcon;
+        private static WindowIcon _darkTrayIcon;
 
         public static Color AccentColor
         {
@@ -68,12 +70,23 @@ namespace FlickSnap
                 ? "avares://flickSnap/Assets/flicksnap-default.ico"
                 : "avares://flickSnap/Assets/flicksnap-default.png")));
 
-        // Tray icon. The macOS menu bar wants the white glyph (it sits on a dark/translucent bar);
-        // the Windows notification area shows the bare FlickSnap mark (flicksnap-tray.ico, no tile).
+        // Windows uses the transparent mark in the ink that contrasts with the taskbar.
         public static WindowIcon TrayIcon
-            => _trayIcon ??= new WindowIcon(AssetLoader.Open(new Uri(OperatingSystem.IsWindows()
-                ? "avares://flickSnap/Assets/flicksnap-tray.ico"
-                : "avares://flickSnap/Assets/flicksnap-white.png")));
+        {
+            get
+            {
+                if (OperatingSystem.IsWindows() && WindowsTaskbarTheme.IsLight())
+                    return _darkTrayIcon ??= LoadIcon("flicksnap-tray-dark.ico");
+
+                return _trayIcon ??= LoadIcon(OperatingSystem.IsWindows() ? "flicksnap-tray.ico" : "flicksnap-white.png");
+            }
+        }
+
+        private static WindowIcon LoadIcon(string fileName)
+        {
+            using var stream = AssetLoader.Open(new Uri($"avares://flickSnap/Assets/{fileName}"));
+            return new WindowIcon(stream);
+        }
 
         public static string UiDateTimePattern
             => CultureInfo.CurrentCulture.DateTimeFormat.ShortDatePattern + " " +

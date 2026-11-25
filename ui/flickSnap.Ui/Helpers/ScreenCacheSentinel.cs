@@ -1,5 +1,7 @@
 using System;
+using System.Runtime.InteropServices;
 using Avalonia.Controls;
+using Avalonia.Threading;
 
 namespace FlickSnap.UI.Helpers
 {
@@ -25,9 +27,11 @@ namespace FlickSnap.UI.Helpers
     /// </summary>
     internal static class ScreenCacheSentinel
     {
+        private const uint WM_SETTINGCHANGE = 0x001A;
+        private const uint WM_THEMECHANGED = 0x031A;
         private static Window _sentinel;
 
-        public static void Initialize()
+        public static void Initialize(Action onShellThemeChanged)
         {
             if (!OperatingSystem.IsWindows() || _sentinel != null)
                 return;
@@ -38,6 +42,19 @@ namespace FlickSnap.UI.Helpers
                 ShowInTaskbar = false,
                 ShowActivated = false,
             };
+            Win32Properties.AddWndProcHookCallback(_sentinel, OnSystemSettingsChanged);
+
+            IntPtr OnSystemSettingsChanged(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam, ref bool handled)
+            {
+                // The shell and app color modes can change independently. Observe the
+                // broadcast even if Avalonia sees no change in the app's colors.
+                if (message == WM_THEMECHANGED ||
+                    (message == WM_SETTINGCHANGE && Marshal.PtrToStringUni(lParam) == "ImmersiveColorSet"))
+                {
+                    Dispatcher.UIThread.Post(onShellThemeChanged);
+                }
+                return IntPtr.Zero;
+            }
         }
     }
 }
