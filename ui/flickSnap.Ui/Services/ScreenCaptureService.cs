@@ -6,7 +6,6 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using Avalonia.Media;
 using Avalonia.Threading;
 using FlickSnap.Config;
 using FlickSnap.Ipc;
@@ -19,8 +18,7 @@ namespace FlickSnap.UI
     /// <see cref="IScreenCapturePage"/> backed by the external Rust capture process
     /// (CAPTURE_PROTOCOL.md). Mirrors the WPF CaptureWindow callback dispatch: a completed
     /// capture (session.json present) loads the session, names it "Screenshot" and opens the
-    /// editor or the upload flow depending on the action.txt marker; a SELECT-COLOR capture
-    /// (action.txt only) opens the color viewer; a SHARE capture (a "share x,y,w,h" marker, no
+    /// editor or the upload flow depending on the action.txt marker; a SHARE capture (a "share x,y,w,h" marker, no
     /// files) starts a region share; a SEARCH-IMAGE capture (a "search-image" marker plus
     /// cropped.png, no session) is looked up with a reverse image search; an OCR-UPLOAD capture
     /// (an "ocr-upload" marker plus an ocr.txt sidecar, no image) uploads the recognized text as
@@ -34,12 +32,15 @@ namespace FlickSnap.UI
 
         // one capture process at a time, across all page instances.
         private static int _captureActive;
+        private static bool _shellOwnsOverlay;
 
-        /// <summary>True while a capture overlay is on screen — a hard block on applying a
-        /// background update (IdleMonitor). Covers both lifetimes: one-shot captures tracked
-        /// here, and the standby capturer's overlay tracked by its supervisor.</summary>
+        /// <summary>True while the shell is starting or handling a capture, or the standby
+        /// overlay is open. Used by the capture and background update guards.</summary>
         public static bool IsCaptureActive =>
             Volatile.Read(ref _captureActive) != 0 || CaptureStandbySupervisor.IsOverlayOpen;
+
+        /// <summary>Whether a capture overlay is opening or accepting input. UI thread only.</summary>
+        internal static bool IsCaptureOverlayOpen => _shellOwnsOverlay || CaptureStandbySupervisor.IsOverlayOpen;
 
         public async void Open(CaptureMode mode, RegionIntent intent = RegionIntent.Capture)
         {
@@ -48,46 +49,40 @@ namespace FlickSnap.UI
                 Dispatcher.UIThread.Post(() => Open(mode, intent));
                 return;
             }
+            await OpenAsync(mode, intent, EnsureScreenRecordingPermissionAsync);
+        }
 
-            // Never launch either capturer until the shell has established that screen capture is
-            // permitted. Normal screenshots then wake the supervised standby process; when it
-            // cannot take the capture — warm mode off, faulted, or mid-restart — TryCapture
-            // returns false and the classic one-shot spawn below runs instead. Video and share
-            // always retain their separate one-shot lifetime/protocol: the standby process was
-            // spawned without --video/--share and would happily service the request as a plain
-            // screenshot, silently turning "pick a region to record/share" into a screenshot.
-            if (!await EnsureScreenRecordingPermissionAsync())
-                return;
-            if (Volatile.Read(ref _captureActive) != 0)
-                return;
-            var eyedropper = intent == RegionIntent.Capture ? DrawOnScreen.DrawOnScreenSession.ActiveEyedropper : null;
-            var returnFocus = intent == RegionIntent.Capture
-                ? DrawOnScreen.DrawOnScreenSession.GetCaptureFocusReturn()
-                : null;
-            // The one-shot lifetime can restore the loupe's capture affinity even if startup fails.
-            if (intent == RegionIntent.Capture && eyedropper == null && CaptureStandbySupervisor.TryCapture(mode, returnFocus))
+        internal async Task OpenAsync(CaptureMode mode, RegionIntent intent, Func<Task<bool>> ensurePermission)
+        {
+            Dispatcher.UIThread.VerifyAccess();
+            if (IsCaptureActive)
                 return;
 
-            // Only one capturer overlay at a time, whichever process owns it: this stops a
-            // video/recording request (or a one-shot fallback) from stacking a second
-            // fullscreen overlay on top of the standby capturer's.
-            if (CaptureStandbySupervisor.IsOverlayOpen)
-            {
-                Debug.WriteLine("Standby capture overlay is open; ignoring capture request.");
-                return;
-            }
-
-            if (Interlocked.CompareExchange(ref _captureActive, 1, 0) != 0)
-            {
-                Debug.WriteLine("Screen capture is already in progress; ignoring re-entrant request.");
-                return;
-            }
-
-            IdleMonitor.NotifyCaptureActivity();
+            // Reserve the overlay before the preflight can yield to another hotkey.
+            // Standby takes over this reservation when it accepts the request.
+            Volatile.Write(ref _captureActive, 1);
+            _shellOwnsOverlay = true;
+            bool oneShot = false;
             bool returnToDrawing = false;
+            Action returnFocus = null;
 
             try
             {
+                if (!await ensurePermission())
+                    return;
+
+                var eyedropper = intent == RegionIntent.Capture ? DrawOnScreen.DrawOnScreenSession.ActiveEyedropper : null;
+                if (intent == RegionIntent.Capture)
+                {
+                    returnFocus = DrawOnScreen.DrawOnScreenSession.GetCaptureFocusReturn();
+                    // Standby handles screenshots. The one-shot path owns the
+                    // eyedropper's capture affinity and the video/share intents.
+                    if (eyedropper == null && CaptureStandbySupervisor.TryCapture(mode, returnFocus))
+                        return;
+                }
+
+                oneShot = true;
+                IdleMonitor.NotifyCaptureActivity();
                 var binary = FlickSnap.Ipc.HelperLocator.Find(HelperNames.Capture);
                 if (binary == null)
                 {
@@ -111,7 +106,6 @@ namespace FlickSnap.UI
                 // or tray interaction). A kill spares its descendants: an OCR search's browser may
                 // be one of them (§7.4).
                 HelperOutcome<FlickSnap.Ipc.CaptureEvent> outcome;
-                // Window capture can open below a topmost picker in a Debug build.
                 var restoreEyedropper = eyedropper?.IncludeEyedropperInScreenshot(passMouse: mode == CaptureMode.Window);
                 try
                 {
@@ -143,10 +137,11 @@ namespace FlickSnap.UI
                 }
                 finally
                 {
+                    _shellOwnsOverlay = false;
                     restoreEyedropper?.Invoke();
                 }
 
-                // Every normal outcome (edit / upload / color / video / cancel) ends with done.
+                // Every normal outcome ends with done.
                 // Anything else means the capturer crashed or aborted (a GPU shader that failed to
                 // load, say), so surface it instead of silently treating the empty session
                 // directory as a user cancellation.
@@ -206,14 +201,17 @@ namespace FlickSnap.UI
             }
             finally
             {
-                Interlocked.Exchange(ref _captureActive, 0);
+                _shellOwnsOverlay = false;
+                Volatile.Write(ref _captureActive, 0);
 
-                // re-stamp on the way out so the quiet period is measured from when the overlay
-                // disappeared, not from when it was opened.
-                IdleMonitor.NotifyCaptureActivity();
-                Closed?.Invoke(this, EventArgs.Empty);
-                if (returnToDrawing)
-                    returnFocus?.Invoke();
+                if (oneShot)
+                {
+                    // The quiet period starts after the overlay disappears.
+                    IdleMonitor.NotifyCaptureActivity();
+                    Closed?.Invoke(this, EventArgs.Empty);
+                    if (returnToDrawing)
+                        returnFocus?.Invoke();
+                }
             }
         }
 
@@ -234,9 +232,6 @@ namespace FlickSnap.UI
                     break;
                 case CaptureAction.Upload:
                     await UploadManager.UploadSession(result.Session);
-                    break;
-                case CaptureAction.SelectColor:
-                    NiceDialog.ShowColorViewer(result.Color);
                     break;
                 case CaptureAction.Video:
                     // the overlay is done by the time any result is dispatched, and
@@ -393,8 +388,7 @@ namespace FlickSnap.UI
 
             // the accent follows the OS (or the user's pick). It goes over as picked: the capturer
             // makes the same contrast correction for the white text drawn on it that
-            // SettingsGeneral.GetEffectiveAccentColor does (issue #48; crates/flicksnap_capture/src/accent.rs),
-            // and derives its hint comet from the original (AccentColors.CometColors). It lives on
+            // SettingsGeneral.GetEffectiveAccentColor does. It lives on
             // General rather than Capture because the recording toolbar and border wear it too.
             var accent = general.GetPickedAccentColor();
 
@@ -421,12 +415,6 @@ namespace FlickSnap.UI
             {
                 args.Add("--capture-mode");
                 args.Add(mode.ToString().ToLowerInvariant());
-            }
-
-            if (settings.TipsMode != CapturerTipsMode.Hints)
-            {
-                args.Add("--tips-mode");
-                args.Add(settings.TipsMode.ToString().ToLowerInvariant());
             }
 
             if (!settings.RoundedWindowCorners)
@@ -525,7 +513,6 @@ namespace FlickSnap.UI
     {
         Edit,
         Upload,
-        SelectColor,
         Video,
         Share,
         Scroll,
@@ -534,7 +521,7 @@ namespace FlickSnap.UI
     }
 
     /// <summary>A finished, non-canceled capture. <see cref="Session"/> is set for
-    /// Edit/Upload; <see cref="Color"/> for SelectColor; <see cref="Region"/> and
+    /// Edit/Upload; <see cref="Region"/> and
     /// <see cref="SessionDir"/> for Video and Scroll, which additionally carry
     /// <see cref="ScrollPoint"/> and <see cref="TargetHwnd"/>; <see cref="Region"/> alone for
     /// Share, whose directory is already deleted; <see cref="Text"/> for OcrUpload, which carries
@@ -549,7 +536,6 @@ namespace FlickSnap.UI
         /// directory before that directory was deleted — so it is the caller's to delete once the
         /// search has been posted.</summary>
         public string ImagePath { get; init; }
-        public Color? Color { get; init; }
         public ScreenRect Region { get; init; }
         public string SessionDir { get; init; }
 
@@ -581,9 +567,7 @@ namespace FlickSnap.UI
         /// Inspects <paramref name="sessionDir"/> after the capture process has exited.
         /// If session.json exists the capture succeeded: the session is loaded (and registered
         /// with <see cref="SessionManager"/>), renamed to "Screenshot" and returned with the
-        /// action from the action.txt marker (missing marker = Edit). An action.txt of
-        /// "select-color #RRGGBB" without a session carries just the picked color; the
-        /// directory is deleted. A "share x,y,w,h" marker carries just the region to mirror, and
+        /// action from the action.txt marker (missing marker = Edit). A "share x,y,w,h" marker carries just the region to mirror, and
         /// its directory is deleted too — a share writes no files. A "search-image" marker carries
         /// its image in cropped.png, which is moved to a temp file before the directory is deleted.
         /// An "ocr-upload" marker carries
@@ -776,20 +760,9 @@ namespace FlickSnap.UI
                 return null;
             }
 
-            // no session payload — either a color pick or a canceled capture; in both cases
-            // the pre-created directory has nothing worth keeping.
+            // no session payload — a canceled capture: the pre-created directory has nothing
+            // worth keeping.
             DeleteSessionDir(sessionDir);
-
-            const string colorPrefix = "select-color";
-            if (action != null && action.StartsWith(colorPrefix, StringComparison.OrdinalIgnoreCase))
-            {
-                var hex = action.Substring(colorPrefix.Length).Trim();
-                if (Color.TryParse(hex, out var color))
-                    return new CaptureResult { Action = CaptureAction.SelectColor, Color = color };
-
-                Debug.WriteLine("Unparseable select-color action: " + action);
-            }
-
             return null;
         }
 

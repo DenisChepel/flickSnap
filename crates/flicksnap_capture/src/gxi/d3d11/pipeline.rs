@@ -25,7 +25,7 @@ use super::shaders;
 pub struct RenderPipeline {
     pub(super) vs: ID3D11VertexShader,
     pub(super) ps: ID3D11PixelShader,
-    /// `None` for the fullscreen-triangle passes (desktop, peek), which
+    /// `None` for the fullscreen-triangle passes, which
     /// bind a null input layout and are driven by `SV_VertexID` alone.
     pub(super) input_layout: Option<ID3D11InputLayout>,
     pub(super) blend: ID3D11BlendState,
@@ -55,13 +55,9 @@ impl Device {
     /// runtime-WGSL fallback (this backend ships no shader compiler), and
     /// a rejected blob can only mean a broken build or a drifted register
     /// contract — never a legitimate runtime condition, because `create`
-    /// guarantees FL ≥ 11_0 and SM 5.0 is core there. Containment depends
-    /// on the call site: the desktop pipeline (worker Stage A) panics with
-    /// the fail guard armed and rides `ReadyGuard` → `failed_count` → show
-    /// gate → the shell's error dialog; the other five pipelines (peek +
-    /// the UI stack) are built on the deferred builder thread, whose panic
-    /// is absorbed in `render.rs` — that monitor keeps a desktop-only
-    /// overlay, no failure is counted, and the only evidence is the log.
+    /// guarantees FL ≥ 11_0 and SM 5.0 is core there. A panic during
+    /// desktop or deferred pipeline creation ends the render worker.
+    /// Its failure guard wakes the capture loop so it can report the error.
     pub fn create_pipeline(&self, desc: &PipelineDesc) -> RenderPipeline {
         let blobs = shaders::source(desc.shader);
         let device = self.raw();
@@ -152,7 +148,7 @@ impl SharedStates {
         let mut rasterizer: Option<ID3D11RasterizerState> = None;
         unsafe { device.CreateRasterizerState(&raster_desc, Some(&mut rasterizer)) }?;
 
-        // Replace: blending disabled (desktop and peek own every pixel).
+        // Replace: blending disabled.
         let blend_replace = create_blend(device, None)?;
         // Source-over with premultiplied source, both channels.
         let blend_premul = create_blend(device, Some((D3D11_BLEND_ONE, D3D11_BLEND_ONE)))?;

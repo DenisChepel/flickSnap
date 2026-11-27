@@ -3,26 +3,27 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use unicode_script::{Script, UnicodeScript};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 #[cfg(windows)]
 use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::capture_output::{copy_text_to_clipboard, copy_to_clipboard, ActionResult};
+use crate::capture_output::{copy_text_to_clipboard, copy_to_clipboard, ActionResult, Screenshot};
+use crate::draw::{DrawState, Marks};
 use crate::image_extract::extract_selection_bgra;
-use crate::interaction::{
-    InteractionController, InteractionEffects, InteractionState, MouseVelocityTracker, OcrNotice, OcrNoticeKind, OcrState,
-};
+use crate::interaction::{InteractionController, InteractionEffects, InteractionState, OcrNotice, OcrNoticeKind, OcrState};
 use crate::ocr::{self, OcrError, OcrOutcome, OcrRequest};
 use crate::render::window::{set_hardware_cursor_visible, WindowHandle, WindowSet};
 use crate::render::worker::WorkerSetup;
-use crate::selection::{clamp_to_nearest_monitor, dpi_at_point, hit_test, move_and_crop, resize_with_clamp, DragMode, Hittest};
+use crate::selection::{dpi_at_point, hit_test, move_and_crop, resize_with_clamp, DragMode, Hittest};
 use crate::session_output::{
-    write_color_action, write_image_search_action, write_ocr_upload_action, write_scroll_action, write_session, write_share_action,
-    write_video_action, SessionAction,
+    write_image_search_action, write_ocr_upload_action, write_scroll_action, write_session, write_share_action, write_video_action,
+    SessionAction,
 };
 use crate::settings::{CaptureMode, CapturerSettings};
 use crate::sync::{Latch, VisibleLatch};
@@ -31,14 +32,10 @@ use crate::telemetry::startup::StartupTimings;
 use crate::ui::command::Command;
 use crate::ui::components::panel;
 use crate::ui::egui_host::{EguiHosts, FontInstall, PanelOutcome, SyncArgs};
-use crate::ui::shared::{active_panel_set, cursor_image_rect, sample_bgra, UiMonitor, UiSharedState};
+use crate::ui::shared::{active_panel_set, UiMonitor, UiSharedState};
 use flicksnap_shared::geometry::{
     to_screen_point, RectExt, ScreenPoint, ScreenPointF, ScreenRect, ScreenRectExt, ScreenRectRounded, WindowPoint,
 };
-
-const ZOOM_STEP: f32 = 2.0;
-const TOUCHPAD_PIXELS_PER_DOUBLING: f32 = 200.0;
-const MOMENTUM_GAP: Duration = Duration::from_millis(50);
 
 /// One capture cycle's state. The persistent process drops this whole graph
 /// before returning to standby, including its GPU instance, monitors,
@@ -51,17 +48,13 @@ pub struct App {
     ui_monitors: Arc<[UiMonitor]>,
     vd_bounds: ScreenRect,
     startup: Arc<StartupTimings>,
-    pinch_monitor: Option<crate::system::PinchMonitor>,
     instance: crate::gxi::Instance,
     /// Consumed in resumed() — each one gets a window + surface handoff.
     worker_setups: Option<Vec<WorkerSetup>>,
-    /// Incremented by workers that die without a clean shutdown (and by
-    /// window-creation failures here), so the show gate
-    /// (`ready + failed >= expected`) can never deadlock on a dead worker.
+    /// Window creation failures and unexpected render worker exits.
     worker_failed: Arc<AtomicUsize>,
     cycle: Option<CaptureCycle>,
-    /// A startup failure detected inside the event loop — today only the
-    /// screenshot deadline expiring. `run_app` has no error channel of its
+    /// A capture or preview startup failure. `run_app` has no error channel of its
     /// own, so the failure is parked here and `fatal_result` hands it back
     /// to `main` after the loop exits, preserving the non-zero exit code
     /// (and the sentry capture) the old blocking-wait `?` produced.
@@ -149,15 +142,14 @@ struct PendingShow {
     since: Instant,
 }
 
-/// How long the show gate waits for every worker before giving up and
-/// showing whatever is ready.
+/// How long the show gate waits for the displays before canceling startup.
 ///
 /// Load-bearing since the overlay windows are ordered front *before* frame 0
 /// (the macOS `SurfaceError::Occluded` workaround): from window creation
 /// onwards the user is looking at a frozen still of their desktop. A worker
 /// that wedges without panicking — the `nextDrawable` stall of
 /// gfx-rs/wgpu#8309, or a hung shader compile — bumps neither `ready_count`
-/// nor `ReadyGuard`, so an unbounded gate would leave that frozen still on
+/// nor the render failure guard, so an unbounded gate would leave that frozen still on
 /// screen forever with the live desktop unreachable and no way to dismiss it.
 /// Before the early order-front the same hang merely showed nothing.
 ///
@@ -171,7 +163,6 @@ const SHOW_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum CycleAction {
     Edit,
     Upload,
-    SelectColor,
     Video,
     /// `--share` mode: the picked region was handed to the shell to mirror
     /// into a window a meeting app can share.
@@ -198,14 +189,7 @@ pub enum CycleAction {
 
 fn broadcast_mouse_state(windows: &WindowSet, input: &InteractionState) {
     for h in windows.values() {
-        h.update_mouse_state(
-            input.virtual_cursor,
-            input.zoom,
-            input.selection,
-            input.selection_radius,
-            input.mouse_down,
-            input.captured,
-        );
+        h.update_mouse_state(input.selection, input.selection_radius, input.mouse_down, input.captured);
     }
 }
 
@@ -236,11 +220,8 @@ fn hide_overlay_for_action(windows: &WindowSet) {
 /// whenever the hosting NSWindow lacks `NSWindowOcclusionStateVisible` (the
 /// guard carried over from wgpu-hal's workaround for gfx-rs/wgpu#8309,
 /// where a presented drawable on an occluded window wedges `nextDrawable`
-/// for a second). Windows are created hidden, so
-/// an unordered window means frame 0 acquires nothing, `draw_once` returns
-/// before it ever reaches `queue.present`, and the worker bumps `ready_count`
-/// anyway — the show gate then raises an overlay that was never painted, and
-/// the first pixels wait on the render loop's next iteration.
+/// for a second). Ordering the window first lets Metal acquire a drawable
+/// while the frozen desktop is already visible underneath.
 ///
 /// Nothing flashes: the caller has already installed (or filled — see
 /// `try_pick_up_screenshot`) the frozen-desktop CALayer, and the render
@@ -264,7 +245,8 @@ fn order_window_front_early(window: &Window) {
     unsafe {
         let ns_view: &NSView = &*(h.ns_view.as_ptr() as *const NSView);
         if let Some(ns_window) = ns_view.window() {
-            ns_window.orderFrontRegardless();
+            // The Draw on Screen toolbar already sits above the standard overlay level.
+            flicksnap_desktop::overlay::raise_above_overlays(&ns_window);
         }
     }
 }
@@ -323,14 +305,20 @@ fn cursor_for(input: &InteractionState, over_button: bool, over_tray: bool) -> C
         // The selection is frozen for the whole of OCR mode: resize
         // arrows would promise an interaction it no longer offers.
         CursorIcon::Default
+    } else if input.marks.is_drawing() || (input.draw.tool.is_some() && is_canvas(input.hittest)) {
+        // With a tool picked the screen is the canvas, not a selection to
+        // move: no move arrows, just the ordinary pointer.
+        CursorIcon::Default
     } else {
         input.hittest.cursor()
     }
 }
 
+/// The system pointer is the overlay's pointer throughout — before the
+/// selection as after it — except where the scroll picker's reticle
+/// stands in for it.
 fn update_cursor_visibility(windows: &WindowSet, cycle: &CaptureCycle) {
     let input = &cycle.input;
-    // Checked ahead of `captured`, which is always set while picking.
     if reticle_stands_in(
         input.scroll_pick_mode,
         input.overlays_visible,
@@ -338,10 +326,8 @@ fn update_cursor_visibility(windows: &WindowSet, cycle: &CaptureCycle) {
         input.pointer_over_tray,
     ) {
         windows.hide_cursors();
-    } else if cycle.settings.live_selection() || input.captured || input.debug_visible {
-        windows.show_cursors();
     } else {
-        windows.hide_cursors();
+        windows.show_cursors();
     }
 }
 
@@ -352,6 +338,117 @@ fn set_cursor_if_changed(windows: &WindowSet, last_cursor: &mut HashMap<WindowId
     if let Some(window) = windows.get(&id) {
         window.set_cursor(cursor);
         last_cursor.insert(id, cursor);
+    }
+}
+
+/// Where a press with a drawing tool picked starts a mark: anywhere but a
+/// resize handle, inside the selection or out. Ink is clipped to the
+/// selection on export. The handles keep resizing around it.
+fn is_canvas(hittest: Hittest) -> bool {
+    matches!(hittest, Hittest::Inside | Hittest::Outside)
+}
+
+/// The undo chord's modifiers: Ctrl alone, or Cmd alone on macOS.
+fn is_undo_chord(m: ModifiersState) -> bool {
+    m == if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL
+    }
+}
+
+/// The letter an overlay hotkey answers to for a key press, lowercase, on
+/// any keyboard layout. ASCII letters follow the active layout. Letters
+/// from other scripts use the physical QWERTY position.
+fn hotkey_letter(logical: &Key, physical: PhysicalKey) -> Option<char> {
+    let Key::Character(ch) = logical else {
+        return None;
+    };
+    let mut chars = ch.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    if c.is_ascii_alphabetic() {
+        return Some(c.to_ascii_lowercase());
+    }
+    if !c.is_alphabetic() || c.script() == Script::Latin {
+        return None;
+    }
+    const QWERTY: [(KeyCode, char); 26] = [
+        (KeyCode::KeyA, 'a'),
+        (KeyCode::KeyB, 'b'),
+        (KeyCode::KeyC, 'c'),
+        (KeyCode::KeyD, 'd'),
+        (KeyCode::KeyE, 'e'),
+        (KeyCode::KeyF, 'f'),
+        (KeyCode::KeyG, 'g'),
+        (KeyCode::KeyH, 'h'),
+        (KeyCode::KeyI, 'i'),
+        (KeyCode::KeyJ, 'j'),
+        (KeyCode::KeyK, 'k'),
+        (KeyCode::KeyL, 'l'),
+        (KeyCode::KeyM, 'm'),
+        (KeyCode::KeyN, 'n'),
+        (KeyCode::KeyO, 'o'),
+        (KeyCode::KeyP, 'p'),
+        (KeyCode::KeyQ, 'q'),
+        (KeyCode::KeyR, 'r'),
+        (KeyCode::KeyS, 's'),
+        (KeyCode::KeyT, 't'),
+        (KeyCode::KeyU, 'u'),
+        (KeyCode::KeyV, 'v'),
+        (KeyCode::KeyW, 'w'),
+        (KeyCode::KeyX, 'x'),
+        (KeyCode::KeyY, 'y'),
+        (KeyCode::KeyZ, 'z'),
+    ];
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    QWERTY
+        .iter()
+        .find(|(k, _)| *k == code)
+        .map(|&(_, c)| c)
+}
+
+/// Whether the drawing strip is up to take an UNDO: the capture strip is.
+fn drawbar_is_up(input: &InteractionState) -> bool {
+    active_panel_set(input.captured, input.scroll_pick_mode, &input.ocr) == Some(panel::model::PanelButtonSet::Normal)
+}
+
+/// Whether a press is still being dragged on the captured selection: a
+/// mark being drawn, or the selection being moved or resized. Every
+/// command waits for its release — a mode switch or an action mid-drag
+/// would leave the gesture running against a strip, a mode or a capture
+/// that is no longer the one it started on.
+fn gesture_in_progress(input: &InteractionState) -> bool {
+    input.captured && (input.marks.is_drawing() || input.drag_mode.is_some())
+}
+
+/// What one Escape press undoes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeStep {
+    ClosePalette,
+    ExitOcr,
+    ExitScrollPick,
+    Cancel,
+}
+
+/// Escape backs out one step at a time: an open colour popup shuts
+/// (draw-on-screen's palette does the same), OCR mode unwinds through its
+/// own ladder (Scanning cancels, Lifted starts the retract, Retracting
+/// skips it), picking a scroll point returns to the panel with the
+/// selection intact, and only outside any of those does Escape cancel the
+/// whole cycle — and with it the selection and everything drawn on it.
+fn escape_step(input: &InteractionState) -> EscapeStep {
+    if input.draw.palette_open {
+        EscapeStep::ClosePalette
+    } else if input.ocr.active() {
+        EscapeStep::ExitOcr
+    } else if input.scroll_pick_mode {
+        EscapeStep::ExitScrollPick
+    } else {
+        EscapeStep::Cancel
     }
 }
 
@@ -387,11 +484,8 @@ fn default_action(input: &InteractionState) -> Option<Command> {
     }
 }
 
-/// How long panel-aimed mouse dispatch stays ignored after the visible
-/// button set changes: the OS double-click time on Windows — exactly the
-/// interval within which the second press of one physical double-click can
-/// arrive, and it tracks the user's accessibility settings — with the OS
-/// default (500 ms) as the fixed fallback elsewhere.
+/// Maximum time between the presses of a double-click. On Windows this
+/// follows the user's system setting, with 500 ms as the fallback elsewhere.
 fn panel_swap_guard_window() -> Duration {
     #[cfg(windows)]
     {
@@ -407,65 +501,55 @@ fn panel_swap_guard_window() -> Duration {
     }
 }
 
-/// Watches which button set the panel is showing and when that last
-/// changed, to enforce one property: **a single physical double-click on a
-/// panel button must never dispatch two different commands.**
-///
-/// The set swap is synchronous on the first press, and `panel::show`
-/// centres each strip with its own width, so the second press of a
-/// double-click lands at an arbitrary position in the new strip: possibly
-/// a different button, possibly nothing. Which one depends on strip widths
-/// and the selection, so it cannot be pinned; ignoring panel-aimed mouse
-/// dispatch for one double-click interval after ANY swap (including
-/// None→Some, a panel materializing under the cursor) closes the whole
-/// class independent of geometry. Keyboard accelerators never consult this
-/// guard: a key press carries no screen position, so a swap cannot
-/// redirect it.
+/// Protect a mouse double-click from acting on two different layouts.
+#[derive(Default)]
 struct PanelSwapGuard {
-    /// The set last shown (`None` = panel hidden). Only *changes* arm the
-    /// guard — the steady-state broadcast on every mouse move must not
-    /// keep re-arming it.
     shown: Option<panel::model::PanelButtonSet>,
-    /// When `shown` last changed; `None` until the first change.
-    changed_at: Option<Instant>,
+    revision: usize,
+    press: Option<(ScreenPointF, Instant, usize)>,
 }
 
 impl PanelSwapGuard {
-    fn new() -> Self {
-        Self {
-            shown: None,
-            changed_at: None,
-        }
-    }
-
-    /// Record the set currently on screen. Called from
-    /// `broadcast_ui_state`, the single choke point every renderer-visible
-    /// state mutation already flows through — so no transition can swap
-    /// the panel without passing here first.
-    ///
-    /// `None -> Some` arms the guard too, deliberately: a double-click
-    /// that CAPTURES a selection materializes the panel under the cursor,
-    /// and its second press would otherwise fire whichever button appeared
-    /// there.
-    fn observe(&mut self, set: Option<panel::model::PanelButtonSet>, now: Instant) {
-        if set != self.shown {
+    fn observe(&mut self, set: Option<panel::model::PanelButtonSet>) {
+        if self.shown != set {
             self.shown = set;
-            self.changed_at = Some(now);
+            self.revision += 1;
         }
     }
 
-    /// Whether a panel-aimed click at `now` must be ignored. Split from
-    /// [`Self::blocks_click`] so tests can pin the window arithmetic
-    /// without a live OS double-click setting.
-    fn blocks_click_within(&self, now: Instant, window: Duration) -> bool {
-        // duration_since saturates to zero for out-of-order Instants, so a
-        // click stamped before the swap is (correctly) still blocked.
-        self.changed_at
-            .is_some_and(|t| now.duration_since(t) < window)
+    fn press(&mut self, point: ScreenPointF, now: Instant, window: Duration, half_width: f32, half_height: f32) -> bool {
+        if self
+            .press
+            .is_some_and(|(previous, at, revision)| {
+                revision != self.revision
+                    && now.saturating_duration_since(at) < window
+                    && (point.x - previous.x).abs() <= half_width
+                    && (point.y - previous.y).abs() <= half_height
+            })
+        {
+            return true;
+        }
+        self.press = Some((point, now, self.revision));
+        false
     }
+}
 
-    fn blocks_click(&self, now: Instant) -> bool {
-        self.blocks_click_within(now, panel_swap_guard_window())
+fn double_click_half_size(dpi: f32) -> (f32, f32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
+        use windows::Win32::UI::WindowsAndMessaging::{SM_CXDOUBLECLK, SM_CYDOUBLECLK};
+        let dpi = (dpi * 96.0).round() as u32;
+        unsafe {
+            (
+                GetSystemMetricsForDpi(SM_CXDOUBLECLK, dpi).max(2) as f32 / 2.0,
+                GetSystemMetricsForDpi(SM_CYDOUBLECLK, dpi).max(2) as f32 / 2.0,
+            )
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        (4.0 * dpi, 4.0 * dpi)
     }
 }
 
@@ -494,35 +578,29 @@ fn broadcast_ui_state(
     // when a swap happened. Every renderer-visible state mutation flows
     // through this broadcast, so the guard is armed before any click can
     // be routed against the new set.
-    cycle.panel_swap.observe(
-        active_panel_set(cycle.input.captured, cycle.input.scroll_pick_mode, &cycle.input.ocr),
-        Instant::now(),
-    );
+    cycle.panel_swap.observe(active_panel_set(
+        cycle.input.captured,
+        cycle.input.scroll_pick_mode,
+        &cycle.input.ocr,
+    ));
     let cursor_pt = to_screen_point(cycle.input.virtual_cursor);
 
     let hovered_monitor_name = monitors
         .iter()
         .find(|m| m.bounds.contains(cursor_pt))
-        .map(|m| m.name.clone());
+        .map(|m| m.name.as_str());
 
     // This is the one call that
     // runs the hosts with everything this broadcast knows, so its outcome
     // is also the answer to what the pointer is over — the cursor ladder
     // in `CursorMoved` reads it rather than running the tray a second time.
-    let cursor_overlay_visible = cycle.input.cursor_overlay_visible;
     let panel = cycle.egui.sync(SyncArgs {
         input: &cycle.input,
         settings: &cycle.settings,
         monitors,
         ui_monitors,
         desktop_buffer: cycle.desktop_buffer.as_deref(),
-        hovered_title: None,
-        hovered_monitor_name: hovered_monitor_name.as_deref(),
-        hovered_bounds: None,
-        hovered_index: None,
-        hovered_obstructed: false,
-        cursor_image_rect: cursor_image_rect(cycle.desktop_buffer.as_deref()),
-        cursor_overlay_visible,
+        hovered_monitor_name,
     });
     // What the tray found under the pointer in the pass that just ran, so
     // every decision taken after this broadcast — the cursor ladder below,
@@ -537,7 +615,7 @@ fn broadcast_ui_state(
     let state = Arc::new(UiSharedState {
         debug_visible: cycle.input.debug_visible,
         overlays_visible: cycle.input.overlays_visible,
-        cursor_overlay_visible,
+        cursor_overlay_visible: cycle.input.cursor_overlay_visible,
         scroll_pick_mode: cycle.input.scroll_pick_mode,
         // The cycle keeps its copy, so this one is a genuine clone — but
         // the only heap content is the outcome behind an Arc, so the cost
@@ -600,13 +678,6 @@ impl App {
             .find(|m| m.is_primary)
             .or_else(|| monitors.first())
             .expect("at least one monitor present");
-        let anchor = ScreenPoint::new(primary.bounds.center_x(), primary.bounds.center_y());
-
-        let tips_mode = if settings.live_selection() {
-            crate::settings::TipsMode::Off
-        } else {
-            settings.tips_mode_at_startup
-        };
         let cursor_overlay_visible = settings.cursor_visible_at_startup;
         let monitor_target = || {
             let point = to_screen_point(initial_mouse);
@@ -624,13 +695,6 @@ impl App {
             CaptureMode::Screen => Some(monitor_target()),
             CaptureMode::Window => Some(active_window.unwrap_or_else(monitor_target)),
         };
-
-        // The macOS hide is display-global, so it is bracketed by the
-        // capture: `finish_cycle` (and `resumed`'s no-windows bail-out)
-        // undoes it.
-        if !settings.live_selection() {
-            set_hardware_cursor_visible(false);
-        }
 
         let cycle = CaptureCycle {
             settings,
@@ -653,14 +717,10 @@ impl App {
             ocr_req: 0,
             ocr_job: None,
             ocr_ready: None,
-            panel_swap: PanelSwapGuard::new(),
+            panel_swap: PanelSwapGuard::default(),
             egui: EguiHosts::new(&ui_monitors, startup.clone()),
             input: InteractionState {
                 virtual_cursor: initial_mouse,
-                zoom: 1.0,
-                anchored: false,
-                anchor_just_engaged: false,
-                anchor,
                 mouse_down: false,
                 mouse_down_pt: None,
                 mouse_down_dpi: 1.0,
@@ -671,20 +731,18 @@ impl App {
                 hittest: Hittest::Outside,
                 drag_mode: None,
                 drag_anchor_selection: None,
-                tips_mode,
+                tips_visible: false,
+                loupe_visible: false,
                 debug_visible: false,
-                last_scroll_end: None,
-                scroll_momentum: false,
                 overlays_visible: true,
                 cursor_overlay_visible,
                 pointer_over_tray: false,
-                has_ever_scrolled: false,
-                show_scroll_hint: false,
-                velocity_tracker: MouseVelocityTracker::new(),
-                has_used_magnifier: false,
                 scroll_pick_mode: false,
                 ocr: OcrState::Idle,
                 ocr_notice: None,
+                draw: DrawState::default(),
+                marks: Marks::default(),
+                modifiers: ModifiersState::empty(),
             },
         };
 
@@ -694,7 +752,6 @@ impl App {
             ui_monitors,
             vd_bounds,
             startup,
-            pinch_monitor: None,
             instance,
             worker_setups: Some(worker_setups),
             worker_failed,
@@ -720,11 +777,9 @@ impl App {
             .unwrap_or(CycleAction::Canceled)
     }
 
-    /// Window creation for monitor `i` failed, so its worker will never
-    /// receive a handoff. Count it, keeping the show gate
-    /// (`ready + failed >= expected`) balanced; the thread exits on channel
-    /// disconnect once the screenshot job's sender clones drop.
-    fn teardown_failed_worker(&mut self, _i: usize) {
+    /// Window creation failed, so the show gate can cancel startup as
+    /// soon as it checks the worker status.
+    fn record_window_failure(&self) {
         self.worker_failed
             .fetch_add(1, Ordering::Release);
     }
@@ -740,14 +795,6 @@ impl App {
         // foreground handback rather than a bare hide, even though the action
         // dispatches have usually done it already.
         hide_overlay_for_action(&self.windows);
-        // Cancelling or sampling a colour while zoomed leaves the hardware
-        // cursor parked at the magnifier anchor; put it back where the user
-        // was pointing before it is shown again.
-        if let Some(cycle) = self.cycle.as_mut() {
-            if let Some(restore) = InteractionController::release_anchor(&mut cycle.input) {
-                SystemInterop::set_mouse_position(restore, &self.monitors);
-            }
-        }
         // Idempotent (guarded by a static in window.rs) even when cursors
         // were already restored via update_cursor_visibility.
         set_hardware_cursor_visible(true);
@@ -764,15 +811,8 @@ impl App {
                 pending.visible_latch.signal_all();
             }
         }
+        event_loop.set_control_flow(ControlFlow::Poll);
         event_loop.exit();
-    }
-
-    fn apply_zoom_factor(&mut self, factor: f32) {
-        let Some(cycle) = self.cycle.as_mut() else {
-            return;
-        };
-        let effects = InteractionController::apply_zoom_factor(&mut cycle.input, factor);
-        self.apply_interaction_effects(effects, None);
     }
 
     fn show_all_windows(&self) {
@@ -805,7 +845,7 @@ impl App {
             let Some(cycle) = self.cycle.as_mut() else {
                 return;
             };
-            if cycle.settings.live_selection() || cycle.desktop_buffer.is_some() {
+            if cycle.desktop_buffer.is_some() {
                 return;
             }
             if let Some(buf) = cycle.screenshot_latch.try_get() {
@@ -831,9 +871,8 @@ impl App {
     }
 
     /// Non-blocking pickup of the OCR worker's result, plus the OCR phase
-    /// clock. Polled every `about_to_wait` pass beside the screenshot
-    /// pickups — the cycle already runs `ControlFlow::Poll`, so no WaitUntil
-    /// machinery is needed for any of the time-gated transitions below.
+    /// clock. Called from `about_to_wait`; an active job or transition
+    /// keeps a bounded wakeup scheduled even without pointer input.
     fn try_advance_ocr(&mut self) {
         let Some(cycle) = self.cycle.as_mut() else {
             return;
@@ -1172,7 +1211,7 @@ impl App {
     /// button, or the picker's crosshair) until the user happened to move.
     ///
     /// Both halves have to come from the same broadcast. The mode change
-    /// re-centres the strip under the cursor and may swap the set
+    /// re-places the strip under the cursor and may swap the set
     /// altogether, so what the pointer is over afterwards is not something
     /// the caller can know before laying the new strip out — and
     /// `update_cursor_visibility` reads `pointer_over_tray`, which this
@@ -1193,9 +1232,6 @@ impl App {
         };
         if effects.update_cursor_visibility {
             update_cursor_visibility(&self.windows, cycle);
-        }
-        if let Some(pos) = effects.restore_mouse {
-            SystemInterop::set_mouse_position(pos, &self.monitors);
         }
         if let (Some(window_id), Some(cursor)) = (window_id, effects.set_cursor) {
             set_cursor_if_changed(&self.windows, &mut cycle.last_cursor, window_id, cursor);
@@ -1256,77 +1292,58 @@ impl App {
         }
     }
 
+    /// Shut the drawing strip's colour popup, and show that it is shut.
+    fn close_palette(&mut self) {
+        if let Some(cycle) = self.cycle.as_mut() {
+            if cycle.input.draw.close_palette() {
+                broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
+            }
+        }
+    }
+
     fn dispatch_command(&mut self, command: Command, event_loop: &ActiveEventLoop, window_id: WindowId) {
         use xdialog::XDialogIcon::Error as ErrorIcon;
-        log::info!("dispatch command: {:?}", command);
-
         if self
             .cycle
             .as_ref()
-            .is_some_and(|c| c.settings.live_selection())
-            && matches!(
-                command,
-                Command::Copy | Command::Save | Command::Edit | Command::Upload | Command::SearchImage | Command::Video | Command::Ocr
-            )
+            .is_some_and(|c| gesture_in_progress(&c.input))
         {
-            let Some(selection) = self
-                .cycle
-                .as_ref()
-                .filter(|c| c.input.captured && !c.input.ocr.active())
-                .and_then(|c| c.input.selection)
-                .and_then(|r| r.intersection(&self.vd_bounds))
-            else {
-                return;
-            };
+            log::info!("command {command:?} ignored: a drag is in progress");
+            return;
+        }
+        log::info!("dispatch command: {:?}", command);
 
-            if command != Command::Ocr {
-                SystemInterop::hand_foreground_to_shell();
-            }
-            self.windows.hide_all();
-            match crate::system::capture_region(selection, &self.monitors) {
-                Ok(bitmap) => {
-                    log::info!("captured region {}x{}", bitmap.width, bitmap.height);
-                    if let Some(cycle) = self.cycle.as_mut() {
-                        cycle.desktop_buffer = Some(Arc::new(bitmap));
-                    }
-                    // OCR continues in the current overlay. The other actions
-                    // keep it hidden and use their usual completion/retry paths.
-                    if command == Command::Ocr {
-                        self.show_all_windows();
-                        if let Some(window) = self.windows.get(&window_id) {
-                            window.focus();
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!("could not capture region: {err:#}");
-                    if xdialog::show_message_retry_cancel("flickSnap Capture", "Screen Capture Failed", err.to_string(), ErrorIcon)
-                        .unwrap_or(false)
-                    {
-                        self.show_all_windows();
-                    } else {
-                        self.finish_cycle(event_loop, CycleAction::Canceled);
-                    }
-                    return;
-                }
-            }
+        // Every command but the colour popup's own shuts it, keyboard
+        // accelerators included — the popup is a choice about to be made,
+        // and doing anything else is the answer to it. Shown at once: some
+        // of these hide the overlay or raise a dialog without broadcasting
+        // again, and the popup must not be what the overlay comes back to.
+        if !matches!(command, Command::DrawPalette | Command::DrawColor(_)) {
+            self.close_palette();
         }
 
         let Some(cycle) = self.cycle.as_mut() else {
             return;
         };
-        let cursor = cycle
-            .desktop_buffer
-            .as_ref()
-            .and_then(|buf| buf.cursor.as_ref());
         let cursor_visible = cycle.input.cursor_overlay_visible;
+        let screenshot = cycle
+            .input
+            .selection
+            .zip(cycle.desktop_buffer.as_deref())
+            .map(|(selection, buffer)| Screenshot {
+                selection,
+                buffer,
+                corner_radius: cycle.input.selection_radius,
+                cursor_visible,
+                marks: cycle.input.marks.done(),
+            });
 
         match command {
             Command::Copy => {
                 hide_overlay_for_action(&self.windows);
-                let result = match (cycle.input.selection, cycle.desktop_buffer.as_deref()) {
-                    (Some(sel), Some(buf)) => copy_to_clipboard(sel, cycle.input.selection_radius, buf, cursor, cursor_visible),
-                    _ => ActionResult::Failed("No selection or buffer".into()),
+                let result = match screenshot {
+                    Some(screenshot) => copy_to_clipboard(screenshot),
+                    None => ActionResult::Failed("No selection or buffer".into()),
                 };
                 match result {
                     ActionResult::Success => self.finish_cycle(event_loop, CycleAction::Copy),
@@ -1344,14 +1361,12 @@ impl App {
             }
             Command::Save => {
                 hide_overlay_for_action(&self.windows);
-                let result = match (cycle.input.selection, cycle.desktop_buffer.as_deref()) {
-                    (Some(sel), Some(buf)) => match self.windows.get(&window_id) {
-                        Some(handle) => {
-                            handle.save_to_file(sel, cycle.input.selection_radius, buf, cursor, cursor_visible, &cycle.settings)
-                        }
+                let result = match screenshot {
+                    Some(screenshot) => match self.windows.get(&window_id) {
+                        Some(handle) => handle.save_to_file(screenshot, &cycle.settings),
                         None => ActionResult::Failed("No active window".into()),
                     },
-                    _ => ActionResult::Failed("No selection or buffer".into()),
+                    None => ActionResult::Failed("No selection or buffer".into()),
                 };
                 match result {
                     ActionResult::Success => self.finish_cycle(event_loop, CycleAction::Save),
@@ -1381,9 +1396,9 @@ impl App {
                     (SessionAction::Edit, CycleAction::Edit)
                 };
                 hide_overlay_for_action(&self.windows);
-                let result = match (cycle.input.selection, cycle.desktop_buffer.as_deref()) {
-                    (Some(sel), Some(buf)) => write_session(&session_dir, sel, cycle.input.selection_radius, buf, cursor_visible, action),
-                    _ => ActionResult::Failed("No selection or buffer".into()),
+                let result = match screenshot {
+                    Some(screenshot) => write_session(&session_dir, screenshot, cycle.settings.capture_mode == CaptureMode::Window, action),
+                    None => ActionResult::Failed("No selection or buffer".into()),
                 };
                 match result {
                     ActionResult::Success => self.finish_cycle(event_loop, cycle_action),
@@ -1411,11 +1426,9 @@ impl App {
                     return;
                 };
                 hide_overlay_for_action(&self.windows);
-                let result = match (cycle.input.selection, cycle.desktop_buffer.as_deref()) {
-                    (Some(sel), Some(buf)) => {
-                        write_image_search_action(&session_dir, sel, cycle.input.selection_radius, buf, cursor_visible)
-                    }
-                    _ => ActionResult::Failed("No selection or buffer".into()),
+                let result = match screenshot {
+                    Some(screenshot) => write_image_search_action(&session_dir, screenshot),
+                    None => ActionResult::Failed("No selection or buffer".into()),
                 };
                 match result {
                     ActionResult::Success => self.finish_cycle(event_loop, CycleAction::SearchImage),
@@ -1430,35 +1443,21 @@ impl App {
                     }
                 }
             }
-            Command::SelectColor => {
-                // H in crosshair mode (DxScreenCapture.cpp:1223): report
-                // the pixel under the cursor to the shell — it opens its
-                // color viewer. Without a shell there is nothing to show
-                // the color in — ignore.
-                let Some(session_dir) = cycle.settings.session_dir.clone() else {
-                    log::info!("command SelectColor ignored: no --session-dir provided");
-                    return;
-                };
-                let sampled = cycle
-                    .desktop_buffer
-                    .as_deref()
-                    .and_then(|buf| sample_bgra(buf, to_screen_point(cycle.input.virtual_cursor)));
-                let Some(bgra) = sampled else {
-                    log::warn!("command SelectColor ignored: cursor is not over the desktop bitmap");
-                    return;
-                };
-                hide_overlay_for_action(&self.windows);
-                match write_color_action(&session_dir, bgra[2], bgra[1], bgra[0]) {
-                    ActionResult::Success => self.finish_cycle(event_loop, CycleAction::SelectColor),
-                    ActionResult::Canceled => self.show_all_windows(),
-                    ActionResult::Failed(msg) => {
-                        if xdialog::show_message_retry_cancel("flickSnap Capture", "Color Capture Failed", &msg, ErrorIcon).unwrap_or(false)
-                        {
-                            self.show_all_windows();
-                        } else {
-                            self.finish_cycle(event_loop, CycleAction::Canceled);
-                        }
-                    }
+            Command::DrawTool(tool) => {
+                cycle.input.draw.toggle_tool(tool);
+                self.broadcast_and_settle_pointer(window_id);
+            }
+            Command::DrawPalette => {
+                cycle.input.draw.toggle_palette();
+                self.broadcast_and_settle_pointer(window_id);
+            }
+            Command::DrawColor(index) => {
+                cycle.input.draw.pick_color(index);
+                self.broadcast_and_settle_pointer(window_id);
+            }
+            Command::DrawUndo => {
+                if cycle.input.marks.undo() {
+                    self.broadcast_and_settle_pointer(window_id);
                 }
             }
             Command::Reset => self.handle_reset(window_id),
@@ -1800,14 +1799,6 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let live_region = self
-            .cycle
-            .as_ref()
-            .is_some_and(|c| c.settings.live_selection());
-        if !live_region && self.pinch_monitor.is_none() {
-            self.pinch_monitor = SystemInterop::install_pinch_monitor();
-        }
-
         // Consume worker setups — each one gets a window + surface handoff.
         let worker_setups = match self.worker_setups.take() {
             Some(s) => s,
@@ -1824,8 +1815,6 @@ impl ApplicationHandler for App {
         let mut windows = WindowSet::new();
         self.startup.mark_window_create_start();
 
-        // Cloned out of the borrow: both failure arms below call
-        // `teardown_failed_worker(&mut self)`.
         let desktop_buffer = self
             .cycle
             .as_ref()
@@ -1858,7 +1847,6 @@ impl ApplicationHandler for App {
                 .with_resizable(false)
                 .with_visible(false)
                 .with_active(false)
-                .with_transparent(live_region)
                 .with_position(win_pos)
                 .with_inner_size(win_size);
             #[cfg(windows)]
@@ -1873,12 +1861,9 @@ impl ApplicationHandler for App {
                 // it creates as an OLE drop target — an OleInitialize plus a
                 // RegisterDragDrop per monitor, on the startup path.
                 attrs = attrs.with_drag_and_drop(false);
-                // WS_EX_TOPMOST from creation: without it the overlay loses the z-order
-                // battle against a fullscreen foreground app (e.g. Discord) on that
-                // monitor — only the focused window is ever raised, and SW_SHOWNOACTIVATE
-                // never raises the others. Release only: a topmost overlay while paused
-                // in a debugger locks up the entire desktop.
-                if live_region || !cfg!(debug_assertions) {
+                // The capture must cover existing topmost windows, including Draw on
+                // Screen. Leave room for an attached debugger if it pauses a debug build.
+                if !cfg!(debug_assertions) || !unsafe { windows::Win32::System::Diagnostics::Debug::IsDebuggerPresent() }.as_bool() {
                     attrs = attrs.with_window_level(winit::window::WindowLevel::AlwaysOnTop);
                 }
             }
@@ -1886,7 +1871,7 @@ impl ApplicationHandler for App {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
                     error!("failed to create window for monitor {i}: {e:?}");
-                    self.teardown_failed_worker(i);
+                    self.record_window_failure();
                     continue;
                 }
             };
@@ -1894,11 +1879,11 @@ impl ApplicationHandler for App {
             self.startup.background.workers[i]
                 .surface_start
                 .set_once(self.startup.t_start.elapsed());
-            let handle = match WindowHandle::new(window, setup, &self.instance, live_region, desktop_buffer.as_deref()) {
+            let handle = match WindowHandle::new(window, setup, &self.instance, desktop_buffer.as_deref()) {
                 Ok(h) => h,
                 Err(e) => {
                     error!("failed to create window handle for monitor {i}: {e:?}");
-                    self.teardown_failed_worker(i);
+                    self.record_window_failure();
                     continue;
                 }
             };
@@ -1915,7 +1900,7 @@ impl ApplicationHandler for App {
             // black rectangle, so `try_pick_up_screenshot` fills the layer and
             // orders front in one motion when the capture arrives.
             #[cfg(target_os = "macos")]
-            if live_region || desktop_buffer.is_some() {
+            if desktop_buffer.is_some() {
                 order_window_front_early(handle.winit_window());
             }
 
@@ -1936,19 +1921,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(ref m) = self.pinch_monitor {
-            let delta = m.drain();
-            if delta != 0.0
-                && self
-                    .cycle
-                    .as_ref()
-                    .is_some_and(|c| !c.input.captured)
-            {
-                self.apply_zoom_factor(1.0 + delta as f32);
-            }
+        if self.cycle.is_some() && self.worker_failed.load(Ordering::Acquire) != 0 {
+            self.fatal = Some(anyhow!("a display preview could not be rendered"));
+            self.finish_cycle(event_loop, CycleAction::Canceled);
+            return;
         }
-
-        // And the screenshot — this is the pass that normally lands it,
+        // The screenshot — this is the pass that normally lands it,
         // installing the backdrops and ordering the windows front.
         self.try_pick_up_screenshot(event_loop);
         self.try_advance_ocr();
@@ -1970,29 +1948,24 @@ impl ApplicationHandler for App {
 
         let mut bench_done = false;
         if let Some(cycle) = self.cycle.as_mut() {
-            // The gate is only evaluated once the screenshot has landed:
-            // before that nothing is on screen (the windows are hidden and
-            // backdropless), so "timed out, show anyway" would raise a black
-            // overlay over nothing — a wedged capture belongs to
-            // `try_pick_up_screenshot`'s own deadline, and the workers
-            // cannot be ready anyway (frame 0 needs the snapshot).
-            if !cycle.settings.live_selection() && cycle.desktop_buffer.is_none() {
+            // Frame 0 needs the snapshot. While it is in flight,
+            // try_pick_up_screenshot handles the capture deadline.
+            if cycle.desktop_buffer.is_none() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(4)));
                 return;
             }
             if let Some(ref pending) = cycle.pending_show {
-                // Failed workers count toward the gate so a dead worker can
-                // never hold the overlay hostage.
                 let ready = pending.ready_count.load(Ordering::Acquire);
-                let failed = self.worker_failed.load(Ordering::Acquire);
                 let timed_out = pending.since.elapsed() >= SHOW_GATE_TIMEOUT;
-                if timed_out && ready + failed < pending.expected {
-                    warn!(
-                        "show gate timed out after {:?}: {ready} ready + {failed} failed of {} workers; \
-                         showing anyway — a wedged worker must not strand the frozen desktop on screen",
-                        SHOW_GATE_TIMEOUT, pending.expected
-                    );
+                if timed_out && ready < pending.expected {
+                    self.fatal = Some(anyhow!(
+                        "timed out preparing the capture preview ({ready} of {} displays ready)",
+                        pending.expected
+                    ));
+                    self.finish_cycle(event_loop, CycleAction::Canceled);
+                    return;
                 }
-                if ready + failed >= pending.expected || timed_out {
+                if ready >= pending.expected {
                     self.startup.mark_show_start();
                     self.windows.show_all();
                     self.startup.mark_shown();
@@ -2014,7 +1987,7 @@ impl ApplicationHandler for App {
                     // (84 MB executable + embedded models) and the system-font
                     // scan load lazily at the first OCR press instead
                     // (`Command::Ocr` above). A cold pre-warm at show competed
-                    // with the deferred UI builds, the desktop blur and the
+                    // with the deferred UI builds and the
                     // render loop for disk and every core — the post-show
                     // freeze — to pre-pay for a rarely-used feature.
 
@@ -2031,29 +2004,30 @@ impl ApplicationHandler for App {
             return;
         }
 
-        if self
-            .cycle
-            .as_ref()
-            .is_some_and(|cycle| cycle.settings.live_selection() && cycle.pending_show.is_none())
-        {
-            // Input wakes a bare picker immediately. While the action panel
-            // is up, keep checking its repaint clock and asynchronous OCR.
-            event_loop.set_control_flow(
-                if self
-                    .cycle
-                    .as_ref()
-                    .is_some_and(|cycle| cycle.input.captured)
-                {
-                    ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16))
-                } else {
-                    ControlFlow::Wait
-                },
-            );
-        }
-
         // Pre-select the active screen / foreground window when launched with
         // `--capture-mode screen|window` (no-op in free-region mode).
         self.try_preselect(event_loop);
+
+        if let Some(cycle) = self.cycle.as_ref() {
+            let now = Instant::now();
+            let timer = if cycle.pending_show.is_some() {
+                Some(now + Duration::from_millis(4))
+            } else if cycle.ocr_job.is_some()
+                || matches!(cycle.input.ocr, OcrState::Scanning { .. } | OcrState::Retracting { .. })
+                || cycle.input.debug_visible
+            {
+                Some(now + crate::ui::egui_host::REPAINT_FLOOR)
+            } else {
+                None
+            };
+            let next = cycle
+                .egui
+                .next_repaint()
+                .into_iter()
+                .chain(timer)
+                .min();
+            event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -2072,39 +2046,49 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 self.finish_cycle(event_loop, CycleAction::Canceled);
             }
+            // UNDO's chord (`hotkey_letter` says which key is its Z), only
+            // while the drawing strip is up to take it. Held down it
+            // repeats, as an editor's undo does.
             WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        logical_key: Key::Named(NamedKey::Escape),
-                        ..
-                    },
+                ref event,
                 ..
-            } => {
-                // Escape backs out one step at a time: OCR mode unwinds
-                // through its own ladder (Scanning cancels, Lifted starts
-                // the retract, Retracting skips it), picking a scroll point
-                // returns to the panel with the selection intact, and only
-                // outside any mode does Escape cancel the whole cycle.
-                if cycle.input.ocr.active() {
-                    self.exit_ocr_mode(id);
-                    return;
+            } if event.state == ElementState::Pressed
+                && is_undo_chord(cycle.input.modifiers)
+                && hotkey_letter(&event.key_without_modifiers(), event.physical_key) == Some('z') =>
+            {
+                if drawbar_is_up(&cycle.input) {
+                    self.dispatch_command(Command::DrawUndo, event_loop, id);
                 }
-                if cycle.input.scroll_pick_mode {
-                    self.exit_scroll_pick_mode(id);
-                    return;
-                }
-                self.finish_cycle(event_loop, CycleAction::Canceled);
             }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         state: ElementState::Pressed,
-                        logical_key: Key::Named(NamedKey::Enter),
+                        logical_key: Key::Named(NamedKey::Escape),
+                        // One step per physical press: held down, the key's
+                        // auto-repeat would walk on past the step it was
+                        // pressed for — shutting the colour popup, then
+                        // cancelling the capture under it.
+                        repeat: false,
                         ..
                     },
                 ..
-            } => {
+            } => match escape_step(&cycle.input) {
+                EscapeStep::ClosePalette => self.close_palette(),
+                EscapeStep::ExitOcr => self.exit_ocr_mode(id),
+                EscapeStep::ExitScrollPick => self.exit_scroll_pick_mode(id),
+                EscapeStep::Cancel => self.finish_cycle(event_loop, CycleAction::Canceled),
+            },
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::Enter),
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if cycle.input.modifiers.is_empty() => {
                 // Mirrors the Dx capturer: Return acts as the default
                 // accept once a selection is made — "open in editor"
                 // normally, COPY while OCR lines are lifted. Which (if
@@ -2113,22 +2097,21 @@ impl ApplicationHandler for App {
                     self.dispatch_command(cmd, event_loop, id);
                 }
             }
+            // The letter hotkeys, by `hotkey_letter`, so they answer on any
+            // keyboard layout.
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         state: ElementState::Pressed,
-                        logical_key: Key::Character(ref ch),
+                        ref logical_key,
+                        physical_key,
                         repeat: false,
                         ..
                     },
                 ..
-            } => {
-                if cycle.settings.live_selection() && !cycle.input.captured {
-                    return;
-                }
-                if let Some(c) = ch.chars().next() {
-                    let c_lower = c.to_ascii_lowercase();
-                    if c_lower == 'd' {
+            } if cycle.input.modifiers.is_empty() => {
+                if let Some(c) = hotkey_letter(logical_key, physical_key) {
+                    if c == 'd' {
                         cycle.input.debug_visible = !cycle.input.debug_visible;
                         update_cursor_visibility(&self.windows, cycle);
                         broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
@@ -2175,8 +2158,11 @@ impl ApplicationHandler for App {
                                 self.dispatch_command(cmd, event_loop, id);
                             }
                         }
-                    } else if c_lower == 'm' {
+                    } else if c == 'm' {
                         cycle.input.cursor_overlay_visible = !cycle.input.cursor_overlay_visible;
+                        broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
+                    } else if c == 'x' {
+                        cycle.input.loupe_visible = !cycle.input.loupe_visible;
                         broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
                     } else if cycle.input.captured {
                         // Normal stays hardcoded here: the OCR arm above
@@ -2194,16 +2180,13 @@ impl ApplicationHandler for App {
                     } else if cycle.input.mouse_down {
                         // Mid-drag: swallow keys.
                     } else {
-                        match c_lower {
+                        match c {
                             't' => {
-                                cycle.input.tips_mode = cycle.input.tips_mode.next();
+                                cycle.input.tips_visible = !cycle.input.tips_visible;
                                 broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
                             }
                             'q' => {
                                 cycle.input.overlays_visible = !cycle.input.overlays_visible;
-                                if !cycle.input.overlays_visible && cycle.input.zoom > 1.0 {
-                                    cycle.input.has_used_magnifier = true;
-                                }
                                 broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
                                 broadcast_mouse_state(&self.windows, &cycle.input);
                             }
@@ -2221,13 +2204,20 @@ impl ApplicationHandler for App {
                             'a' => {
                                 self.finalize_selection(self.vd_bounds, event_loop, id);
                             }
-                            'h' => {
-                                // color-sampler row in the tips panel.
-                                self.dispatch_command(Command::SelectColor, event_loop, id);
-                            }
                             _ => {}
                         }
                     }
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let was_shift = cycle.input.modifiers.shift_key();
+                cycle.input.modifiers = modifiers.state();
+                let shift = cycle.input.modifiers.shift_key();
+                // Draw-on-screen re-snaps a mark the moment Shift goes down
+                // or up, without waiting for the pointer to move.
+                if shift != was_shift && cycle.input.marks.is_drawing() {
+                    cycle.input.marks.resnap(shift);
+                    broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
                 }
             }
             WindowEvent::CursorMoved {
@@ -2238,30 +2228,7 @@ impl ApplicationHandler for App {
                 let win_pt = WindowPoint::new(position.x as f32, position.y as f32);
                 let os_vd = ScreenPoint::new(bounds.min_x() + win_pt.x.round() as i32, bounds.min_y() + win_pt.y.round() as i32);
 
-                if cycle.input.anchored {
-                    if os_vd == cycle.input.anchor {
-                        return;
-                    }
-                    if cycle.input.anchor_just_engaged {
-                        const STALE_THRESHOLD: f32 = 75.0;
-                        let raw_dx = (os_vd.x - cycle.input.anchor.x) as f32;
-                        let raw_dy = (os_vd.y - cycle.input.anchor.y) as f32;
-                        if raw_dx * raw_dx + raw_dy * raw_dy > STALE_THRESHOLD * STALE_THRESHOLD {
-                            SystemInterop::set_mouse_position(cycle.input.anchor, &self.monitors);
-                            return;
-                        }
-                        cycle.input.anchor_just_engaged = false;
-                    }
-                    let zoom = cycle.input.zoom;
-                    let dx = (os_vd.x - cycle.input.anchor.x) as f32 / zoom;
-                    let dy = (os_vd.y - cycle.input.anchor.y) as f32 / zoom;
-                    cycle.input.virtual_cursor.x += dx;
-                    cycle.input.virtual_cursor.y += dy;
-                    clamp_to_nearest_monitor(&mut cycle.input.virtual_cursor, &self.monitors);
-                    SystemInterop::set_mouse_position(cycle.input.anchor, &self.monitors);
-                } else {
-                    cycle.input.virtual_cursor = ScreenPointF::new(os_vd.x as f32, os_vd.y as f32);
-                }
+                cycle.input.virtual_cursor = ScreenPointF::new(os_vd.x as f32, os_vd.y as f32);
 
                 if cycle.input.mouse_down && !cycle.input.captured {
                     if let Some(start) = cycle.input.mouse_down_pt {
@@ -2272,7 +2239,7 @@ impl ApplicationHandler for App {
                             cycle.input.virtual_cursor.y,
                         );
                         if !cycle.input.dragging {
-                            let threshold = 6.0 / (cycle.input.mouse_down_dpi * cycle.input.zoom);
+                            let threshold = 6.0 / cycle.input.mouse_down_dpi;
                             let crossed = psel.is_some_and(|r| (r.width() as f32) > threshold || (r.height() as f32) > threshold);
                             if crossed {
                                 cycle.input.dragging = true;
@@ -2294,7 +2261,13 @@ impl ApplicationHandler for App {
                 // this move's debug rows.
                 let mut settle_cursor = false;
                 if cycle.input.captured {
-                    if let (Some(mode), Some(anchor), Some(start)) =
+                    if cycle.input.marks.is_drawing() {
+                        let snap = cycle.input.modifiers.shift_key();
+                        cycle
+                            .input
+                            .marks
+                            .drag_to(cycle.input.virtual_cursor, snap);
+                    } else if let (Some(mode), Some(anchor), Some(start)) =
                         (cycle.input.drag_mode, cycle.input.drag_anchor_selection, cycle.input.mouse_down_pt)
                     {
                         let cur_x = cycle.input.virtual_cursor.x.floor() as i32;
@@ -2330,28 +2303,6 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                if !cycle.settings.live_selection() && !cycle.input.has_ever_scrolled && !cycle.input.captured {
-                    let now = Instant::now();
-                    cycle
-                        .input
-                        .velocity_tracker
-                        .record(now, cycle.input.virtual_cursor);
-                    let dpi = dpi_at_point(cycle.input.virtual_cursor, &self.monitors);
-                    cycle.input.show_scroll_hint = cycle
-                        .input
-                        .velocity_tracker
-                        .evaluate(now, cycle.input.show_scroll_hint, dpi);
-                }
-
-                if cycle.settings.live_selection() && !cycle.input.captured {
-                    if cycle.input.dragging {
-                        broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
-                    }
-                    if cycle.input.mouse_down {
-                        broadcast_mouse_state(&self.windows, &cycle.input);
-                    }
-                    return;
-                }
                 let panel = broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
                 if settle_cursor {
                     // The tray is egui's now, and the broadcast above just
@@ -2373,6 +2324,12 @@ impl ApplicationHandler for App {
                 }
                 match state {
                     ElementState::Pressed => {
+                        let point = cycle.input.virtual_cursor;
+                        let (half_width, half_height) = double_click_half_size(dpi_at_point(point, &self.monitors));
+                        let blocks_click =
+                            cycle
+                                .panel_swap
+                                .press(point, Instant::now(), panel_swap_guard_window(), half_width, half_height);
                         if cycle.input.captured {
                             // One egui tick that both lays the strip out
                             // and answers the press: egui reports the
@@ -2382,23 +2339,8 @@ impl ApplicationHandler for App {
                                 .egui
                                 .panel_press(&cycle.input, &cycle.settings, &self.ui_monitors);
                             if let Some(cmd) = out.clicked {
-                                // PROPERTY: a single physical double-
-                                // click on a panel button must never
-                                // dispatch two different commands. The
-                                // set swap is synchronous on the first
-                                // press and the new strip is re-centred
-                                // under the cursor, so the second press
-                                // can land on any button of the OTHER
-                                // set (OCR's first press swaps the
-                                // strip; its second could hit the OCR
-                                // strip's EXIT and destroy the
-                                // capture). Swallow (not fall through:
-                                // the click was aimed at a button) any
-                                // press within one double-click
-                                // interval of a swap; see
-                                // PanelSwapGuard.
-                                if cycle.panel_swap.blocks_click(Instant::now()) {
-                                    log::info!("panel click ignored: the button set changed within the double-click window");
+                                if blocks_click {
+                                    log::info!("panel click ignored: second press of a double-click across a panel swap");
                                     return;
                                 }
                                 // The button ids encode their set, so the
@@ -2407,6 +2349,15 @@ impl ApplicationHandler for App {
                                 self.dispatch_command(cmd, event_loop, id);
                                 return;
                             }
+                            // A press anywhere but on the colour popup
+                            // shuts it, and then does what it would have
+                            // done with the popup shut.
+                            if !out.over_palette {
+                                self.close_palette();
+                            }
+                            let Some(cycle) = self.cycle.as_mut() else {
+                                return;
+                            };
                             if out.over_tray {
                                 // Dead tray: chassis, emblem, readout,
                                 // padding. The tray owns the click, as
@@ -2438,8 +2389,8 @@ impl ApplicationHandler for App {
                                         // own location. Same property as the
                                         // panel guard above: one physical
                                         // double-click, one command.
-                                        if cycle.panel_swap.blocks_click(Instant::now()) {
-                                            log::info!("scroll pick ignored: within the double-click window of the panel swap");
+                                        if blocks_click {
+                                            log::info!("scroll pick ignored: second press of a double-click across a panel swap");
                                             return;
                                         }
                                         self.dispatch_scroll_pick(event_loop);
@@ -2459,6 +2410,23 @@ impl ApplicationHandler for App {
                             // it — so drag/resize never arms while OCR mode
                             // is active; a click outside the panel simply
                             // does nothing there.
+                            // With a drawing tool picked the screen is the
+                            // canvas: a press inside the selection or out
+                            // starts a mark instead of a move. The handles
+                            // still resize, and the strips took their own
+                            // presses above.
+                            if !cycle.input.ocr.active() && is_canvas(cycle.input.hittest) {
+                                if let Some(tool) = cycle.input.draw.tool {
+                                    let at = cycle.input.virtual_cursor;
+                                    let scale = dpi_at_point(at, &self.monitors);
+                                    let ink = cycle.input.draw.ink();
+                                    cycle.input.marks.begin(tool, at, ink, scale);
+                                    cycle.input.mouse_down = true;
+                                    cycle.input.mouse_down_pt = Some(at);
+                                    broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
+                                    return;
+                                }
+                            }
                             if !cycle.input.ocr.active() {
                                 let drag_mode = match cycle.input.hittest {
                                     Hittest::Inside => Some(DragMode::Move),
@@ -2481,6 +2449,14 @@ impl ApplicationHandler for App {
                         broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
                     }
                     ElementState::Released => {
+                        // The pointer is not hit-tested while a captured
+                        // gesture drags, so the release settles it where
+                        // it let go — the next press must not act on where
+                        // the gesture began.
+                        let gesture_ended = gesture_in_progress(&cycle.input);
+                        // A mark being dragged out is finished where the
+                        // pointer let go.
+                        cycle.input.marks.finish();
                         let finalizing = cycle.input.mouse_down && !cycle.input.captured && cycle.input.selection.is_some();
                         let was_move_drag = matches!(cycle.input.drag_mode, Some(DragMode::Move));
                         cycle.input.mouse_down = false;
@@ -2498,6 +2474,9 @@ impl ApplicationHandler for App {
                             // exist.
                             cycle.input.ocr = OcrState::Idle;
                             cycle.input.ocr_notice = None;
+                            // So are the drawing tool and the marks.
+                            cycle.input.draw.reset();
+                            cycle.input.marks.clear();
                             cycle.input.hittest = Hittest::Outside;
                             update_cursor_visibility(&self.windows, cycle);
                             set_cursor_if_changed(&self.windows, &mut cycle.last_cursor, id, CursorIcon::Default);
@@ -2506,10 +2485,6 @@ impl ApplicationHandler for App {
                         if finalizing {
                             cycle.input.captured = true;
                             update_cursor_visibility(&self.windows, cycle);
-                            if let Some(restore) = InteractionController::release_anchor(&mut cycle.input) {
-                                SystemInterop::set_mouse_position(restore, &self.monitors);
-                            }
-                            cycle.input.zoom = 1.0;
                             if let Some(sel) = cycle.input.selection {
                                 let dpi = dpi_at_point(cycle.input.virtual_cursor, &self.monitors);
                                 let ht = hit_test(cycle.input.virtual_cursor, sel, dpi);
@@ -2525,71 +2500,22 @@ impl ApplicationHandler for App {
                         let Some(cycle) = self.cycle.as_mut() else {
                             return;
                         };
-                        broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
+                        let settle = gesture_ended && cycle.input.captured;
+                        if settle {
+                            if let Some(sel) = cycle.input.selection {
+                                let dpi = dpi_at_point(cycle.input.virtual_cursor, &self.monitors);
+                                cycle.input.hittest = hit_test(cycle.input.virtual_cursor, sel, dpi);
+                            }
+                            update_cursor_visibility(&self.windows, cycle);
+                        }
+                        let panel = broadcast_ui_state(&self.windows, &self.monitors, &self.ui_monitors, cycle);
+                        if settle {
+                            let cursor = cursor_for(&cycle.input, panel.over_button, panel.over_tray);
+                            set_cursor_if_changed(&self.windows, &mut cycle.last_cursor, id, cursor);
+                        }
                         broadcast_mouse_state(&self.windows, &cycle.input);
                     }
                 }
-            }
-            WindowEvent::MouseWheel {
-                delta,
-                phase,
-                ..
-            } => {
-                if cycle.settings.live_selection() || cycle.input.captured {
-                    return;
-                }
-                let factor = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => {
-                        if y > 0.0 {
-                            ZOOM_STEP
-                        } else if y < 0.0 {
-                            1.0 / ZOOM_STEP
-                        } else {
-                            return;
-                        }
-                    }
-                    MouseScrollDelta::PixelDelta(p) => {
-                        match phase {
-                            TouchPhase::Started => {
-                                cycle.input.scroll_momentum = cycle
-                                    .input
-                                    .last_scroll_end
-                                    .is_some_and(|t| t.elapsed() < MOMENTUM_GAP);
-                            }
-                            TouchPhase::Ended | TouchPhase::Cancelled => {
-                                cycle.input.last_scroll_end = Some(Instant::now());
-                            }
-                            _ => {}
-                        }
-                        if cycle.input.scroll_momentum {
-                            return;
-                        }
-                        let dy = p.y as f32;
-                        if dy == 0.0 {
-                            return;
-                        }
-                        2_f32.powf(dy / TOUCHPAD_PIXELS_PER_DOUBLING)
-                    }
-                };
-                cycle.input.has_ever_scrolled = true;
-                cycle.input.show_scroll_hint = false;
-                cycle.input.velocity_tracker.dismiss_hint();
-                self.apply_zoom_factor(factor);
-            }
-            WindowEvent::PinchGesture {
-                delta,
-                ..
-            } => {
-                if cycle.settings.live_selection() || cycle.input.captured {
-                    return;
-                }
-                if delta == 0.0 {
-                    return;
-                }
-                cycle.input.has_ever_scrolled = true;
-                cycle.input.show_scroll_hint = false;
-                cycle.input.velocity_tracker.dismiss_hint();
-                self.apply_zoom_factor(1.0 + delta as f32);
             }
             // Without this override winit resizes the window by
             // new_scale/old_scale, permanently shrinking any overlay whose
@@ -2612,16 +2538,11 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::TipsMode;
 
     /// A freshly-shown overlay: nothing selected, no modes engaged.
     fn input() -> InteractionState {
         InteractionState {
             virtual_cursor: ScreenPointF::new(0.0, 0.0),
-            zoom: 1.0,
-            anchored: false,
-            anchor_just_engaged: false,
-            anchor: ScreenPoint::new(0, 0),
             mouse_down: false,
             mouse_down_pt: None,
             mouse_down_dpi: 1.0,
@@ -2632,20 +2553,18 @@ mod tests {
             hittest: Hittest::Outside,
             drag_mode: None,
             drag_anchor_selection: None,
-            tips_mode: TipsMode::Off,
+            tips_visible: false,
+            loupe_visible: false,
             debug_visible: false,
-            last_scroll_end: None,
-            scroll_momentum: false,
             overlays_visible: true,
             pointer_over_tray: false,
             cursor_overlay_visible: false,
-            has_ever_scrolled: false,
-            show_scroll_hint: false,
-            velocity_tracker: MouseVelocityTracker::new(),
-            has_used_magnifier: false,
             scroll_pick_mode: false,
             ocr: OcrState::Idle,
             ocr_notice: None,
+            draw: DrawState::default(),
+            marks: Marks::default(),
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -2670,6 +2589,36 @@ mod tests {
         // Overlays hidden: the reticle is suppressed, so the pointer must
         // come back or there would be nothing to aim with.
         assert!(!reticle_stands_in(true, false, Hittest::Inside, false));
+    }
+
+    /// With a drawing tool picked the selection's interior and the screen
+    /// around it wear the ordinary pointer rather than the move arrows,
+    /// the handles keep their resize arrows, and the strips keep theirs.
+    #[test]
+    fn a_picked_tool_turns_the_screen_into_a_canvas() {
+        let canvas = |hittest: Hittest, picked: bool| {
+            let mut input = InteractionState {
+                captured: true,
+                hittest,
+                ..input()
+            };
+            if picked {
+                input
+                    .draw
+                    .toggle_tool(crate::draw::DrawTool::Arrow);
+            }
+            input
+        };
+        assert_eq!(cursor_for(&canvas(Hittest::Inside, true), false, false), CursorIcon::Default);
+        assert_eq!(cursor_for(&canvas(Hittest::Inside, true), true, true), CursorIcon::Pointer);
+        assert_eq!(
+            cursor_for(&canvas(Hittest::BottomRight, true), false, false),
+            Hittest::BottomRight.cursor()
+        );
+        assert_eq!(cursor_for(&canvas(Hittest::Outside, true), false, false), CursorIcon::Default);
+        assert_eq!(cursor_for(&canvas(Hittest::Inside, false), false, false), Hittest::Inside.cursor());
+        assert!(is_canvas(Hittest::Inside) && is_canvas(Hittest::Outside));
+        assert!(!is_canvas(Hittest::BottomRight) && !is_canvas(Hittest::Top));
     }
 
     /// The pointer's look is a function of the state and what the tray
@@ -2809,65 +2758,136 @@ mod tests {
         assert_eq!(default_action(&i), None);
     }
 
-    /// The swap guard's whole contract: a click inside one double-click
-    /// interval of a set change is swallowed, one outside it is not, and
-    /// only genuine *changes* arm it (the broadcast on every mouse move
-    /// re-observes the same set constantly). The strips recenter on every
-    /// swap, so without this guard the second press of a double-click on
-    /// BACK — or on whatever materializes when a selection is captured by
-    /// double-click — fires whichever button happens to land under the
-    /// cursor.
+    /// Ctrl+Z alone is the chord (Cmd+Z on macOS); with Shift or Alt it is
+    /// something else.
     #[test]
-    fn panel_swap_guard_blocks_reclick_inside_window_only() {
-        use panel::model::PanelButtonSet;
-        let window = Duration::from_millis(500);
-        let t0 = Instant::now();
-        let mut g = PanelSwapGuard::new();
-
-        // Nothing observed yet: nothing to guard.
-        assert!(!g.blocks_click_within(t0, window));
-
-        // The panel appears (None -> Normal): armed — a double-click that
-        // CAPTURES a selection must not press whatever button materialized
-        // under the cursor.
-        g.observe(Some(PanelButtonSet::Normal), t0);
-        assert!(g.blocks_click_within(t0 + Duration::from_millis(100), window));
-        // ...and releases once a full double-click interval has passed.
-        assert!(!g.blocks_click_within(t0 + window, window));
-
-        // Steady-state re-observation of the same set must NOT re-arm.
-        let t1 = t0 + Duration::from_secs(10);
-        g.observe(Some(PanelButtonSet::Normal), t1);
-        assert!(!g.blocks_click_within(t1 + Duration::from_millis(1), window));
-
-        // A genuine swap (Normal -> Ocr) re-arms: the double-click-OCR-
-        // hits-EXIT case itself.
-        let t2 = t0 + Duration::from_secs(20);
-        g.observe(Some(PanelButtonSet::Ocr), t2);
-        assert!(g.blocks_click_within(t2 + Duration::from_millis(100), window));
-        assert!(!g.blocks_click_within(t2 + window, window));
-
-        // Hiding the panel (Some -> None) then re-showing it re-arms too —
-        // the scroll-pick round trip.
-        let t3 = t0 + Duration::from_secs(30);
-        g.observe(None, t3);
-        g.observe(Some(PanelButtonSet::Normal), t3 + Duration::from_secs(5));
-        assert!(g.blocks_click_within(t3 + Duration::from_secs(5) + Duration::from_millis(100), window));
+    fn the_undo_chord_is_the_command_key_alone() {
+        let command = if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL
+        };
+        assert!(is_undo_chord(command));
+        assert!(!is_undo_chord(ModifiersState::empty()));
+        assert!(!is_undo_chord(command | ModifiersState::SHIFT));
+        assert!(!is_undo_chord(command | ModifiersState::ALT));
+        assert!(!is_undo_chord(ModifiersState::CONTROL | ModifiersState::SUPER));
     }
 
-    /// A click stamped at (or even before) the swap instant is still inside
-    /// the window: `duration_since` saturates to zero rather than wrapping
-    /// or panicking, so event-timestamp skew cannot punch through the guard.
+    /// Ctrl+Z answers only while the drawing strip is up to take it: not
+    /// before a capture, not in the scroll-picker, not mid-drag.
     #[test]
-    fn panel_swap_guard_handles_out_of_order_instants() {
-        use panel::model::PanelButtonSet;
+    fn the_undo_chord_needs_the_drawing_strip() {
+        let mut i = input();
+        assert!(!drawbar_is_up(&i), "nothing captured");
+        i.captured = true;
+        assert!(drawbar_is_up(&i));
+        i.scroll_pick_mode = true;
+        assert!(!drawbar_is_up(&i), "the scroll-picker's strip is up");
+    }
+
+    /// A hotkey's letter is the Latin letter the key types — so Z is the
+    /// QWERTZ Z, not its Y — and on a layout without Latin letters the
+    /// letter in the key's QWERTY place, so T, F, A… and Ctrl+Z answer on a
+    /// Russian layout too.
+    #[test]
+    fn hotkeys_answer_to_the_layouts_letter_on_any_layout() {
+        let key = |s: &str| Key::Character(s.into());
+        let at = PhysicalKey::Code;
+        assert_eq!(hotkey_letter(&key("z"), at(KeyCode::KeyZ)), Some('z'), "QWERTY");
+        assert_eq!(hotkey_letter(&key("Z"), at(KeyCode::KeyZ)), Some('z'), "Caps Lock");
+        assert_eq!(hotkey_letter(&key("z"), at(KeyCode::KeyY)), Some('z'), "QWERTZ's Z");
+        assert_eq!(hotkey_letter(&key("y"), at(KeyCode::KeyZ)), Some('y'), "QWERTZ's Y");
+        assert_eq!(hotkey_letter(&key("я"), at(KeyCode::KeyZ)), Some('z'), "Russian Z");
+        assert_eq!(hotkey_letter(&key("е"), at(KeyCode::KeyT)), Some('t'), "Russian T");
+        assert_eq!(hotkey_letter(&key("1"), at(KeyCode::Digit1)), None, "not a letter");
+        assert_eq!(hotkey_letter(&key("'"), at(KeyCode::KeyQ)), None, "Dvorak punctuation");
+        assert_eq!(hotkey_letter(&key("€"), at(KeyCode::KeyE)), None, "AltGr symbol");
+        assert_eq!(hotkey_letter(&key("é"), at(KeyCode::KeyE)), None, "extended Latin");
+        assert_eq!(hotkey_letter(&Key::Named(NamedKey::Escape), at(KeyCode::Escape)), None);
+    }
+
+    /// Every command waits while a press drags on the capture — a mark
+    /// being drawn, the selection moved or resized — and none waits on a
+    /// drag that has not captured yet.
+    #[test]
+    fn a_gesture_holds_the_commands_until_its_release() {
+        let mut i = input();
+        i.captured = true;
+        assert!(!gesture_in_progress(&i));
+        i.marks
+            .begin(crate::draw::DrawTool::Line, ScreenPointF::new(0.0, 0.0), egui::Color32::RED, 1.0);
+        assert!(gesture_in_progress(&i), "a mark is being drawn");
+        i.marks.finish();
+        assert!(!gesture_in_progress(&i));
+        i.drag_mode = Some(DragMode::Move);
+        assert!(gesture_in_progress(&i), "the selection is being moved");
+        i.captured = false;
+        assert!(!gesture_in_progress(&i), "a selection still being dragged out");
+    }
+
+    /// Escape shuts an open colour popup and nothing more: the capture,
+    /// its selection and the marks on it survive the press.
+    #[test]
+    fn escape_shuts_the_colour_popup_before_it_cancels_anything() {
+        let mut i = input();
+        i.captured = true;
+        assert_eq!(escape_step(&i), EscapeStep::Cancel);
+
+        i.draw.toggle_palette();
+        assert_eq!(escape_step(&i), EscapeStep::ClosePalette);
+        i.draw.close_palette();
+        assert_eq!(escape_step(&i), EscapeStep::Cancel);
+
+        i.scroll_pick_mode = true;
+        assert_eq!(escape_step(&i), EscapeStep::ExitScrollPick);
+    }
+
+    #[test]
+    fn panel_swap_blocks_a_second_press_at_the_same_position_only() {
+        use panel::model::PanelButtonSet::{Normal, Ocr, ScrollPick};
+        let t = Instant::now();
         let window = Duration::from_millis(500);
-        // Anchored ahead of now so the subtraction below cannot underflow.
-        let t0 = Instant::now() + Duration::from_secs(60);
-        let mut g = PanelSwapGuard::new();
-        g.observe(Some(PanelButtonSet::Normal), t0);
-        assert!(g.blocks_click_within(t0, window));
-        assert!(g.blocks_click_within(t0 - Duration::from_millis(5), window));
+        let soon = t + Duration::from_millis(100);
+        let here = ScreenPointF::new(20.0, 20.0);
+        let nearby = ScreenPointF::new(21.0, 21.0);
+        let elsewhere = ScreenPointF::new(55.0, 60.0);
+        let mut guard = PanelSwapGuard::default();
+
+        guard.observe(Some(Normal));
+        assert!(
+            !guard.press(here, t, window, 2.0, 2.0),
+            "the first click after preselect is independent"
+        );
+        guard.observe(Some(Ocr));
+        assert!(
+            guard.press(nearby, soon, window, 2.0, 2.0),
+            "the next click at the same spot hits a different panel"
+        );
+        assert!(
+            !guard.press(elsewhere, soon, window, 2.0, 2.0),
+            "a fast click elsewhere still works"
+        );
+        guard.observe(Some(Ocr));
+        assert!(
+            !guard.press(elsewhere, soon, window, 2.0, 2.0),
+            "an unchanged set does not block repeat commands"
+        );
+        guard.observe(Some(ScrollPick));
+        assert!(
+            !guard.press(elsewhere, soon + window, window, 2.0, 2.0),
+            "the double-click interval has passed"
+        );
+    }
+
+    #[test]
+    fn first_panel_click_works_at_the_end_of_a_drag() {
+        let t = Instant::now();
+        let window = Duration::from_millis(500);
+        let mut guard = PanelSwapGuard::default();
+        assert!(!guard.press(ScreenPointF::new(10.0, 10.0), t, window, 2.0, 2.0));
+        guard.observe(Some(panel::model::PanelButtonSet::Normal));
+        assert!(!guard.press(ScreenPointF::new(210.0, 100.0), t + Duration::from_millis(260), window, 2.0, 2.0));
     }
 
     /// The live window comes from GetDoubleClickTime; the clamp guarantees

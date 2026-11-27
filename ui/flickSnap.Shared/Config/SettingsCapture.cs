@@ -4,14 +4,6 @@ using Avalonia.Media;
 
 namespace FlickSnap.Config
 {
-    /// <summary>Mirrors the capturer's --tips-mode flag (flicksnap_capture, see CAPTURE_PROTOCOL.md).</summary>
-    public enum CapturerTipsMode
-    {
-        Hints,
-        Tips,
-        Off,
-    }
-
     public class SettingsCapture : SimpleNotifyObject
     {
         /// <summary>
@@ -135,26 +127,8 @@ namespace FlickSnap.Config
             set => Set(ref _screenshotWithCursor, value);
         }
 
-        [Browsable(false)]
-        [Description("If this is true, the Capture window will try to detect and highlight different windows as you hover over them.")]
-        public bool DetectWindows
-        {
-            get => _detectWindows;
-            set => Set(ref _detectWindows, value);
-        }
-
-        [Category("Behavior")]
-        [DisplayName("Tips overlay")]
-        [Description("Tips shown when the capture overlay opens. Press T to cycle.")]
-        public CapturerTipsMode TipsMode
-        {
-            get => _tipsMode;
-            set => Set(ref _tipsMode, value);
-        }
-
         /// <summary>
-        /// Whether a selection made by picking a window (hover and click, <c>W</c>, the
-        /// capture-window hotkey) takes on that window's OS corner radius — rounded dashed
+        /// Whether Active Window capture takes on the window's OS corner radius — rounded dashed
         /// border in the overlay, transparent corners in the copied / saved / uploaded image
         /// — instead of a sharp rectangle that ships a few pixels of whatever sat behind the
         /// window. Dragged selections stay square either way (flicksnap_capture
@@ -220,8 +194,6 @@ namespace FlickSnap.Config
         private string _filenamePattern = DefaultFilenamePattern;
         private bool _keepCapturerWarm = true;
         private bool _screenshotWithCursor = false;
-        private bool _detectWindows = true;
-        private CapturerTipsMode _tipsMode = CapturerTipsMode.Hints;
         private bool _roundedWindowCorners = true;
         // Off by default, for everyone — see UploadButtonVisible, whose rename is what
         // carries existing users onto this default.

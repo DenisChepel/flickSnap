@@ -27,6 +27,8 @@ skrifa.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 egui_plot.workspace = true
+tiny-skia.workspace = true
+unicode-script = "0.5"
 arboard.workspace = true
 rfd.workspace = true
 xdialog = { workspace = true, features = ["win32-direct", "maccf-direct"] }
@@ -45,7 +47,6 @@ windows = { workspace = true, features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
-    "Win32_Graphics_DirectComposition",
     "Win32_Graphics_Dxgi",
     # The d3d11 gxi backend (src/gxi/d3d11): D3D11CreateDevice + resources,
     # D3D_DRIVER_TYPE/D3D_FEATURE_LEVEL/topology, DXGI formats + swapchain.
@@ -53,6 +54,7 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
     # SetThreadPriority / MMCSS / power throttling for the thread tiers
     # (src/system/mod.rs lower_thread_priority and friends).
     "Win32_System_Threading",

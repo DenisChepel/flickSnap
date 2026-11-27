@@ -1,6 +1,15 @@
-//! Where the tray goes: choose the side beside the selection, ask for the
+//! Where the tray goes: choose the side of the selection, ask for the
 //! strip's size in that orientation, and keep the whole box on the
 //! monitor (tail wins when it cannot fit).
+//!
+//! The tray owns the selection's bottom and top edges and the drawing
+//! strip its right and left (`drawbar::place`), so the two never stand
+//! on one side. The tray hangs off the bottom-right corner — a row
+//! beneath the selection, ending at its right edge — and when the room
+//! beneath cannot hold it at its full distance it jumps to the top-right
+//! corner rather than squeeze in closer. It never stands on its end
+//! beside the selection: only a monitor too narrow for the row at all
+//! gets a column, tucked inside the selection.
 //!
 //! Pure and in integer physical pixels, the same units the selection and
 //! the monitor bounds are in. `show` turns the result into the
@@ -19,21 +28,18 @@ pub enum Axis {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
-    /// A row beneath the anchor, centred on it.
+    /// A row beneath the anchor, ending at its right edge.
     Below,
-    /// A column to the right, bottom-anchored.
-    Right,
-    /// A column to the left, bottom-anchored.
-    Left,
-    /// A row or column tucked inside the anchor.
+    /// A row above the anchor, ending at its right edge.
+    Above,
+    /// A row or column tucked inside the anchor's bottom-right corner.
     Inside(Axis),
 }
 
 impl Side {
     pub fn axis(self) -> Axis {
         match self {
-            Side::Below => Axis::Row,
-            Side::Right | Side::Left => Axis::Column,
+            Side::Below | Side::Above => Axis::Row,
             Side::Inside(axis) => axis,
         }
     }
@@ -54,6 +60,17 @@ pub struct Fit {
 }
 
 impl Fit {
+    pub fn scale_on(self, axis: Axis, bounds: ScreenRect) -> f32 {
+        let (w, h) = match axis {
+            Axis::Row => (self.row.len, self.row.thick),
+            Axis::Column => (self.col.thick, self.col.len),
+        };
+        super::theme::fit_scale(
+            egui::vec2(w as f32, h as f32),
+            egui::vec2(bounds.width() as f32, bounds.height() as f32),
+        )
+    }
+
     pub fn fits_on(self, axis: Axis, bounds: ScreenRect) -> bool {
         match axis {
             Axis::Row => self.row.len <= bounds.width() && self.row.thick <= bounds.height(),
@@ -100,10 +117,12 @@ pub fn place(
 ) -> (Side, ScreenRect) {
     let side = choose_side(anchor, bounds, fit, near, lock);
     let (w, h) = size_for(side.axis());
-    let (x, y) = origin(side, anchor, bounds, (w, h), near);
+    let (x, y) = origin(side, anchor, (w, h), near);
     // Keep the WHOLE box on the bounds, both axes (a shadow may clip).
-    // Only when nothing fits can the box still be longer than the bounds;
-    // then the tail stays on the bounds and the head overflows.
+    // A side outside the anchor is only taken with room for the box at its
+    // full distance, so this moves one only along the selection's edge;
+    // only when nothing fits can the box still be longer than the bounds,
+    // and then the tail stays on the bounds and the head overflows.
     let rect = ScreenRect::from_xy_size(
         clamp_span(x, w, bounds.left(), bounds.right()),
         clamp_span(y, h, bounds.top(), bounds.bottom()),
@@ -113,28 +132,21 @@ pub fn place(
     (side, rect)
 }
 
-const CASCADE: [Side; 5] = [
-    Side::Below,
-    Side::Right,
-    Side::Left,
-    Side::Inside(Axis::Row),
-    Side::Inside(Axis::Column),
-];
+const CASCADE: [Side; 4] = [Side::Below, Side::Above, Side::Inside(Axis::Row), Side::Inside(Axis::Column)];
 
-/// A candidate fits when the box's THICKNESS in that orientation fits the
-/// free space on that side and the full footprint fits the monitor.
-/// Inside, prefer a row whenever it fits. When no candidate fully fits,
-/// the free space across the strip alone decides.
+/// A candidate fits when the free space on its side holds the box's
+/// THICKNESS at the full distance from the anchor, still clear of the
+/// bounds edge, and the full footprint fits the monitor. Inside, prefer a
+/// row whenever it fits. When no candidate fully fits, the free space
+/// across the strip alone decides.
 fn choose_side(anchor: ScreenRect, bounds: ScreenRect, fit: Fit, near: Near, lock: Option<Axis>) -> Side {
-    // `min_distance` is subtracted so the box never hugs the bounds edge;
-    // negative means "no space".
-    let bottom = (bounds.bottom() - anchor.bottom()).max(0) - near.min_distance;
-    let right = (bounds.right() - anchor.right()).max(0) - near.min_distance;
-    let left = (anchor.left() - bounds.left()).max(0) - near.min_distance;
+    // What a side outside the anchor has to hold besides the box itself.
+    let around = near.max_distance + near.min_distance;
+    let below = bounds.bottom() - anchor.bottom() - around;
+    let above = anchor.top() - bounds.top() - around;
     let across = |side: Side| match side {
-        Side::Below => bottom >= fit.row.thick,
-        Side::Right => right >= fit.col.thick,
-        Side::Left => left >= fit.col.thick,
+        Side::Below => below >= fit.row.thick,
+        Side::Above => above >= fit.row.thick,
         Side::Inside(_) => true,
     };
     let allowed = |s: Side| lock.is_none_or(|axis| s.axis() == axis);
@@ -151,34 +163,15 @@ fn choose_side(anchor: ScreenRect, bounds: ScreenRect, fit: Fit, near: Near, loc
         .unwrap_or(Side::Inside(lock.unwrap_or(Axis::Row)))
 }
 
-/// Top-left of a `size` box on `side`, before the bounds clamp. Integer
-/// division throughout.
-fn origin(side: Side, anchor: ScreenRect, bounds: ScreenRect, size: (i32, i32), near: Near) -> (i32, i32) {
+/// Top-left of a `size` box on `side`, before the bounds clamp: always the
+/// full distance from the anchor, never pulled in closer.
+fn origin(side: Side, anchor: ScreenRect, size: (i32, i32), near: Near) -> (i32, i32) {
     let (w, h) = size;
-    let centred = anchor.left() + anchor.width() / 2 - w / 2;
+    let gap = near.max_distance;
     match side {
-        Side::Below => (
-            centred,
-            bounds
-                .bottom()
-                .min(anchor.bottom() + near.max_distance + h)
-                - h,
-        ),
-        Side::Right => (
-            bounds
-                .right()
-                .min(anchor.right() + near.max_distance + w)
-                - w,
-            anchor.bottom() - h,
-        ),
-        // No bounds pull-back here: the clamp in `place` does it, which is
-        // what keeps a negative-origin bounds a pure translation.
-        Side::Left => (anchor.left() - near.max_distance - w, anchor.bottom() - h),
-        Side::Inside(Axis::Row) => (centred, anchor.bottom() - h - 2 * near.max_distance),
-        Side::Inside(Axis::Column) => (
-            anchor.right() - w - 2 * near.max_distance,
-            anchor.bottom() - h - 2 * near.max_distance,
-        ),
+        Side::Below => (anchor.right() - w, anchor.bottom() + gap),
+        Side::Above => (anchor.right() - w, anchor.top() - gap - h),
+        Side::Inside(_) => (anchor.right() - w - 2 * gap, anchor.bottom() - h - 2 * gap),
     }
 }
 
@@ -232,94 +225,96 @@ mod tests {
 
     #[test]
     fn below_when_it_fits() {
-        assert_eq!(placed(rect(500, 300, 100, 100), HD), (rect(250, 415, 600, 56), Side::Below));
+        assert_eq!(placed(rect(500, 300, 100, 100), HD), (rect(0, 412, 600, 56), Side::Below));
+    }
+
+    /// No room beneath: the row goes to the top-right corner, never onto
+    /// either flank — those are the drawing strip's.
+    #[test]
+    fn above_when_below_is_short() {
+        assert_eq!(
+            placed(rect(500, 1000, 100, 60), HD),
+            (rect(0, 1000 - 12 - 56, 600, 56), Side::Above)
+        );
+        assert_eq!(placed(rect(1800, 1000, 100, 60), HD).1, Side::Above);
     }
 
     #[test]
-    fn right_when_below_is_short() {
-        assert_eq!(placed(rect(500, 1000, 100, 60), HD), (rect(615, 560, 92, 500), Side::Right));
+    fn inside_when_neither_edge_has_room() {
+        assert_eq!(
+            placed(HD, HD),
+            (rect(1920 - 24 - 600, 1080 - 24 - 56, 600, 56), Side::Inside(Axis::Row))
+        );
     }
 
+    /// Only a monitor too narrow for the row at all gets a column, and
+    /// then inside the selection, not beside it.
     #[test]
-    fn left_when_right_is_short() {
-        assert_eq!(placed(rect(1800, 1000, 100, 60), HD), (rect(1693, 560, 92, 500), Side::Left));
-    }
-
-    #[test]
-    fn inside_when_nothing_fits_across() {
-        assert_eq!(placed(HD, HD), (rect(660, 994, 600, 56), Side::Inside(Axis::Row)));
-    }
-
-    #[test]
-    fn along_axis_fit_uses_the_longest_box() {
-        // Room beneath, but the row is longer than the bounds are wide.
+    fn a_monitor_too_narrow_for_the_row_gets_a_column_inside() {
         let narrow = rect(0, 0, 500, 1080);
-        assert_eq!(placed(rect(100, 100, 100, 100), narrow).1, Side::Right);
-        // Room to the right and left, but the column is taller than the
-        // bounds; a row fits, so Inside wins over Right.
-        let short = rect(0, 0, 1920, 400);
-        assert_eq!(placed(rect(100, 300, 300, 60), short).1, Side::Inside(Axis::Row));
+        assert_eq!(placed(rect(100, 300, 300, 300), narrow).1, Side::Inside(Axis::Column));
     }
 
+    /// The room beneath has to hold the whole gap as well as the row: one
+    /// pixel short and the tray jumps to the top rather than sit closer to
+    /// the selection. Wherever it lands outside, it is the full gap away.
     #[test]
-    fn thickness_only_fallback_picks_the_first_side_with_room() {
-        // Neither orientation fits along; no room beneath; room to the right.
-        let small = rect(0, 0, 500, 400);
-        assert_eq!(placed(rect(100, 50, 100, 330), small).1, Side::Right);
-        // And with the right side gone too, the left.
-        assert_eq!(placed(rect(400, 50, 100, 330), small).1, Side::Left);
-    }
+    fn the_gap_never_shrinks_the_tray_jumps_instead() {
+        let fits = 1080 - 2 - 12 - 56;
+        let (r, side) = placed(rect(500, 300, 100, fits - 300), HD);
+        assert_eq!(side, Side::Below);
+        assert_eq!(r.top(), fits + 12);
+        assert_eq!(r.bottom(), 1080 - 2);
 
-    #[test]
-    fn thresholds_are_exact() {
-        let short_by_one = 1080 - FIT.row.thick - near().min_distance + 1;
-        assert_eq!(placed(rect(500, 100, 100, short_by_one - 100), HD).1, Side::Right);
-        assert_eq!(placed(rect(500, 100, 100, short_by_one - 101), HD).1, Side::Below);
+        let (r, side) = placed(rect(500, 300, 100, fits - 300 + 1), HD);
+        assert_eq!(side, Side::Above);
+        assert_eq!(r.bottom(), 300 - 12);
     }
 
     #[test]
     fn min_distance_is_subtracted_before_the_compare() {
-        let anchor = rect(500, 100, 100, 1080 - FIT.row.thick - 101);
+        let anchor = rect(500, 100, 100, 1080 - 100 - 12 - 56);
         let loose = Near {
             min_distance: 0,
             ..near()
         };
         assert_eq!(place(anchor, HD, FIT, loose, None, full).0, Side::Below);
-        assert_eq!(place(anchor, HD, FIT, near(), None, full).0, Side::Right);
+        assert_eq!(place(anchor, HD, FIT, near(), None, full).0, Side::Above);
     }
 
-    #[test]
-    fn below_and_right_pull_back_to_the_bounds_edge() {
-        let (r, side) = placed(rect(500, 1020, 100, 2), HD);
-        assert_eq!((side, r.bottom()), (Side::Below, 1080), "not 1022 + 15 + 56");
-        let (r, side) = placed(rect(1800, 1000, 20, 60), HD);
-        assert_eq!((side, r.right()), (Side::Right, 1920), "not 1820 + 15 + 92");
-    }
-
+    /// A row that cannot fit the monitor's width but has room beneath is
+    /// still put there; the clamp keeps its tail on the monitor and lets
+    /// its head overflow.
     #[test]
     fn clamp_keeps_the_high_edge_when_the_box_is_longer_than_the_bounds() {
         let small = rect(0, 0, 500, 400);
-        let (r, side) = placed(rect(100, 50, 100, 330), small);
-        assert_eq!((side, r.top(), r.bottom()), (Side::Right, -100, 400), "the head overflows the top");
-        let (r, side) = placed(rect(10, 50, 480, 330), small);
-        assert_eq!(
-            (side, r.left(), r.right()),
-            (Side::Inside(Axis::Row), -100, 500),
-            "the head overflows the left"
-        );
+        let (r, side) = placed(rect(100, 50, 100, 100), small);
+        assert_eq!((side, r.left(), r.right()), (Side::Below, -100, 500), "the head overflows the left");
     }
 
+    /// A row on a selection near the monitor's left edge slides along the
+    /// edge onto the monitor; it never moves across it.
     #[test]
-    fn bottom_anchored_column_is_pushed_down_to_the_top() {
+    fn a_row_slides_along_the_selection_onto_the_monitor() {
+        let (r, side) = placed(rect(0, 300, 100, 100), HD);
+        assert_eq!((side, r.left(), r.top()), (Side::Below, 0, 412));
+        let (r, side) = placed(rect(0, 1000, 100, 60), HD);
+        assert_eq!((side, r.left(), r.bottom()), (Side::Above, 0, 1000 - 12));
+    }
+
+    /// A strip locked to a row is never stood on its end, even where only
+    /// a column would fit.
+    #[test]
+    fn a_row_lock_never_yields_a_column() {
         let narrow = rect(0, 0, 500, 1080);
-        let (r, side) = placed(rect(100, 50, 100, 100), narrow);
-        assert_eq!((side, r.top()), (Side::Right, 0), "150 - 500 clamps to the top edge");
+        let (side, _) = place(rect(100, 300, 300, 300), narrow, FIT, near(), Some(Axis::Row), full);
+        assert_eq!(side.axis(), Axis::Row);
     }
 
     #[test]
     fn negative_origin_bounds_are_a_pure_translation() {
         let shifted = rect(-1920, 0, 1920, 1080);
-        for anchor in [rect(500, 300, 100, 100), rect(1800, 1000, 100, 60)] {
+        for anchor in [rect(500, 300, 100, 100), rect(1800, 1000, 100, 60), HD] {
             let (here, side) = placed(anchor, HD);
             let (there, side2) = placed(anchor.translate(euclid::vec2(-1920, 0)), shifted);
             assert_eq!(side, side2);
@@ -327,21 +322,24 @@ mod tests {
         }
     }
 
+    /// A row ends at the anchor's right edge whatever its width, so the
+    /// tray and the drawing strip meet at the selection's corner.
     #[test]
-    fn centre_uses_integer_division() {
-        for (aw, w) in [(100, 600), (101, 600), (100, 601), (101, 601)] {
-            let anchor = rect(500, 300, aw, 100);
-            let fit = Fit {
-                row: Footprint {
-                    len: w,
-                    thick: 56,
-                },
-                ..FIT
-            };
-            let (side, r) = place(anchor, HD, fit, near(), None, |_| (w, 56));
-            assert_eq!(side, Side::Below);
-            let mid = r.left() + w / 2;
-            assert!((mid - (500 + aw / 2)).abs() <= 1, "anchor {aw} box {w}: mid {mid}");
+    fn a_row_ends_at_the_anchors_right_edge() {
+        for (aw, w) in [(100, 600), (101, 600), (700, 601), (1200, 400)] {
+            for y in [300, 1000] {
+                let anchor = rect(700, y, aw, 60);
+                let fit = Fit {
+                    row: Footprint {
+                        len: w,
+                        thick: 56,
+                    },
+                    ..FIT
+                };
+                let (side, r) = place(anchor, HD, fit, near(), None, |_| (w, 56));
+                assert_eq!(side.axis(), Axis::Row);
+                assert_eq!(r.right(), anchor.right(), "anchor {aw} box {w} at {y}");
+            }
         }
     }
 
@@ -349,7 +347,7 @@ mod tests {
     fn size_for_is_called_once_with_the_chosen_axis() {
         let calls = Cell::new(0);
         let axis = Cell::new(None);
-        let (side, _) = place(rect(500, 1000, 100, 60), HD, FIT, near(), None, |a| {
+        let (side, _) = place(rect(100, 300, 300, 300), rect(0, 0, 500, 1080), FIT, near(), None, |a| {
             calls.set(calls.get() + 1);
             axis.set(Some(a));
             full(a)
@@ -359,21 +357,22 @@ mod tests {
         assert_eq!(side.axis(), Axis::Column);
     }
 
-    /// Each strip is centred with its OWN width, which is what lets a set
-    /// swap re-centre under the cursor (`PanelSwapGuard`'s premise).
+    /// Each strip is placed with its OWN width and ends where every other
+    /// one does, so a set swap leaves the strip's right end where it was.
     #[test]
-    fn each_strip_is_centred_with_its_own_width() {
-        let anchor = rect(500, 300, 100, 100);
-        let mids = [400, 520].map(|w| {
-            let (_, r) = place(anchor, HD, FIT, near(), None, |_| (w, 56));
-            r.left() + w / 2
+    fn each_strip_keeps_its_right_end_whatever_its_width() {
+        let anchor = rect(900, 300, 400, 100);
+        let ends = [400, 520].map(|w| {
+            place(anchor, HD, FIT, near(), None, |_| (w, 56))
+                .1
+                .right()
         });
-        assert!((mids[0] - mids[1]).abs() <= 1, "{mids:?}");
+        assert_eq!(ends, [anchor.right(); 2]);
     }
 
     #[test]
     fn near_scales_by_ceil_at_each_dpi() {
-        for (dpi, min, max) in [(1.0, 2, 15), (1.25, 3, 19), (1.5, 3, 23), (2.0, 4, 30)] {
+        for (dpi, min, max) in [(1.0, 2, 12), (1.25, 3, 15), (1.5, 3, 18), (2.0, 4, 24)] {
             let near = Near::at_dpi(dpi);
             assert_eq!((near.min_distance, near.max_distance), (min, max), "at {dpi}");
         }

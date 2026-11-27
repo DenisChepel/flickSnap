@@ -1,8 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// One-shot value slot. Writers call `set(v)` once; readers block on
-/// `wait()` until the value arrives, then receive a clone.
+/// One-shot value slot. Readers can poll or wait for a bounded interval.
 pub struct Latch<T: Clone> {
     inner: Mutex<Option<T>>,
     cv: Condvar,
@@ -22,18 +21,7 @@ impl<T: Clone> Latch<T> {
         self.cv.notify_all();
     }
 
-    #[allow(dead_code)]
-    pub fn wait(&self) -> T {
-        let guard = self.inner.lock().unwrap();
-        let guard = self
-            .cv
-            .wait_while(guard, |v| v.is_none())
-            .unwrap();
-        guard.as_ref().unwrap().clone()
-    }
-
-    /// Like [`wait`](Self::wait), but gives up after `timeout` and returns `None`
-    /// if no value has arrived — the writer thread may have died or wedged.
+    /// Return the value if it arrives within `timeout`.
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> Option<T> {
         let guard = self.inner.lock().unwrap();
         let (guard, _) = self
@@ -80,19 +68,24 @@ impl VisibleLatch {
     }
 }
 
-/// RAII guard that increments `ready_count` on drop unless disarmed.
-/// Ensures a panicking worker still unblocks `about_to_wait`.
-pub struct ReadyGuard {
+/// Report an unexpected render-worker exit, including an unwinding panic.
+pub struct RenderFailureGuard {
     counter: Arc<AtomicUsize>,
+    window: Option<Arc<winit::window::Window>>,
     armed: bool,
 }
 
-impl ReadyGuard {
+impl RenderFailureGuard {
     pub fn new(counter: Arc<AtomicUsize>) -> Self {
         Self {
             counter,
+            window: None,
             armed: true,
         }
+    }
+
+    pub fn attach_window(&mut self, window: Arc<winit::window::Window>) {
+        self.window = Some(window);
     }
 
     pub fn disarm(&mut self) {
@@ -100,10 +93,30 @@ impl ReadyGuard {
     }
 }
 
-impl Drop for ReadyGuard {
+impl Drop for RenderFailureGuard {
     fn drop(&mut self) {
         if self.armed {
             self.counter.fetch_add(1, Ordering::Release);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_unexpected_worker_exits_are_reported() {
+        let failures = Arc::new(AtomicUsize::new(0));
+        let mut stopped = RenderFailureGuard::new(failures.clone());
+        stopped.disarm();
+        drop(stopped);
+        assert_eq!(failures.load(Ordering::Acquire), 0);
+
+        drop(RenderFailureGuard::new(failures.clone()));
+        assert_eq!(failures.load(Ordering::Acquire), 1);
     }
 }

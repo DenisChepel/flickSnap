@@ -39,8 +39,7 @@ namespace FlickSnap.UI.DrawOnScreen
         // the ink's hide/show fade (the session drives Canvas.Opacity)
         private static readonly TimeSpan HideFade = TimeSpan.FromMilliseconds(150);
 
-        // the backdrop's zoom range, and one wheel notch's step within it: the capture overlay's
-        // magnifier (flicksnap_capture's ZOOM_STEP and ZOOM_MAX), so both zoom alike
+        // the backdrop's maximum zoom and the factor for one wheel notch
         private const double MaxBackdropZoom = 256;
         private const double FrozenWheelZoomFactor = 2;
 

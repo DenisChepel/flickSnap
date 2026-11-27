@@ -11,8 +11,7 @@
 //! is written **last** (its presence is the shell's completion signal), and
 //! paths in it are absolute (hence [`absolute_path`]).
 //!
-//! A scrolling capture never has a cursor, so its two fields are skipped
-//! when absent rather than being required of every writer.
+//! Cursor fields are optional for scrolling captures and older sessions.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +34,9 @@ pub struct SessionJson {
     pub cursor_img_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_position: Option<RectJson>,
+    /// Whether the screenshot preview includes the cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_visible: Option<bool>,
     pub cropped_rect: RectJson,
     pub original_bounds: RectJson,
     /// Corner radius, in physical pixels of `cropped_rect`, that the
@@ -44,6 +46,9 @@ pub struct SessionJson {
     /// so an older shell reading the file sees exactly what it always did.
     #[serde(skip_serializing_if = "is_zero")]
     pub corner_radius: f32,
+    /// Bits TL, TR, BL, BR. Absent means all corners use the radius.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rounded_corner_mask: Option<u8>,
 }
 
 fn is_zero(v: &f32) -> bool {
@@ -138,6 +143,7 @@ pub fn contract_sample() -> SessionJson {
             width: 32,
             height: 32,
         }),
+        cursor_visible: Some(true),
         cropped_rect: RectJson {
             x: -20,
             y: 30,
@@ -151,6 +157,7 @@ pub fn contract_sample() -> SessionJson {
             height: 1440,
         },
         corner_radius: 16.0,
+        rounded_corner_mask: Some(5),
     }
 }
 
@@ -191,13 +198,16 @@ mod tests {
             preview_img_path: "C:\\s\\cropped.png".to_string(),
             cursor_img_path: None,
             cursor_position: None,
+            cursor_visible: None,
             cropped_rect: ScreenRect::from_xy_size(0, 0, 10, 10).into(),
             original_bounds: ScreenRect::from_xy_size(5, 5, 10, 10).into(),
             corner_radius: 0.0,
+            rounded_corner_mask: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("CursorImgPath"));
         assert!(!json.contains("CursorPosition"));
+        assert!(!json.contains("CursorVisible"));
         assert!(json.contains(r#""DesktopImgPath":"C:\\s\\desktop.png""#));
     }
 
@@ -213,9 +223,11 @@ mod tests {
             preview_img_path: "c.png".to_string(),
             cursor_img_path: None,
             cursor_position: None,
+            cursor_visible: None,
             cropped_rect: ScreenRect::from_xy_size(0, 0, 10, 10).into(),
             original_bounds: ScreenRect::from_xy_size(5, 5, 10, 10).into(),
             corner_radius: 0.0,
+            rounded_corner_mask: None,
         };
         assert!(!serde_json::to_string(&info)
             .unwrap()

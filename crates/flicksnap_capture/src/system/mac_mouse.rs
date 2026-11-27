@@ -14,18 +14,6 @@ pub fn get_position(monitors: &[MonitorInfo]) -> ScreenPoint {
     }
 }
 
-pub fn set_position(pos: ScreenPoint, monitors: &[MonitorInfo]) {
-    let logical_pt = if let Some(m) = find_monitor_for_physical_point(pos, monitors) {
-        let lp = m.screen_to_logical(pos);
-        CGPoint::new(lp.x, lp.y)
-    } else {
-        let s = fallback_scale(monitors) as f64;
-        CGPoint::new(pos.x as f64 / s, pos.y as f64 / s)
-    };
-
-    let _ = flicksnap_desktop::warp_cursor(logical_pt);
-}
-
 fn find_monitor_for_logical_point(pt: LogicalPoint, monitors: &[MonitorInfo]) -> Option<&MonitorInfo> {
     monitors.iter().find(|m| {
         let ox = m.logical_origin.x;
@@ -34,12 +22,6 @@ fn find_monitor_for_logical_point(pt: LogicalPoint, monitors: &[MonitorInfo]) ->
         let lh = m.bounds.height() as f64 / m.scale_factor as f64;
         pt.x >= ox && pt.x < ox + lw && pt.y >= oy && pt.y < oy + lh
     })
-}
-
-fn find_monitor_for_physical_point(pt: ScreenPoint, monitors: &[MonitorInfo]) -> Option<&MonitorInfo> {
-    monitors
-        .iter()
-        .find(|m| m.bounds.contains(pt))
 }
 
 fn fallback_scale(monitors: &[MonitorInfo]) -> f32 {

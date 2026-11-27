@@ -2,7 +2,7 @@
 //! FlickSnap UI shell with `--session-dir <path>`.
 //!
 //! Mirrors `DxScreenCapture::SaveSession` in the retired C++ capturer (DxScreenCapture.cpp:1980):
-//! writes `desktop.png` (full virtual-desktop bitmap, no cursor),
+//! writes `desktop.png` (source pixels without the cursor),
 //! `cursor.png` (desktop crop at the cursor rect with the cursor
 //! composited), `cropped.png` (preview of the selection) and
 //! `session.json` into the session directory. The JSON schema is shared
@@ -11,16 +11,15 @@
 //!
 //! Actions the shell must perform are signaled through an `action.txt`
 //! sidecar in the same directory: `upload` (session payload present,
-//! upload instead of edit) or `select-color #RRGGBB` (no session
-//! payload). No file means edit — the historical default.
+//! upload instead of edit). No file means edit — the historical default.
 
 use std::path::{Path, PathBuf};
 
 use flicksnap_shared::geometry::{RectExt, ScreenPoint, ScreenRect};
 use flicksnap_shared::session::{absolute_path, created_utc_now, save_png, SessionJson};
 
-use crate::capture_output::ActionResult;
-use crate::image_extract::{apply_rounded_corners, composite_cursor_rgba, corners_to_round, extract_selection_rgba};
+use crate::capture_output::{ActionResult, Screenshot};
+use crate::image_extract::{composite_cursor_rgba, corners_to_round, extract_selection_rgba};
 use crate::system::{virtual_desktop_bounds, CapturedDesktop, CursorImage, MonitorInfo};
 
 /// Name of the sidecar file the shell reads to route the finished
@@ -44,15 +43,8 @@ pub enum SessionAction {
 /// Write the full session payload into `session_dir`. Returns
 /// `ActionResult` so the app can route failures through the same
 /// retry/cancel dialog used by Copy and Save.
-pub fn write_session(
-    session_dir: &Path,
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor_visible: bool,
-    action: SessionAction,
-) -> ActionResult {
-    match write_session_inner(session_dir, selection, corner_radius, buffer, cursor_visible, action) {
+pub fn write_session(session_dir: &Path, screenshot: Screenshot<'_>, keep_desktop: bool, action: SessionAction) -> ActionResult {
+    match write_session_inner(session_dir, screenshot, keep_desktop, action) {
         Ok(json_path) => {
             log::info!("session written to {:?}", json_path);
             ActionResult::Success
@@ -64,36 +56,14 @@ pub fn write_session(
     }
 }
 
-/// Write only the `action.txt` marker for a SELECT-COLOR capture: the
-/// shell opens its color viewer with this color and deletes the
-/// directory — no session payload is produced.
-pub fn write_color_action(session_dir: &Path, r: u8, g: u8, b: u8) -> ActionResult {
-    let write = std::fs::create_dir_all(session_dir)
-        .and_then(|_| std::fs::write(session_dir.join(ACTION_FILE), format!("select-color #{r:02X}{g:02X}{b:02X}\n")));
-    match write {
-        Ok(()) => {
-            log::info!("color action written to {:?}", session_dir.join(ACTION_FILE));
-            ActionResult::Success
-        }
-        Err(e) => {
-            log::error!("color action write failed: {e:#}");
-            ActionResult::Failed(format!("Failed to write color: {e}"))
-        }
-    }
-}
-
 /// Write a VIDEO action payload: `cropped.png` (the recording's poster
 /// frame) plus an `action.txt` = `video X,Y,W,H [R]` marker written LAST
 /// so its appearance is the completion signal. No `desktop.png` and no
 /// `session.json` — the session is created by FlickSnap.Ui when recording
 /// finishes (DESIGN §3.2).
 ///
-/// Unlike the screenshot path this **never composites peeked windows**:
-/// flicksnap_recorder records the real screen (obstructions included), so a
-/// peek-composited poster would show content the video does not. Nor is
-/// anything rounded: the recorder captures the raw region, and `R` is
-/// metadata the video editor turns into a rounded-rect mask on the
-/// screen track — the counterpart of `session.json`'s `CornerRadius`.
+/// The poster contains the raw screen region. The video editor uses `R`
+/// to apply a rounded-rect mask to the screen track.
 ///
 /// The rect in `action.txt` is emitted in the platform capture
 /// coordinate space (DESIGN §1.1): physical pixels (virtual-desktop,
@@ -139,9 +109,7 @@ fn write_video_action_inner(
         .ok_or_else(|| anyhow!("selection {:?} does not intersect desktop bounds {:?}", selection, buffer.bounds))?;
     let selection = ensure_min_video_size(selection, buffer.bounds)?;
 
-    // cropped.png — poster frame. No peek compositing (see doc above);
-    // cursor included only if the user has it visible, matching the
-    // screenshot preview.
+    // cropped.png — poster frame, with the cursor when visible.
     let preview_path = session_dir.join("cropped.png");
     {
         let (mut rgba, w, h) = extract_selection_rgba(selection, buffer).ok_or_else(|| anyhow!("failed to extract selection preview"))?;
@@ -444,26 +412,10 @@ fn share_action_line(selection: ScreenRect, monitors: &[MonitorInfo]) -> anyhow:
 /// `action.txt` = `search-image` marker written LAST, so its appearance is
 /// the completion signal (the rule [`write_video_action`] documents).
 ///
-/// No `desktop.png` and no `session.json`: the shell posts this one file to
-/// the search engine, opens the results page and deletes the directory, so
-/// nothing downstream ever opens a session for it. That is the VIDEO
-/// writer's shape, not the UPLOAD writer's — the difference being which of
-/// the two ways of making `cropped.png` is right here.
-///
-/// It is made the *screenshot* way: the cursor included
-/// only when the user has it visible, and a picked window's corners
-/// rounded away. What the user is searching for is what the overlay showed
-/// them, down to the transparent corners — the VIDEO poster's raw,
-/// square, un-peeked crop would hand the engine pixels of the obscuring
-/// window instead.
-pub fn write_image_search_action(
-    session_dir: &Path,
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor_visible: bool,
-) -> ActionResult {
-    match write_image_search_action_inner(session_dir, selection, corner_radius, buffer, cursor_visible) {
+/// The shell posts the same cropped, annotated PNG as Upload, opens the
+/// results page and deletes the directory.
+pub fn write_image_search_action(session_dir: &Path, screenshot: Screenshot<'_>) -> ActionResult {
+    match write_image_search_action_inner(session_dir, screenshot) {
         Ok(action_path) => {
             log::info!("search-image action written to {:?}", action_path);
             ActionResult::Success
@@ -475,40 +427,13 @@ pub fn write_image_search_action(
     }
 }
 
-fn write_image_search_action_inner(
-    session_dir: &Path,
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor_visible: bool,
-) -> anyhow::Result<PathBuf> {
+fn write_image_search_action_inner(session_dir: &Path, screenshot: Screenshot<'_>) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(session_dir)?;
     let session_dir = absolute_path(session_dir);
 
-    let requested = selection;
-    let selection = selection
-        .intersection(&buffer.bounds)
-        .ok_or_else(|| anyhow!("selection {:?} does not intersect desktop bounds {:?}", selection, buffer.bounds))?;
-    // A corner the clamp cut off is not a corner — the same rule
-    // `write_session_inner` applies to the preview it shares this crop
-    // with.
-    let preview_corners = if corner_radius > 0.0 {
-        corners_to_round(requested, selection)
-    } else {
-        [false; 4]
-    };
-
     let preview_path = session_dir.join("cropped.png");
-    {
-        let (mut rgba, w, h) = extract_selection_rgba(selection, buffer).ok_or_else(|| anyhow!("failed to extract selection preview"))?;
-        if cursor_visible {
-            if let Some(cur) = buffer.cursor.as_ref() {
-                composite_cursor_rgba(&mut rgba, w, h, selection, cur);
-            }
-        }
-        apply_rounded_corners(&mut rgba, w, h, corner_radius, preview_corners);
-        save_png(&preview_path, rgba, w, h)?;
-    }
+    let (rgba, w, h) = screenshot.extract()?;
+    save_png(&preview_path, rgba, w, h)?;
 
     // action.txt last: until it appears the shell sees a directory it
     // simply ignores, so a failure above loses nothing but the capture.
@@ -570,10 +495,8 @@ fn write_ocr_upload_action_inner(session_dir: &Path, text: &str) -> anyhow::Resu
 
 fn write_session_inner(
     session_dir: &Path,
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor_visible: bool,
+    screenshot: Screenshot<'_>,
+    keep_desktop: bool,
     action: SessionAction,
 ) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(session_dir)?;
@@ -581,40 +504,30 @@ fn write_session_inner(
 
     // Selection clamped to the desktop bitmap; this is the region the
     // preview contains and what CroppedRect must describe.
-    let requested = selection;
-    let selection = selection
-        .intersection(&buffer.bounds)
-        .ok_or_else(|| anyhow!("selection {:?} does not intersect desktop bounds {:?}", selection, buffer.bounds))?;
-    // A picked window's corners go transparent in the PREVIEW only (the
-    // image UPLOAD ships and the editor shows first). desktop.png stays a
-    // plain bitmap — the editor crops it by CroppedRect itself — and a
-    // corner the clamp cut off is not a corner.
-    let preview_corners = if corner_radius > 0.0 {
-        corners_to_round(requested, selection)
-    } else {
-        [false; 4]
-    };
+    let buffer = screenshot.buffer;
+    let prepared = screenshot.prepare()?;
+    let selection = prepared.selection;
+    // Only Active Window has historically kept pixels outside the crop.
+    let source = if keep_desktop { buffer.bounds } else { selection };
 
     // The three image extract+encode jobs are independent; run them on
     // scoped threads so the wall time is the largest single encode
     // (desktop.png) rather than the sum. session.json stays strictly
     // after the join, preserving the "payload appears last" protocol.
     let desktop_path = session_dir.join("desktop.png");
+    let cursor_path = session_dir.join("cursor.png");
     let preview_path = session_dir.join("cropped.png");
     let (desktop_res, cursor_res, preview_res) = std::thread::scope(|s| {
-        // desktop.png — the full virtual-desktop bitmap with the locked
-        // peek window composited (matches Dx GetCombinedBitmap(merge, no
-        // crop)), but never the cursor: the editor toggles cursor
-        // visibility itself.
+        // The editor crops this source and toggles the cursor independently.
         let desktop_job = s.spawn(|| -> anyhow::Result<()> {
-            let (rgba, w, h) = extract_selection_rgba(buffer.bounds, buffer).ok_or_else(|| anyhow!("failed to extract desktop bitmap"))?;
+            let (rgba, w, h) = prepared.pixels(source, false)?;
             save_png(&desktop_path, rgba, w, h)
         });
 
         // cursor.png — desktop crop at the cursor rect with the cursor
         // composited over it (matches Dx GetCursorBitmap). Skipped when
         // no cursor was captured or the OS reported it hidden.
-        let cursor_job = s.spawn(|| -> anyhow::Result<Option<(PathBuf, ScreenRect)>> {
+        let cursor_job = s.spawn(|| -> anyhow::Result<Option<ScreenRect>> {
             let Some(cur) = buffer.cursor.as_ref().filter(|c| c.visible) else {
                 return Ok(None);
             };
@@ -632,29 +545,23 @@ fn write_session_inner(
             };
             let cursor_rect =
                 ScreenRect::from_xy_size(cur.position.x - cur.hotspot_x, cur.position.y - cur.hotspot_y, cw as i32, ch as i32);
-            let Some(clamped) = cursor_rect.intersection(&buffer.bounds) else {
+            let Some(clamped) = cursor_rect
+                .intersection(&source)
+                .filter(|r| r.width() > 0 && r.height() > 0)
+            else {
                 return Ok(None);
             };
-            let Some((mut rgba, w, h)) = extract_selection_rgba(clamped, buffer) else {
-                return Ok(None);
-            };
-            composite_cursor_rgba(&mut rgba, w, h, clamped, cur);
-            let cursor_path = session_dir.join("cursor.png");
+            // Repeat the same layer order over the cursor patch rather
+            // than drawing the cursor on top of the exported ink.
+            let (rgba, w, h) = prepared.pixels(clamped, true)?;
             save_png(&cursor_path, rgba, w, h)?;
-            Ok(Some((cursor_path, clamped)))
+            Ok(Some(clamped))
         });
 
         // cropped.png — preview of the selection, cursor
         // included only if the user has it visible (Dx `copyCursor`).
         let preview_job = s.spawn(|| -> anyhow::Result<()> {
-            let (mut rgba, w, h) =
-                extract_selection_rgba(selection, buffer).ok_or_else(|| anyhow!("failed to extract selection preview"))?;
-            if cursor_visible {
-                if let Some(cur) = buffer.cursor.as_ref() {
-                    composite_cursor_rgba(&mut rgba, w, h, selection, cur);
-                }
-            }
-            apply_rounded_corners(&mut rgba, w, h, corner_radius, preview_corners);
+            let (rgba, w, h) = prepared.extract()?;
             save_png(&preview_path, rgba, w, h)
         });
 
@@ -672,7 +579,15 @@ fn write_session_inner(
     });
     desktop_res?;
     preview_res?;
-    let cursor_entry: Option<(PathBuf, ScreenRect)> = cursor_res?;
+    let cursor_rect = cursor_res?;
+    if cursor_rect.is_none() {
+        // A retry with a different selection may no longer include the cursor.
+        match std::fs::remove_file(&cursor_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     // action.txt — routing marker, written before session.json so the
     // payload stays the last file to appear. Edit removes any marker a
@@ -688,24 +603,30 @@ fn write_session_inner(
 
     // session.json — written last; the shell treats its presence as the
     // success signal (missing file = capture canceled).
-    let origin = buffer.bounds.origin;
+    let origin = source.origin;
     let cropped_rect = selection.translate(euclid::Vector2D::new(-origin.x, -origin.y));
+    let rounded_corner_mask = (screenshot.corner_radius > 0.0 && selection != screenshot.selection).then(|| {
+        corners_to_round(screenshot.selection, selection)
+            .into_iter()
+            .enumerate()
+            .fold(0, |mask, (i, round)| mask | (u8::from(round) << i))
+    });
 
     let info = SessionJson {
         created_utc: created_utc_now(),
         name: "Screenshot",
         desktop_img_path: desktop_path.to_string_lossy().into_owned(),
         preview_img_path: preview_path.to_string_lossy().into_owned(),
-        cursor_img_path: cursor_entry
-            .as_ref()
-            .map(|(p, _)| p.to_string_lossy().into_owned()),
-        cursor_position: cursor_entry.as_ref().map(|(_, r)| {
+        cursor_img_path: cursor_rect.map(|_| cursor_path.to_string_lossy().into_owned()),
+        cursor_position: cursor_rect.map(|r| {
             r.translate(euclid::Vector2D::new(-origin.x, -origin.y))
                 .into()
         }),
+        cursor_visible: Some(screenshot.cursor_visible),
         cropped_rect: cropped_rect.into(),
         original_bounds: selection.into(),
-        corner_radius,
+        corner_radius: screenshot.corner_radius,
+        rounded_corner_mask,
     };
 
     let json_path = session_dir.join("session.json");
@@ -718,6 +639,122 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn screenshot_exports_agree_on_cursor_ink_and_retained_pixels() {
+        use crate::draw::{Ink, Mark, Shape};
+        use crate::system::CapturedCursor;
+        use egui::{pos2, Color32};
+
+        let buffer = CapturedDesktop {
+            bgra: [0x40, 0x40, 0x40, 0].repeat(32 * 24),
+            width: 32,
+            height: 24,
+            bounds: ScreenRect::from_xy_size(-16, 0, 32, 24),
+            cursor: Some(CapturedCursor {
+                position: ScreenPoint::new(-6, 8),
+                hotspot_x: 0,
+                hotspot_y: 0,
+                visible: true,
+                image: CursorImage::AlphaBlended {
+                    bgra: [255, 0, 0, 255].repeat(3 * 5),
+                    width: 3,
+                    height: 5,
+                },
+            }),
+        };
+        let marks = [Mark {
+            ink: Ink::Shape {
+                shape: Shape::Line,
+                from: pos2(-12.0, 9.5),
+                to: pos2(9.0, 9.5),
+            },
+            color: Color32::RED,
+            scale: 1.0,
+        }];
+        let screenshot = Screenshot {
+            selection: ScreenRect::from_xy_size(-8, 7, 16, 16),
+            buffer: &buffer,
+            corner_radius: 2.0,
+            cursor_visible: true,
+            marks: &marks,
+        };
+        // Copy and Save use this same pixel generator.
+        let (preview, w, h) = screenshot.extract().unwrap();
+        let preview = image::RgbaImage::from_raw(w, h, preview).unwrap();
+        assert_eq!(preview.get_pixel(2, 2).0, [255, 0, 0, 255], "ink covers the cursor");
+        assert_eq!(preview.get_pixel(2, 5).0, [0, 0, 255, 255], "uncovered part of the cursor");
+        assert_eq!(preview.get_pixel(0, 2).0, [255, 0, 0, 255], "ink reaches the crop boundary");
+        assert!(preview.get_pixel(0, 0).0[3] < 255, "the preview has a transparent corner");
+        assert_eq!(buffer.bgra[3], 0, "the original frame is untouched");
+
+        let dir = temp_session_dir();
+        let read = |dir: &Path, name| {
+            image::open(dir.join(name))
+                .unwrap()
+                .to_rgba8()
+        };
+        for (name, action, keep_desktop) in [
+            ("edit", SessionAction::Edit, false),
+            ("upload", SessionAction::Upload, false),
+            ("window", SessionAction::Edit, true),
+        ] {
+            let target = dir.join(name);
+            let json_path = write_session_inner(&target, screenshot, keep_desktop, action).unwrap();
+            let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+            assert_eq!(read(&target, "cropped.png"), preview);
+            let source = read(&target, "desktop.png");
+            let patch = read(&target, "cursor.png");
+            let (x, y) = if keep_desktop { (8, 7) } else { (0, 0) };
+            assert_eq!(source.dimensions(), if keep_desktop { (32, 24) } else { (w, h) });
+            assert_eq!(metadata["CroppedRect"]["X"], x);
+            assert_eq!(metadata["CroppedRect"]["Y"], y);
+            assert_eq!(metadata["CursorPosition"]["X"], x + 2);
+            assert_eq!(metadata["CursorPosition"]["Y"], y + 1);
+            assert_eq!(metadata["CursorVisible"], true);
+            assert_eq!(source.get_pixel(x, y).0[3], 255, "the editor source stays rectangular");
+            assert_eq!(source.get_pixel(x + 2, y + 5).0, [0x40, 0x40, 0x40, 255]);
+            assert_eq!(patch.get_pixel(0, 1).0, preview.get_pixel(2, 2).0);
+            assert_eq!(patch.get_pixel(0, 4).0, preview.get_pixel(2, 5).0);
+            if keep_desktop {
+                assert_eq!(source.get_pixel(x - 1, y + 2).0, [0x40, 0x40, 0x40, 255], "no ink outside the crop");
+            }
+        }
+        let search = dir.join("search");
+        write_image_search_action_inner(&search, screenshot).unwrap();
+        assert_eq!(read(&search, "cropped.png"), preview);
+
+        let edit = dir.join("edit");
+        let hidden = Screenshot {
+            cursor_visible: false,
+            ..screenshot
+        };
+        let json_path = write_session_inner(&edit, hidden, false, SessionAction::Edit).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+        assert_eq!(metadata["CursorVisible"], false);
+        assert_eq!(read(&edit, "cropped.png").get_pixel(2, 5).0, [0x40, 0x40, 0x40, 255]);
+        assert_eq!(read(&edit, "cursor.png").get_pixel(0, 4).0, [0, 0, 255, 255]);
+
+        let without_cursor = Screenshot {
+            selection: ScreenRect::from_xy_size(0, 0, 8, 8),
+            ..screenshot
+        };
+        write_session_inner(&edit, without_cursor, false, SessionAction::Edit).unwrap();
+        assert!(!edit.join("cursor.png").exists());
+
+        let clipped_window = Screenshot {
+            selection: ScreenRect::from_xy_size(-18, 3, 16, 16),
+            corner_radius: 4.0,
+            ..hidden
+        };
+        let json_path = write_session_inner(&edit, clipped_window, true, SessionAction::Edit).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(json_path).unwrap()).unwrap();
+        assert_eq!(metadata["RoundedCornerMask"], 0b1010);
+        let cropped = read(&edit, "cropped.png");
+        assert_eq!(cropped.get_pixel(0, 0).0[3], 255);
+        assert!(cropped.get_pixel(13, 0).0[3] < 255);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn min_video_size_passthrough() {
@@ -799,6 +836,8 @@ mod tests {
             adapter_id: None,
             #[cfg(target_os = "macos")]
             logical_origin: flicksnap_shared::geometry::LogicalPoint::new(x as f64, y as f64),
+            #[cfg(target_os = "macos")]
+            display_id: 0,
         }
     }
 

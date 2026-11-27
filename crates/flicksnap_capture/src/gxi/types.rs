@@ -21,7 +21,6 @@ use super::{Buffer, Frame, Sampler, Texture};
 pub enum ShaderId {
     Desktop,
     Selection,
-    Crosshair,
     Egui,
 }
 
@@ -30,7 +29,6 @@ impl ShaderId {
         match self {
             ShaderId::Desktop => "desktop",
             ShaderId::Selection => "selection",
-            ShaderId::Crosshair => "crosshair",
             ShaderId::Egui => "ui_egui",
         }
     }
@@ -44,7 +42,6 @@ impl ShaderId {
         match self {
             ShaderId::Desktop => shader_bindings::DESKTOP_BINDINGS,
             ShaderId::Selection => shader_bindings::OVERLAY_BINDINGS,
-            ShaderId::Crosshair => shader_bindings::OVERLAY_BINDINGS,
             ShaderId::Egui => shader_bindings::EGUI_BINDINGS,
         }
     }
@@ -55,8 +52,7 @@ impl ShaderId {
 /// `ID3D11BlendState` objects.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
-    /// No blending (desktop and peek passes — they own every pixel they
-    /// touch).
+    /// No blending. The desktop pass owns every pixel it touches.
     Replace,
     /// Source-over with premultiplied source (`ONE / ONE_MINUS_SRC_ALPHA`
     /// for both color and alpha) — the egui painter.
@@ -150,7 +146,7 @@ pub enum SamplerFilter {
 pub struct PipelineDesc {
     pub label: &'static str,
     pub shader: ShaderId,
-    /// `None` for the fullscreen-triangle passes (desktop, peek).
+    /// `None` for passes driven by the vertex index.
     pub vertex: Option<VertexLayout>,
     pub blend: BlendMode,
 }
@@ -190,12 +186,9 @@ pub enum AcquireResult {
     /// early order-front races the metal backend's occlusion guard.
     #[cfg_attr(windows, allow(dead_code))] // constructed only by the metal backend
     Occluded,
-    /// The device itself is gone. Produced only by the d3d11 backend,
-    /// which maps `DXGI_ERROR_DEVICE_REMOVED/RESET` here (in
-    /// `Surface::acquire`) so the worker can exit via its fail path;
-    /// Metal has no equivalent runtime device-loss signal.
+    /// The device or swap chain is unusable.
     #[cfg_attr(target_os = "macos", allow(dead_code))] // constructed only by the d3d11 backend
-    DeviceLost,
+    Failed,
 }
 
 /// Progress callbacks out of `Device::create`, so the caller can stamp its

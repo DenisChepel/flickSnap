@@ -6,7 +6,7 @@ use egui::{pos2, vec2, Color32, FontId, Painter, Rect, Stroke, StrokeKind, Vec2}
 use crate::ui::components::{InputCtx, Local};
 use crate::ui::fonts;
 use crate::ui::shared::UiMonitor;
-use flicksnap_shared::geometry::{RectExt, ScreenRectF};
+use flicksnap_shared::geometry::RectExt;
 
 /// One host's copy of the indicator, already in that monitor's points.
 #[derive(Clone, Copy, PartialEq)]
@@ -32,11 +32,7 @@ pub fn inputs(index: usize, monitor: &UiMonitor, c: &InputCtx<'_>) -> Option<Are
         return None;
     }
     let sel = i.selection?;
-    // Match the render transform before clipping against the monitors.
-    let cursor = i.virtual_cursor;
-    let left = cursor.x + (sel.left() as f32 - cursor.x) * i.zoom;
-    let top = cursor.y + (sel.top() as f32 - cursor.y) * i.zoom;
-    let displayed = ScreenRectF::from_xy_size(left, top, sel.width() as f32 * i.zoom, sel.height() as f32 * i.zoom);
+    let displayed = sel.to_f32();
     let (host, clipped) = c
         .monitors
         .iter()
@@ -136,11 +132,7 @@ mod tests {
             monitors,
             cursor_index: monitor_index_at(monitors, input.virtual_cursor),
             accent: Color32::RED,
-            hovered_window_title: None,
             hovered_monitor_name: None,
-            hovered_pixel_bgra: None,
-            cursor_image_rect: None,
-            cursor_overlay_visible: true,
         }
     }
 
@@ -174,20 +166,6 @@ mod tests {
         let above = pill_rect(resized, text(), s);
         assert_eq!(above.left(), resized.left());
         assert_eq!(above.bottom(), resized.top() - GAP);
-    }
-
-    #[test]
-    fn zoom_moves_the_visible_corner_without_changing_reported_dimensions() {
-        let m = monitors();
-        let mut i = InteractionState::new();
-        i.selection = Some(ScreenRect::from_xy_size(400, 300, 600, 400));
-        i.dragging = true;
-        i.zoom = 2.0;
-        i.virtual_cursor = ScreenPointF::new(500.0, 400.0);
-
-        let shown = inputs(0, &m[0], &ctx(&i, &m)).expect("zoomed selection on primary");
-        assert_eq!(shown.clipped.min, pos2(300.0, 200.0));
-        assert_eq!(shown.size, (600, 400));
     }
 
     #[test]

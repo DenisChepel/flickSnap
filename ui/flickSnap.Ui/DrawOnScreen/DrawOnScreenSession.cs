@@ -119,14 +119,19 @@ namespace FlickSnap.UI.DrawOnScreen
         {
             Dispatcher.UIThread.VerifyAccess();
 
-            if (ActiveInstance is { } active)
+            var active = ActiveInstance;
+            if (closeLiveSession && active is { _frozen: false })
             {
-                if (closeLiveSession && !active._frozen)
-                {
-                    active.Close();
-                    return;
-                }
+                active.Close();
+                return;
+            }
 
+            // Only closing a live session is allowed while capture owns the overlay.
+            if (ScreenCapturePage.IsCaptureOverlayOpen)
+                return;
+
+            if (active != null)
+            {
                 active.Raise();
 
                 // the press found a session already up: point at its toolbar, wherever it was left, and
@@ -251,7 +256,7 @@ namespace FlickSnap.UI.DrawOnScreen
                     _toolbar.ShowAtTopOf(anchor.WorkingArea, upwardOffset: 20);
                 else
                     _toolbar.Show();
-                WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar);
+                RaiseToolbar();
 
                 // The foreground watch also sees changes that Avalonia's IsActive misses on Windows.
                 _foregroundWatch = WindowNativeExtensions.WatchForeground(OnFocusMoved);
@@ -858,8 +863,6 @@ namespace FlickSnap.UI.DrawOnScreen
 
         private void OnChanged() => Changed?.Invoke(this, EventArgs.Empty);
 
-        /// <summary>Re-asserts every window above its topmost peers, the toolbar last so it stays
-        /// above the canvases.</summary>
         /// <summary>
         /// Puts the strip back above the canvases. Showing it last is not enough on its own: a canvas
         /// finishes opening (and is restyled) after its Show() returns, which can land it above the
@@ -868,15 +871,22 @@ namespace FlickSnap.UI.DrawOnScreen
         /// </summary>
         private void KeepToolbarOnTop()
         {
-            WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar);
-            Dispatcher.UIThread.Post(() => WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar), DispatcherPriority.Background);
+            RaiseToolbar();
+            Dispatcher.UIThread.Post(RaiseToolbar, DispatcherPriority.Background);
         }
 
+        private void RaiseToolbar()
+        {
+            if (!_closing && !ScreenCapturePage.IsCaptureOverlayOpen)
+                WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar);
+        }
+
+        /// <summary>Raises the drawing windows, with the toolbar above the canvases.</summary>
         private void Raise()
         {
             foreach (var overlay in _overlays)
                 WindowNativeExtensions.RaiseTopmostNoActivate(overlay.Window);
-            WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar);
+            RaiseToolbar();
         }
 
         // ====================================================================
@@ -980,13 +990,13 @@ namespace FlickSnap.UI.DrawOnScreen
         /// </summary>
         private void OnTextEditingChanged(Overlay overlay)
         {
-            if (_closing)
+            if (_closing || ScreenCapturePage.IsCaptureOverlayOpen)
                 return;
 
             if (overlay.Canvas.IsTextEditing)
             {
                 overlay.Window.Activate();
-                WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar);
+                RaiseToolbar();
             }
             else if (overlay.Window.IsActive)
             {
@@ -1014,6 +1024,9 @@ namespace FlickSnap.UI.DrawOnScreen
         /// </summary>
         private void TakeKeyboard()
         {
+            if (_closing || ScreenCapturePage.IsCaptureOverlayOpen)
+                return;
+
             var target = _toolbar?.KeyboardTarget;
             if (target == null)
                 return;
@@ -1198,7 +1211,7 @@ namespace FlickSnap.UI.DrawOnScreen
 
             // a freshly shown canvas is the newest topmost window; the strip goes back above it
             if (added)
-                WindowNativeExtensions.RaiseTopmostNoActivate(_toolbar);
+                RaiseToolbar();
 
             RecomputeCanClear();
             OnChanged();

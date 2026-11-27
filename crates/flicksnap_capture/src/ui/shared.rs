@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use crate::interaction::OcrState;
-use crate::system::{CapturedDesktop, CursorImage};
+use crate::system::CapturedDesktop;
 use crate::ui::components::panel::model::PanelButtonSet;
 use crate::ui::egui_frame::EguiFrame;
 use flicksnap_shared::geometry::{RectExt, ScreenPoint, ScreenPointF, ScreenRect, ScreenRectF};
@@ -43,7 +43,7 @@ pub struct UiMonitor {
 pub struct UiSharedState {
     pub debug_visible: bool,
     /// Master overlay switch. When `false`, every UI overlay (tips,
-    /// debug, panel, selection border, crosshair, dim) is suppressed so
+    /// debug, panel, selection border, dim) is suppressed so
     /// the desktop shows through unobstructed. Toggled by the Q key
     /// (`DxScreenCapture.cpp:1234-1239`).
     pub overlays_visible: bool,
@@ -84,8 +84,7 @@ pub fn aabb_intersects(a: ScreenRectF, b: ScreenRectF) -> bool {
     a.right() > b.left() && a.left() < b.right() && a.bottom() > b.top() && a.top() < b.bottom()
 }
 
-/// Sample one desktop pixel as BGRA. Shared by the info overlay and the
-/// SELECT-COLOR command.
+/// Sample one pixel from the frozen desktop in BGRA order.
 pub fn sample_bgra(buf: &CapturedDesktop, p: ScreenPoint) -> Option<[u8; 4]> {
     let dx = p.x - buf.bounds.min_x();
     let dy = p.y - buf.bounds.min_y();
@@ -99,31 +98,6 @@ pub fn sample_bgra(buf: &CapturedDesktop, p: ScreenPoint) -> Option<[u8; 4]> {
     let idx = ((dy * w + dx) as usize) * 4;
     let s = buf.bgra.get(idx..idx + 4)?;
     Some([s[0], s[1], s[2], s[3]])
-}
-
-/// Bounding rect of the captured cursor image, in virtual-desktop physical
-/// px: the cursor position minus its hotspot, sized by the bitmap. `None`
-/// when the cursor was not captured or the OS reports it hidden.
-pub fn cursor_image_rect(buf: Option<&CapturedDesktop>) -> Option<ScreenRectF> {
-    let cursor = buf?.cursor.as_ref()?;
-    if !cursor.visible {
-        return None;
-    }
-    let (w, h) = match &cursor.image {
-        CursorImage::AlphaBlended {
-            width,
-            height,
-            ..
-        } => (*width, *height),
-        CursorImage::Masked {
-            width,
-            height,
-            ..
-        } => (*width, *height),
-    };
-    let left = cursor.position.x as f32 - cursor.hotspot_x as f32;
-    let top = cursor.position.y as f32 - cursor.hotspot_y as f32;
-    Some(ScreenRectF::from_xy_size(left, top, w as f32, h as f32))
 }
 
 /// The monitor whose bounds hold the point, or `None` in a gap between

@@ -7,8 +7,7 @@
 //!     recent frames. Its live numbers come from the render worker's
 //!     `PerfSnapshot`s.
 //!   * the **primary** panel, anchored top-right of the monitor holding the
-//!     virtual cursor, showing startup timings, cursor, selection and
-//!     hovered-window info — all app-thread values already.
+//!     cursor, showing startup timings, cursor and selection state.
 //!
 //! [`model`] formats the rows, [`resources`] polls RAM/VRAM and [`show`]
 //! lays both panels out.

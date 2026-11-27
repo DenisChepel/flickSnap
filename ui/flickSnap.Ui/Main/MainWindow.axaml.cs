@@ -152,9 +152,11 @@ namespace FlickSnap.UI
         {
             // the first of the action's gestures: the caption names one key, not the whole list
             var gesture = SettingsRoot.Current.Hotkeys.CaptureRegionShortcut.FirstOrDefault()?.ToString();
-            return String.IsNullOrEmpty(gesture)
+            var opened = String.IsNullOrEmpty(gesture)
                 ? "These settings apply to the capture overlay, opened from the tray menu."
                 : $"These settings apply to the capture overlay, opened with {gesture}.";
+            // the overlay starts with its hotkey panel hidden: this is where its key is told
+            return opened + " Press T in the overlay to see its hotkeys.";
         }
 
         /// <summary>The nav's status badges: the System entry turns into a red alert reading

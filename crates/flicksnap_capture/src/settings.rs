@@ -13,36 +13,10 @@ use clap::Parser;
 use crate::filename_pattern::DEFAULT_FILENAME_PATTERN;
 use crate::ui::components::panel::model::{ButtonStyle, PanelFeatures};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum TipsMode {
-    #[default]
-    Hints,
-    Tips,
-    Off,
-}
-
-impl TipsMode {
-    pub fn next(self) -> Self {
-        match self {
-            TipsMode::Hints => TipsMode::Tips,
-            TipsMode::Tips => TipsMode::Off,
-            TipsMode::Off => TipsMode::Hints,
-        }
-    }
-
-    pub fn show_hints(self) -> bool {
-        matches!(self, TipsMode::Hints)
-    }
-
-    pub fn show_tips_panel(self) -> bool {
-        matches!(self, TipsMode::Tips)
-    }
-}
-
 /// What the capturer should have selected when it opens. `Region` is the
-/// default drag selection over the live desktop; `Screen` and `Window` pre-select the
+/// default drag selection over the frozen desktop; `Screen` and `Window` pre-select the
 /// active monitor / foreground window and show the action panel so the
-/// user can confirm or adjust (mirrors pressing `F` / `W` at startup).
+/// user can confirm or adjust.
 /// Chosen by the shell from which capture hotkey fired.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CaptureMode {
@@ -56,24 +30,12 @@ pub enum CaptureMode {
 /// via `Arc` — we never mutate it after construction.
 #[derive(Debug, Clone)]
 pub struct CapturerSettings {
-    /// RGBA (each channel in [0, 1]) accent color used for crosshair
-    /// arms, selection borders, and UI highlights. Written into the
+    /// RGBA (each channel in [0, 1]) accent color used for selection
+    /// borders and UI highlights. Written into the
     /// per-window uniform buffer once, at render-thread startup. This is the
     /// pick put through [`crate::accent::ensure_contrast_with_white`] unless
     /// the shell asked for the exact color (`--no-accent-contrast`).
     pub accent_color: [f32; 4],
-    /// The accent exactly as the user picked it, before any contrast
-    /// correction: what light-emitting accents with no white ink on them —
-    /// the hint comet — derive their colors from.
-    pub picked_accent_color: [f32; 4],
-    /// Which tips/hints mode is active when the capturer first opens.
-    /// The user cycles through modes with the `T` key.
-    pub tips_mode_at_startup: TipsMode,
-    /// When enabled, obstructed windows are captured via PrintWindow
-    /// and a peek-through composite is shown when hovering them.
-    /// Maximum fraction of a window's area that can be obstructed by
-    /// higher-Z windows before it is dropped from hit-test results.
-    /// 0.80 = windows up to 80% covered are still selectable. Range 0.0–1.0.
     /// Whether the captured OS cursor is rendered in the preview and
     /// included when saving/copying. The cursor image is always captured
     /// regardless; this only controls visibility. Toggled at runtime
@@ -91,8 +53,7 @@ pub struct CapturerSettings {
     /// Directory to write the session payload into, supplied by the
     /// shell via `--session-dir <path>`. When set, the EDIT/UPLOAD
     /// actions write desktop/cursor/preview PNGs plus `session.json`
-    /// here (UPLOAD also an `action.txt` marker), SELECT-COLOR writes
-    /// only `action.txt`, and the capturer exits (see
+    /// here (UPLOAD also an `action.txt` marker), and the capturer exits (see
     /// CAPTURE_PROTOCOL.md). `None` = standalone mode.
     pub session_dir: Option<PathBuf>,
     /// What to have selected when the capturer opens. `Region` starts with
@@ -142,12 +103,6 @@ pub struct CapturerSettings {
     pub save_directory: Option<PathBuf>,
 }
 
-impl CapturerSettings {
-    pub fn live_selection(&self) -> bool {
-        self.capture_mode != CaptureMode::Window
-    }
-}
-
 impl Default for CapturerSettings {
     fn default() -> Self {
         Self {
@@ -156,8 +111,6 @@ impl Default for CapturerSettings {
             // always passes `--accent-color` (the OS accent, or the user's pick), which goes
             // through the same correction in `into_settings`, so this is the standalone default only.
             accent_color: contrast_corrected(FLICKSNAP_BLUE_RGBA),
-            picked_accent_color: FLICKSNAP_BLUE_RGBA,
-            tips_mode_at_startup: TipsMode::default(),
             cursor_visible_at_startup: true,
             rounded_window_corners: true,
             session_dir: None,
@@ -196,16 +149,14 @@ pub struct CliArgs {
     pub session_root: Option<PathBuf>,
 
     /// Directory to write the session payload into. When set, the
-    /// EDIT/UPLOAD/SELECT-COLOR actions write their payload here and
+    /// EDIT/UPLOAD actions write their payload here and
     /// exit (see CAPTURE_PROTOCOL.md). Omit for standalone mode.
     #[arg(long, value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
 
-    /// Accent color for the crosshair, selection borders, and UI
-    /// highlights, as hex `#RRGGBB` or `#RRGGBBAA` (leading `#` optional).
+    /// Accent color for selection borders and UI highlights, as hex `#RRGGBB` or `#RRGGBBAA` (leading `#` optional).
     /// Pass the color as picked: it is darkened here for the white labels
-    /// drawn on it (see `--no-accent-contrast`), and the hint comet derives
-    /// its own colors from the original.
+    /// drawn on it (see `--no-accent-contrast`).
     #[arg(long, value_name = "HEX", default_value = "#3B97D2", value_parser = parse_hex_color)]
     pub accent_color: [f32; 4],
 
@@ -213,10 +164,6 @@ pub struct CliArgs {
     /// than darkening it until white labels on it are readable (WCAG AA).
     #[arg(long)]
     pub no_accent_contrast: bool,
-
-    /// Tips/hints overlay mode at startup (cycled at runtime with T).
-    #[arg(long, value_enum, default_value_t = TipsMode::Hints)]
-    pub tips_mode: TipsMode,
 
     /// Start with the captured cursor hidden (toggled at runtime with M).
     #[arg(long)]
@@ -229,7 +176,7 @@ pub struct CliArgs {
     pub no_rounded_corners: bool,
 
     /// What to have selected when the capturer opens. `region` (default)
-    /// starts the free-selection crosshair; `screen` pre-selects the
+    /// starts a free selection; `screen` pre-selects the
     /// active monitor and `window` the foreground window, in both cases
     /// showing the action panel so the user can confirm or adjust.
     #[arg(long, value_enum, default_value_t = CaptureMode::Region)]
@@ -340,8 +287,6 @@ impl CliArgs {
             } else {
                 contrast_corrected(self.accent_color)
             },
-            picked_accent_color: self.accent_color,
-            tips_mode_at_startup: self.tips_mode,
             cursor_visible_at_startup: !self.no_cursor,
             rounded_window_corners: !self.no_rounded_corners,
             session_dir: self.session_dir,
@@ -400,8 +345,6 @@ mod tests {
         let from_cli = cli.into_settings();
         let default = CapturerSettings::default();
         assert_eq!(from_cli.accent_color, default.accent_color);
-        assert_eq!(from_cli.picked_accent_color, default.picked_accent_color);
-        assert_eq!(from_cli.tips_mode_at_startup, default.tips_mode_at_startup);
         assert_eq!(from_cli.cursor_visible_at_startup, default.cursor_visible_at_startup);
         assert_eq!(from_cli.rounded_window_corners, default.rounded_window_corners);
         assert_eq!(from_cli.session_dir, default.session_dir);
@@ -584,10 +527,9 @@ mod tests {
     fn accent_is_contrast_corrected_unless_asked_not_to() {
         let hex = |c: [f32; 4]| c.map(|v| (v * 255.0).round() as u8);
         let fixed = CliArgs::parse_from(["flicksnap_capture", "--accent-color", "#FFFF00"]).into_settings();
-        assert_eq!(hex(fixed.picked_accent_color), [0xFF, 0xFF, 0x00, 0xFF]);
         assert!(crate::accent::contrast_with_white([0, 1, 2].map(|i| hex(fixed.accent_color)[i])) >= 4.5);
 
         let exact = CliArgs::parse_from(["flicksnap_capture", "--accent-color", "#FFFF00", "--no-accent-contrast"]).into_settings();
-        assert_eq!(exact.accent_color, exact.picked_accent_color);
+        assert_eq!(hex(exact.accent_color), [0xFF, 0xFF, 0x00, 0xFF]);
     }
 }

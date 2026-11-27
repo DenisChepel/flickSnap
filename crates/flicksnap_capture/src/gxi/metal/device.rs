@@ -258,12 +258,8 @@ impl Device {
             .unwrap_or_else(|e| panic!("metal texture '{}' ({}x{}): {e:#}", desc.label, desc.width, desc.height))
     }
 
-    /// Fallible variant of [`Device::create_texture_with_data`] for the
-    /// mid-render-loop, size-driven uploads (blurred desktop, peek):
-    /// those textures are optional cosmetics, and an allocation failure
-    /// on a multi-4K desktop should be a logged skip, not a dead render
-    /// worker. Size-mismatch asserts still panic - that is a caller bug,
-    /// not a runtime condition.
+    /// Fallible allocation and upload for textures sized at runtime.
+    /// The caller must supply enough pixels for the declared size.
     pub fn try_create_texture_with_data(&self, queue: &Queue, desc: &TextureDesc, data: &[u8]) -> Result<Texture> {
         // Brand-new texture: no in-flight command buffer can reference it
         // yet, so the upload skips the queue's write fence on purpose.
@@ -564,9 +560,7 @@ impl Texture {
     }
 }
 
-/// A sampler. `Clone` is cheap (refcount) - the desktop snapshot keeps a
-/// clone of the shared sampler so the peek bind group can reuse it per
-/// frame.
+/// A Metal sampler state.
 #[derive(Clone)]
 pub struct Sampler {
     pub(super) raw: Retained<ProtocolObject<dyn MTLSamplerState>>,

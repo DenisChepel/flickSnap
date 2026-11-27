@@ -82,7 +82,7 @@ impl StackedButton {
     }
 }
 
-/// `key` style: a 40 pt square, the icon beside the accelerator letter
+/// `key` style: a `KEY_TILE` square, the icon beside the accelerator letter
 /// (white at 80 %: the earlier 45 % tag was too dim to read on either
 /// group fill).
 pub fn key_hint_button(def: &ButtonDef, id: Id, min_size: Vec2, base: Color32, veil: f32) -> StackedButton {
@@ -107,7 +107,7 @@ pub fn key_hint_button(def: &ButtonDef, id: Id, min_size: Vec2, base: Color32, v
     }
 }
 
-/// `below` style: 48 pt tall, the icon over the Title-case label with the
+/// `below` style: `BELOW_HEIGHT` tall, the icon over the Title-case label with the
 /// accelerator glyph underlined.
 pub fn below_button(def: &ButtonDef, id: Id, min_size: Vec2, base: Color32, veil: f32) -> StackedButton {
     StackedButton {
@@ -147,10 +147,16 @@ pub fn icon_button(def: &ButtonDef, id: Id, min_size: Vec2, base: Color32, veil:
 /// icon-only buttons carry no letter of their own, so the chip is where
 /// the key is learned.
 pub fn tip_job(def: &ButtonDef) -> LayoutJob {
+    tip_text_job(def.tip, Some(def.accel_key()))
+}
+
+/// A tooltip chip's text: `text`, 11 pt, white, and — for a button that
+/// has one — its key dimmed after a middle dot.
+pub fn tip_text_job(text: &str, key: Option<char>) -> LayoutJob {
     let font = egui::FontId::new(tokens::TIP_FONT, egui::FontFamily::Proportional);
     let mut job = LayoutJob::default();
     job.append(
-        def.tip,
+        text,
         0.0,
         TextFormat {
             font_id: font.clone(),
@@ -158,24 +164,26 @@ pub fn tip_job(def: &ButtonDef) -> LayoutJob {
             ..Default::default()
         },
     );
-    job.append(
-        &format!("  ·  {}", def.accel_key().to_ascii_uppercase()),
-        0.0,
-        TextFormat {
-            font_id: font,
-            color: tokens::FG_70,
-            ..Default::default()
-        },
-    );
+    if let Some(key) = key {
+        job.append(
+            &format!("  ·  {}", key.to_ascii_uppercase()),
+            0.0,
+            TextFormat {
+                font_id: font,
+                color: tokens::FG_70,
+                ..Default::default()
+            },
+        );
+    }
     job
 }
 
 /// The tooltip chip at `rect`: the dark fill and the label centred in it.
 /// A plain painter call rather than a widget: the chip is never
 /// interactive and must not take the hover from the button under it.
-pub fn tip(painter: &egui::Painter, rect: egui::Rect, def: &ButtonDef) {
+pub fn tip(painter: &egui::Painter, rect: egui::Rect, job: LayoutJob) {
     painter.rect_filled(rect, tokens::TIP_RADIUS, tokens::TIP_FILL);
-    let galley = painter.layout_job(tip_job(def));
+    let galley = painter.layout_job(job);
     // Centred on the box, not the ink: a tip with a descender must not
     // sit higher than one without, and the chip is padded for the box.
     painter.galley(rect.center() - galley.size() / 2.0, galley, tokens::FG);

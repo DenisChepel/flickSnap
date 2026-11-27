@@ -8,7 +8,10 @@
 
 pub mod area;
 pub mod debug;
-pub mod hints;
+pub mod drawbar;
+pub mod loupe;
+pub mod marks;
+pub mod notice;
 pub mod ocr;
 pub mod panel;
 pub mod pill;
@@ -64,18 +67,8 @@ pub struct InputCtx<'a> {
     /// when it sits in a gap between monitors.
     pub cursor_index: Option<usize>,
     pub accent: Color32,
-    /// Title of the window under the cursor, for the rows that name it.
-    pub hovered_window_title: Option<&'a str>,
-    /// Name of the monitor under the cursor, likewise.
+    /// Name of the monitor under the cursor, for the hotkey panel.
     pub hovered_monitor_name: Option<&'a str>,
-    /// The desktop pixel under the cursor, sampled once per sync.
-    pub hovered_pixel_bgra: Option<[u8; 4]>,
-    /// The captured cursor image's rect in virtual-desktop physical px,
-    /// already `None` when the peek window covers it.
-    pub cursor_image_rect: Option<ScreenRectF>,
-    /// Whether the software cursor is drawn — already ANDed with "the
-    /// peek does not cover it".
-    pub cursor_overlay_visible: bool,
 }
 
 /// The accent colour, which the settings carry as floats, in the 8-bit
@@ -96,20 +89,20 @@ pub struct OverlayInputs {
     /// routing exactly as they did — but paints at opacity 0; every other
     /// overlay folds this into its own rule inside its `inputs` builder.
     pub overlays_visible: bool,
-    /// The hint comet's body and head colours ([`hints::trail::comet_colors`]).
-    pub comet: (Color32, Color32),
     /// The "W x H" pill on the host at the selection's top-left corner.
     pub area: Option<area::show::AreaInputs>,
     /// The Tips & Hotkeys panel, on the host holding the cursor.
     pub tips: Option<tips::show::TipsInputs>,
-    /// The floating hint chips and the dashed cursor square.
-    pub hints: hints::show::HintsInputs,
     /// The transient OCR notice pill, on the selection's own host.
-    pub notice: Option<hints::show::NoticeInputs>,
+    pub notice: Option<notice::show::NoticeInputs>,
     /// The scroll-pick reticle, on every host it reaches.
     pub scope: Option<scope::show::ScopeInputs>,
     /// The OCR sweep band and its text bubbles, on every host they reach.
     pub ocr: Option<ocr::show::OcrInputs>,
+    /// The marks drawn on the overlay, on every host.
+    pub marks: Option<marks::show::MarksInputs>,
+    /// Magnified screenshot pixels on the cursor's monitor.
+    pub loupe: Option<loupe::LoupeInputs>,
 }
 
 /// Draw one monitor's UI and report what the tray found under the pointer.
@@ -134,7 +127,26 @@ pub fn compose(ctx: &egui::Context, inputs: &HostInputs, monitor: UiMonitor) -> 
     let screen = ctx.viewport_rect();
     let mut out = PanelOutcome::default();
     if let Some(p) = &inputs.panel {
-        out = panel::show::show(ctx, p, monitor, o.overlays_visible);
+        let (tray, tray_px) = panel::show::show(ctx, p, monitor, o.overlays_visible);
+        out = tray;
+        // After the tray, so it can be kept clear of the box the tray
+        // was just given.
+        if let Some(d) = &inputs.drawbar {
+            out = out.merge(drawbar::show::show(
+                ctx,
+                d,
+                p.anchor,
+                p.accent,
+                tray_px,
+                monitor,
+                o.overlays_visible,
+            ));
+        }
+    }
+    // The marks first: they are the capture's content, and every piece
+    // of chrome below draws over them.
+    if let Some(x) = &o.marks {
+        marks::show::show(&painter, x, &monitor);
     }
     if let Some(x) = &o.ocr {
         ocr::show::show(ctx, &painter, x, &monitor);
@@ -153,9 +165,16 @@ pub fn compose(ctx: &egui::Context, inputs: &HostInputs, monitor: UiMonitor) -> 
     if let Some(x) = &o.area {
         area::show::show(&painter, x, screen);
     }
-    hints::show::show(ctx, &painter, &o.hints, o.notice.as_ref(), screen, o.comet);
+    if let Some(x) = &o.notice {
+        notice::show::show(ctx, &painter, x, screen);
+    }
     if let Some(x) = &o.tips {
         tips::show::show(&painter, x, screen);
+    }
+    if let Some(x) = &o.loupe {
+        if !out.over_tray && !out.over_palette {
+            loupe::show(&painter, x, screen);
+        }
     }
     if let Some(d) = &inputs.debug {
         debug::show::show(ctx, d);
@@ -245,6 +264,7 @@ mod tests {
         let monitor = monitor();
         let inputs = HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: None,
             overlays: OverlayInputs::default(),
@@ -279,6 +299,7 @@ mod tests {
                 set: PanelButtonSet::ScrollPick,
                 ..panel_inputs(monitor)
             }),
+            drawbar: None,
             debug: None,
             pointer: None,
             overlays: OverlayInputs {
@@ -334,6 +355,7 @@ mod tests {
         let p = panel_inputs(monitor);
         let inputs = HostInputs {
             panel: Some(p),
+            drawbar: None,
             debug: None,
             pointer: None,
             overlays: OverlayInputs {

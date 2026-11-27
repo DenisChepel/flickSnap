@@ -94,7 +94,7 @@ impl WorkerTimings {
             ("first_present", self.first_present.get()),
             ("first_render", self.first_render.get()),
             // Off the critical path, and printed last because that is where it
-            // actually lands on the clock: the UI painter and the peek pipeline
+            // actually lands on the clock: the UI painter and selection pipeline
             // are built on a side thread that the worker only joins after frame
             // 0, so this can be — and on a healthy run is — later than
             // `first_render` and often later than the overlay being on screen.
@@ -176,8 +176,7 @@ impl BackgroundGroup {
     /// per-worker marks are first-writer-wins, so the fleet-wide answer has
     /// to be a max here rather than a shared `set_once` — and it is the max
     /// that matters: the desktop is only fully covered once the slowest
-    /// display has presented. Workers that never presented (a dead worker,
-    /// which the show gate tolerates) are simply absent from the max.
+    /// display has presented. Workers that skipped frame 0 are absent.
     pub fn first_present(&self) -> Option<Duration> {
         self.workers
             .iter()

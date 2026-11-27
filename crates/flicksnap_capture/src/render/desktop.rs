@@ -3,12 +3,12 @@ use crate::gpu::overlay::OverlayUniforms;
 use crate::gxi;
 use crate::interaction::OcrState;
 use crate::ocr::anim;
-use flicksnap_shared::geometry::{screen_to_window, RectExt, ScreenPointF, ScreenRect};
+use flicksnap_shared::geometry::{RectExt, ScreenRect};
 
 /// Duration of the color to grayscale fade after the window first becomes
 /// visible — and of the OCR selection's own color→grayscale ramp, which
 /// deliberately reuses the same curve (see [`grayscale_fade`]).
-const FADE_DURATION_SECS: f32 = 0.3;
+pub(super) const FADE_DURATION_SECS: f32 = 0.3;
 
 /// The color→grayscale easing: quartic ease-out over
 /// [`FADE_DURATION_SECS`]. ONE function on purpose — the overlay's opening
@@ -25,18 +25,9 @@ pub(crate) struct SnapshotState {
     pub ubo: gxi::Buffer,
     pub bind_group: gxi::BindGroup,
     pub uniforms: WindowUniforms,
-    pub base_uv_offset_scale: [f32; 4],
-    /// The overlay passes' shared uniform buffer + per-shader bind
-    /// groups (crosshair.wgsl / selection.wgsl — one buffer, two
-    /// layouts). Written every frame alongside `ubo`.
+    /// The selection pass's uniform buffer and bind group (selection.wgsl).
+    /// Written every frame alongside `ubo`.
     pub overlay_ubo: gxi::Buffer,
-    /// The crosshair pass's peek-replication uniforms (see
-    /// `gpu::overlay::CrosshairPeekUniforms`): filled by the render loop
-    /// whenever a peek quad draws, zeroed otherwise.
-    /// Fallback crosshair bind group — peek textures are 1×1
-    /// placeholders. The render loop builds a peek-aware replacement in
-    /// the frames a peek quad actually draws.
-    pub crosshair_bind_group: gxi::BindGroup,
     pub selection_bind_group: gxi::BindGroup,
     pub overlay_uniforms: OverlayUniforms,
     /// Seeded once from `CycleParams`; never updated per frame.
@@ -54,14 +45,11 @@ pub(crate) struct SnapshotState {
 /// skipped entirely — the feature costs no GPU time at all.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct OverlayVisibility {
-    pub crosshair: bool,
     pub selection: bool,
 }
 
 pub(crate) struct FrameState {
     pub monitor_bounds: ScreenRect,
-    pub mouse_pos: ScreenPointF,
-    pub zoom: f32,
     pub selection: Option<ScreenRect>,
     /// Corner radius of `selection` in virtual-desktop px (0 = square).
     pub selection_radius: f32,
@@ -101,8 +89,6 @@ impl SnapshotState {
     ) -> OverlayVisibility {
         let FrameState {
             monitor_bounds,
-            mouse_pos,
-            zoom,
             selection,
             selection_radius,
             selection_dragging,
@@ -123,35 +109,9 @@ impl SnapshotState {
         self.uniforms.ocr_params = [ocr_dim.clamp(0.0, 1.0), 0.0, ocr_gray.clamp(0.0, 1.0), 0.0];
 
         // While overlays are hidden the desktop pass shows the plain
-        // (zoomed) desktop — no fade — and the selection/crosshair
-        // passes are skipped outright.
-        let live_region = self.uniforms.params[1] != 0.0;
-        let fade = if !overlays_visible {
-            0.0
-        } else if live_region {
-            1.0
-        } else {
-            grayscale_fade(elapsed)
-        };
+        // desktop — no fade — and the selection pass is skipped outright.
+        let fade = if overlays_visible { grayscale_fade(elapsed) } else { 0.0 };
         self.uniforms.params[0] = fade;
-
-        let local = screen_to_window(monitor_bounds, mouse_pos);
-        if zoom <= 1.0 {
-            self.uniforms.uv_offset_scale = self.base_uv_offset_scale;
-        } else {
-            let w = surface_size.0 as f32;
-            let h = surface_size.1 as f32;
-            let cu = local.x / w;
-            let cv = local.y / h;
-            let k = 1.0 - 1.0 / zoom;
-            let base = self.base_uv_offset_scale;
-            self.uniforms.uv_offset_scale = [
-                base[0] + base[2] * cu * k,
-                base[1] + base[3] * cv * k,
-                base[2] / zoom,
-                base[3] / zoom,
-            ];
-        }
 
         // A selection that has gone away takes its held period with it, so
         // the next one starts from the nominal pattern rather than
@@ -170,21 +130,16 @@ impl SnapshotState {
         // corner hides the pattern's seam.
         let handles = captured && !ocr_active;
 
-        // Selection rect in window-local physical pixels — through the
-        // zoom mapping, so it stays congruent with the UV path above.
-        // `None` while overlays are hidden: the desktop shows unfaded
-        // and no border draws.
+        // Selection rect in window-local physical pixels. `None` while
+        // overlays are hidden: the desktop shows unfaded and no border
+        // draws.
         let sel_local = if overlays_visible {
             selection.map(|sel| {
-                let cx = mouse_pos.x;
-                let cy = mouse_pos.y;
                 let sel_f = sel.to_f32();
-                let to_local = |vd_x: f32, vd_y: f32| -> (f32, f32) { ((vd_x - cx) * zoom + local.x, (vd_y - cy) * zoom + local.y) };
-                let (l, t) = to_local(sel_f.left(), sel_f.top());
-                let (r, b) = to_local(sel_f.right(), sel_f.bottom());
-                // The radius is a length in the same space as the rect, so
-                // it scales with the magnifier like the rect's edges do.
-                let radius_local = selection_radius.max(0.0) * zoom.max(1.0);
+                let origin = monitor_bounds.to_f32();
+                let (l, t) = (sel_f.left() - origin.left(), sel_f.top() - origin.top());
+                let (r, b) = (sel_f.right() - origin.left(), sel_f.bottom() - origin.top());
+                let radius_local = selection_radius.max(0.0);
                 // Dash period: snapped to the border's perimeter so the
                 // pattern wraps without a cut dash — but only when that
                 // seam is on screen to see, and never mid-drag (see
@@ -206,23 +161,22 @@ impl SnapshotState {
             .map(|(rect, _, _)| rect)
             .unwrap_or([0.0, 0.0, -1.0, -1.0]);
 
-        // The picker draws its own reticle at the live cursor. The
-        // snapshot's frozen cursor sits wherever the pointer happened to
-        // be when the screenshot was taken, so it reads as a second,
-        // stuck pointer right where the user is aiming — hide it for the
-        // duration whatever the M toggle says. Display only: the frozen
-        // cursor is not part of what the scroll driver captures, and the
-        // user's setting is untouched when they back out.
-        let show_frozen_cursor = cursor_overlay_visible && !scroll_pick_mode;
-        self.set_cursor_uniforms(cursor_textures, show_frozen_cursor, monitor_bounds, mouse_pos, zoom);
+        // The snapshot's frozen cursor sits wherever the pointer was when
+        // the screenshot was taken. While the user is still aiming — the
+        // live pointer picking a region, or the scroll picker's reticle —
+        // it reads as a second, stuck pointer right where they are
+        // looking, so it is shown only once a selection is made, as the
+        // preview of what the M toggle puts in the image. Display only:
+        // the image takes it or not by the M toggle alone, and the frozen
+        // cursor is not part of what the scroll driver captures.
+        let show_frozen_cursor = cursor_overlay_visible && captured && !scroll_pick_mode;
+        self.set_cursor_uniforms(cursor_textures, show_frozen_cursor, monitor_bounds);
         queue.write_buffer(&self.ubo, 0, bytemuck::bytes_of(&self.uniforms));
 
-        // ── Overlay passes (crosshair + selection border/handles) ──
+        // ── Selection pass (border + handles) ──
         let o = &mut self.overlay_uniforms;
         o.viewport = [surface_size.0 as f32, surface_size.1 as f32, self.dpi_scale, fade];
-        o.cursor = [local.x, local.y, 0.0, 0.0];
         o.accent_color = self.accent_color;
-        o.uv_offset_scale = self.uniforms.uv_offset_scale;
         if let Some((rect, radius, period)) = sel_local {
             o.selection_rect = rect;
             o.sel_params = [elapsed, period, radius, if handles { 1.0 } else { 0.0 }];
@@ -232,21 +186,11 @@ impl SnapshotState {
         queue.write_buffer(&self.overlay_ubo, 0, bytemuck::bytes_of(&self.overlay_uniforms));
 
         OverlayVisibility {
-            // Once the user has finalized a selection the OS cursor takes
-            // over and the rendered crosshair is suppressed entirely.
-            crosshair: !live_region && overlays_visible && !captured,
             selection: sel_local.is_some(),
         }
     }
 
-    fn set_cursor_uniforms(
-        &mut self,
-        cursor_textures: Option<&CursorTextures>,
-        visible: bool,
-        monitor_bounds: ScreenRect,
-        mouse_pos: ScreenPointF,
-        zoom: f32,
-    ) {
+    fn set_cursor_uniforms(&mut self, cursor_textures: Option<&CursorTextures>, visible: bool, monitor_bounds: ScreenRect) {
         let ct = match cursor_textures {
             Some(ct) if visible && ct.visible => ct,
             _ => {
@@ -261,14 +205,9 @@ impl SnapshotState {
         let vd_right = vd_left + ct.width as f32;
         let vd_bottom = vd_top + ct.height as f32;
 
-        let cx = mouse_pos.x;
-        let cy = mouse_pos.y;
-        let local_cursor = screen_to_window(monitor_bounds, mouse_pos);
-
-        let to_local = |vd_x: f32, vd_y: f32| -> (f32, f32) { ((vd_x - cx) * zoom + local_cursor.x, (vd_y - cy) * zoom + local_cursor.y) };
-
-        let (l, t) = to_local(vd_left, vd_top);
-        let (r, b) = to_local(vd_right, vd_bottom);
+        let origin = monitor_bounds.to_f32();
+        let (l, t) = (vd_left - origin.left(), vd_top - origin.top());
+        let (r, b) = (vd_right - origin.left(), vd_bottom - origin.top());
         self.uniforms.cursor_rect = [l, t, r, b];
         self.uniforms.cursor_params = [ct.cursor_type as f32, 0.0, 0.0, 0.0];
     }

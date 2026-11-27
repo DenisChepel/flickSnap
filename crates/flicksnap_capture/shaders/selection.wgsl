@@ -1,9 +1,8 @@
 // Selection overlay pass: the marching-ants border (square integer-slab
 // or rounded anti-aliased), the rounded selection's faded outside-the-
-// curve corners, and the resize handles. Drawn over the desktop and peek
-// passes and under the crosshair (see render/frame.rs), so neither of
-// those needs to know any of this geometry — the border and handles
-// simply paint over whatever is beneath them.
+// curve corners, and the resize handles. Drawn over the desktop pass (see
+// render/frame.rs), so it needs to know none of this geometry — the
+// border and handles simply paint over whatever is beneath them.
 //
 // Cost model: the vertex shader emits sixteen quads that cover only the
 // affected pixels — four border slabs, four corner patches (degenerate
@@ -12,24 +11,21 @@
 // own area instead of the whole monitor. The pass is skipped entirely
 // (no draw call) when there is no selection.
 //
-// Shared overlay uniforms — one buffer written per frame, bound by both
-// this pass and crosshair.wgsl (the struct must stay byte-identical in
-// both files and in `gpu::overlay::OverlayUniforms`):
+// Overlay uniforms — one buffer written per frame (the struct must stay
+// byte-identical to `gpu::overlay::OverlayUniforms`):
 //   viewport.xy       = surface size in physical px.
 //   viewport.z        = this monitor's DPI scale factor (1.0 = 100 %).
 //   viewport.w        = grayscale fade factor in [0, 1]; the border and
 //                       handles fade in with the overlay.
-//   cursor            = unused here (crosshair pass).
 //   accent_color      = RGBA color of the border dashes and the handles.
 //   selection_rect    = selection in window-local physical pixels:
-//                       x=left y=top z=right w=bottom (through the
-//                       magnifier zoom, CPU-side). Never empty — the
-//                       draw is skipped instead.
+//                       x=left y=top z=right w=bottom. The pass is
+//                       skipped for an empty selection.
 //   sel_params.x      = elapsed seconds; drives the marching-ants phase.
 //   sel_params.y      = dash period in physical px for this frame,
 //                       always > 0 (see render/desktop.rs dash_period).
-//   sel_params.z      = the selection's corner radius in window-local px
-//                       (through the zoom transform). 0 = square: the
+//   sel_params.z      = the selection's corner radius in window-local px.
+//                       0 = square: the
 //                       border takes the original pixel-exact integer-
 //                       slab path. > 0 only for a picked window, whose
 //                       OS corner radius it is; the border is then an
@@ -41,17 +37,11 @@
 //   sel_params.w      = 1.0 when the resize handles are visible
 //                       (captured, not picking a scroll point, OCR
 //                       idle — decided CPU-side), else 0.0.
-//   uv_offset_scale   = window px → desktop-texture UV mapping (zoom
-//                       folded in); used by the corner patches to
-//                       repaint the outside-the-curve corners with the
-//                       faded desktop.
 struct OverlayUniforms {
     viewport:        vec4<f32>,
-    cursor:          vec4<f32>,
     accent_color:    vec4<f32>,
     selection_rect:  vec4<f32>,
     sel_params:      vec4<f32>,
-    uv_offset_scale: vec4<f32>,
 };
 
 const PI: f32 = 3.14159265;
@@ -389,7 +379,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // regions: with dest = fill,
     //   final = mix(mix(fade_outside, fill, inside_a), dash, dash_w)
     // (Explicit-LOD sample: non-uniform control flow.)
-    let uv = u.uv_offset_scale.xy + (fpos / u.viewport.xy) * u.uv_offset_scale.zw;
+    let uv = fpos / u.viewport.xy;
     let base = textureSampleLevel(desktop_tex, desktop_samp, uv, 0.0).rgb;
     let outside = fade_outside(base, fade);
     let src = outside * (1.0 - dash_w) * (1.0 - inside_a) + dash.rgb * dash_w;

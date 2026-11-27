@@ -10,6 +10,8 @@
 //! Adding a new command = add a variant here + one arm in the app's
 //! command dispatcher.
 
+use crate::draw::DrawTool;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Upload the current selection.
@@ -50,9 +52,16 @@ pub enum Command {
     Copy,
     /// Save the selection to a file.
     Save,
-    /// Report the pixel color under the cursor to the shell (H in
-    /// crosshair mode, before a selection exists).
-    SelectColor,
+    /// Pick a drawing tool from the drawing strip, or put it down when it
+    /// is the one already picked.
+    DrawTool(DrawTool),
+    /// Open or close the drawing strip's colour popup.
+    DrawPalette,
+    /// Ink in this `draw::PALETTE` index from now on (a swatch in the
+    /// colour popup).
+    DrawColor(usize),
+    /// Take back the newest mark drawn on the selection.
+    DrawUndo,
     /// Reset the current selection (return to draw mode).
     Reset,
     /// Exit the capture tool.

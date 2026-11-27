@@ -248,12 +248,12 @@ pub struct ButtonGroup {
 /// How a button presents its def. Chosen once per run by `--panel-buttons`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ButtonStyle {
-    /// A 40 px square: the icon with the accelerator letter, dim, beside
+    /// A square tile: the icon with the accelerator letter, dim, beside
     /// it. No label, no underline.
     #[default]
     #[value(name = "key")]
     KeyHint,
-    /// A 48 px tall segment: the icon over the Title-case label with the
+    /// A taller segment: the icon over the Title-case label with the
     /// accelerator glyph underlined.
     Below,
 }
@@ -295,9 +295,6 @@ pub struct ButtonDef {
 ///   0: Upload — U   (0x55)
 ///   1: Share  — H   (0x48), underlined on the second char because every
 ///      other letter of Share is spoken for (S=Save, A/R/E=Edit, Reset).
-///      'h' is also the pre-capture color-sampler key, which does not
-///      collide: that branch only runs while nothing is captured, and the
-///      panel — and therefore this lookup — only exists once something is.
 ///   2: Scroll — L   (0x4C), underlined on the fifth char because
 ///      S, C and R already belong to Save, Copy and Reset
 ///   3: OCR    — O   (0x4F)
@@ -311,7 +308,7 @@ pub struct ButtonDef {
 ///   7: Copy   — C   (0x43)
 ///   8: Save   — S   (0x53)
 ///   9: Reset  — R   (0x52)
-///  10: Exit   — X   (0x58), underlined on the second char
+///  10: Exit   — I   (0x49), underlined on the third char
 const NORMAL_DEFS: &[ButtonDef] = &[
     ButtonDef {
         command: Command::Upload,
@@ -386,7 +383,7 @@ const NORMAL_DEFS: &[ButtonDef] = &[
     ButtonDef {
         command: Command::Exit,
         label: "Exit",
-        underline_idx: 1,
+        underline_idx: 2,
         icon: &super::assets::EXIT,
         tip: "Cancel and exit",
     },
@@ -412,7 +409,7 @@ const NORMAL_GROUPS: &[ButtonGroup] = &[
 /// The buttons shown once recognized text has been lifted off the
 /// selection: what to *do* with that text, plus the two ways out.
 ///
-/// The accelerators reuse `u`/`s`/`c`/`x` from the capture strip on
+/// The accelerators reuse `u`/`s`/`c`/`i` from the capture strip on
 /// purpose: only one set is ever on screen, and `lookup_command_by_key`
 /// is scoped to that set.
 const OCR_DEFS: &[ButtonDef] = &[
@@ -447,7 +444,7 @@ const OCR_DEFS: &[ButtonDef] = &[
     ButtonDef {
         command: Command::Exit,
         label: "Exit",
-        underline_idx: 1,
+        underline_idx: 2,
         icon: &super::assets::EXIT,
         tip: "Cancel and exit",
     },
@@ -507,7 +504,7 @@ const SCROLL_PICK_DEFS: &[ButtonDef] = &[
     ButtonDef {
         command: Command::Exit,
         label: "Exit",
-        underline_idx: 1,
+        underline_idx: 2,
         icon: &super::assets::EXIT,
         tip: "Cancel and exit",
     },
@@ -537,7 +534,7 @@ impl ButtonDef {
 /// Returns `None` if no visible button matches.
 ///
 /// Scoping to a set is not an optimization: the two sets deliberately
-/// reuse `u`, `s`, `c` and `x`, and a global search would let a key fire
+/// reuse `u`, `s`, `c` and `i`, and a global search would let a key fire
 /// a button that is not on screen. The caller must pass the set the user
 /// is actually looking at. `features` closes the same hole from the other
 /// direction — a switched-off button must not answer to its letter either.
@@ -601,7 +598,7 @@ mod tests {
     }
 
     /// The real path a mark takes on a host: through the installed loader,
-    /// at the pixel size a 20 pt icon asks for at that monitor's DPI. The
+    /// at the pixel size the icon cell asks for at that monitor's DPI. The
     /// texture must be allocated at exactly that many pixels, which is
     /// what keeps the tray crisp at 125-200 %.
     #[test]
@@ -637,7 +634,7 @@ mod tests {
     /// the keyboard while still rendering an underline that promises it
     /// works.
     ///
-    /// Uniqueness is per set. Cross-set reuse (`u`, `s`, `c`, `x` appear
+    /// Uniqueness is per set. Cross-set reuse (`u`, `s`, `c`, `i` appear
     /// in both) is intentional and safe because only one set is on
     /// screen at a time — `lookup_is_scoped_to_its_set` pins that.
     #[test]
@@ -711,7 +708,7 @@ mod tests {
                 ('c', Command::Copy),
                 ('s', Command::Save),
                 ('r', Command::Reset),
-                ('x', Command::Exit),
+                ('i', Command::Exit),
             ] {
                 assert_eq!(
                     lookup_command_by_key(PanelButtonSet::Normal, features, key),
@@ -945,7 +942,10 @@ mod tests {
             lookup_command_by_key(PanelButtonSet::Normal, all, 'l'),
             Some(Command::ScrollCapture)
         );
-        assert_eq!(lookup_command_by_key(PanelButtonSet::Normal, all, 'x'), Some(Command::Exit));
+        for set in [PanelButtonSet::Normal, PanelButtonSet::Ocr, PanelButtonSet::ScrollPick] {
+            assert_eq!(lookup_command_by_key(set, all, 'i'), Some(Command::Exit));
+            assert_eq!(lookup_command_by_key(set, all, 'x'), None);
+        }
         assert_eq!(lookup_command_by_key(PanelButtonSet::Ocr, all, 'b'), Some(Command::OcrBack));
     }
 

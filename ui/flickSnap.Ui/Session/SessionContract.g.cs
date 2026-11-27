@@ -7,7 +7,7 @@ namespace FlickSnap
     /// <summary>The session.json the Rust capture helpers write, every field set, for the contract test.</summary>
     internal static class SessionContract
     {
-        internal const string RustSample = """{"CreatedUtc":"2026-01-02T03:04:05Z","Name":"Screenshot","DesktopImgPath":"/sessions/1/desktop.png","PreviewImgPath":"/sessions/1/cropped.png","CursorImgPath":"/sessions/1/cursor.png","CursorPosition":{"X":11,"Y":12,"Width":32,"Height":32},"CroppedRect":{"X":-20,"Y":30,"Width":640,"Height":480},"OriginalBounds":{"X":-100,"Y":0,"Width":2560,"Height":1440},"CornerRadius":16.0}""";
+        internal const string RustSample = """{"CreatedUtc":"2026-01-02T03:04:05Z","Name":"Screenshot","DesktopImgPath":"/sessions/1/desktop.png","PreviewImgPath":"/sessions/1/cropped.png","CursorImgPath":"/sessions/1/cursor.png","CursorPosition":{"X":11,"Y":12,"Width":32,"Height":32},"CursorVisible":true,"CroppedRect":{"X":-20,"Y":30,"Width":640,"Height":480},"OriginalBounds":{"X":-100,"Y":0,"Width":2560,"Height":1440},"CornerRadius":16.0,"RoundedCornerMask":5}""";
 
         internal static readonly string[] RustFields =
         [
@@ -16,10 +16,12 @@ namespace FlickSnap
             "CroppedRect",
             "CursorImgPath",
             "CursorPosition",
+            "CursorVisible",
             "DesktopImgPath",
             "Name",
             "OriginalBounds",
             "PreviewImgPath",
+            "RoundedCornerMask",
         ];
     }
 }

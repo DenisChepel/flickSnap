@@ -1371,13 +1371,14 @@ namespace FlickSnap.UI
                     crop,
                     cursorFilePath: _session.CursorImgPath,
                     cursorPosition: cursor,
-                    cursorVisible: _settings.Capture.ScreenshotWithCursor);
+                    cursorVisible: _session.CursorVisible ?? _settings.Capture.ScreenshotWithCursor);
 
                 // a picked window's rounded corners: desktop.png is a plain bitmap, so the radius the
                 // capturer measured travels in session.json and the graphic rounds the crop itself
                 // (bitmap px — the graphic opens at 1:1, and the user can change it in the bar)
                 if (_session.CornerRadius > 0)
                     graphic.CornerRadius = _session.CornerRadius;
+                graphic.RoundedCornerMask = _session.RoundedCornerMask;
 
                 // add image
                 drawingCanvas.AddGraphic(graphic);

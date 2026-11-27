@@ -200,6 +200,12 @@ namespace FlickSnap
             set => Set(value);
         }
 
+        public bool? CursorVisible
+        {
+            get => Get<bool?>();
+            set => Set(value);
+        }
+
         public ScreenRect CroppedRect
         {
             get => Get<ScreenRect>();
@@ -222,6 +228,13 @@ namespace FlickSnap
         public double CornerRadius
         {
             get => Get<double>();
+            set => Set(value);
+        }
+
+        /// <summary>Bits for the top-left, top-right, bottom-left and bottom-right corners.</summary>
+        public byte? RoundedCornerMask
+        {
+            get => Get<byte?>();
             set => Set(value);
         }
 

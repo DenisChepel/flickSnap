@@ -138,11 +138,6 @@ pub const ALL_SHADERS: &[ShaderDef] = &[
         bindings: OVERLAY_BINDINGS,
     },
     ShaderDef {
-        name: "crosshair",
-        wgsl_path: "shaders/crosshair.wgsl",
-        bindings: OVERLAY_BINDINGS,
-    },
-    ShaderDef {
         name: "ui_egui",
         wgsl_path: "shaders/ui_egui.wgsl",
         bindings: EGUI_BINDINGS,

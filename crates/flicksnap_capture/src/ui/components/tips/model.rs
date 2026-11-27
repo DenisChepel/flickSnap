@@ -1,9 +1,8 @@
 //! Static content for the Tips & Hotkeys panel.
 //!
-//! Everything except the three runtime-populated strings (hovered
-//! window title, hovered monitor name, hovered pixel RGB) is declared
-//! here as compile-time constants. Layout math reads this table to
-//! measure the longest row and size the panel accordingly.
+//! The rows are static apart from the name of the monitor under the cursor.
+//! Layout math reads this table to measure the longest row and size the
+//! panel accordingly.
 
 /// The accent-colored title bar text.
 pub const TITLE: &str = "Tips & Hotkeys";
@@ -12,9 +11,7 @@ pub const TITLE: &str = "Tips & Hotkeys";
 /// description text, each in its own column (`DxScreenCapture.cpp:746-752`).
 pub struct TipRow {
     pub hotkey: &'static str,
-    /// `{window}` is substituted with `AppContext.hovered_window_title`,
-    /// `{monitor}` with `AppContext.hovered_monitor_name`. No substitution
-    /// for rows that don't contain a placeholder.
+    /// `{monitor}` is substituted with the name of the monitor under the cursor.
     pub description_template: &'static str,
 }
 
@@ -27,34 +24,19 @@ impl TipRow {
     }
 }
 
-/// The top block of body rows, above the color-sampler row.
-/// `DxScreenCapture.cpp:746-749`.
-pub const TIPS_TOP: &[TipRow] = &[
-    TipRow::new("-", "Scroll to zoom!"),
+/// The panel's rows, top to bottom.
+pub const TIPS: &[TipRow] = &[
     TipRow::new("F", "Select monitor {monitor}"),
     TipRow::new("A", "Select all monitors"),
-];
-
-/// The bottom block of body rows, below the color-sampler row.
-/// `DxScreenCapture.cpp:750,752`.
-pub const TIPS_BOTTOM: &[TipRow] = &[
     TipRow::new("M", "Toggle cursor in screenshot"),
+    TipRow::new("X", "Toggle magnifier"),
     TipRow::new("D", "Toggle debug stats"),
-    TipRow::new("T", "Cycle tips display"),
-    TipRow::new("Q", "Toggle cursor/crosshair"),
+    TipRow::new("T", "Show or hide this panel"),
+    TipRow::new("Q", "Hide or show the overlay"),
 ];
 
-/// Hotkey label for the color-sampler row. The description is computed
-/// from `AppContext.hovered_pixel_bgra` at bake time.
-pub const COLOR_ROW_HOTKEY: &str = "H";
-
-/// Fallback string when no window / monitor is under the cursor, matching
-/// `DxScreenCapture.cpp` which uses the string "n/a" in the same case.
+/// Fallback when no monitor is under the cursor.
 pub const FALLBACK: &str = "n/a";
-
-/// Max characters (inclusive) before the window title is truncated with an
-/// ellipsis. Keeps long titles from expanding the panel beyond `MIN_PANEL_WIDTH`.
-pub(crate) const WINDOW_TITLE_MAX: usize = 32;
 
 /// Max characters (inclusive) before the monitor name is truncated.
 pub(crate) const MONITOR_NAME_MAX: usize = 28;
@@ -76,10 +58,7 @@ pub(crate) fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
 
 /// Render the body of a single tip row (description only, without hotkey
 /// or gap) with runtime substitutions applied.
-pub fn render_description(template: &str, hovered_window: Option<&str>, hovered_monitor: Option<&str>) -> String {
-    let window = hovered_window.map(|s| truncate_ellipsis(s, WINDOW_TITLE_MAX));
+pub fn render_description(template: &str, hovered_monitor: Option<&str>) -> String {
     let monitor = hovered_monitor.map(|s| truncate_ellipsis(s, MONITOR_NAME_MAX));
-    template
-        .replace("{window}", window.as_deref().unwrap_or(FALLBACK))
-        .replace("{monitor}", monitor.as_deref().unwrap_or(FALLBACK))
+    template.replace("{monitor}", monitor.as_deref().unwrap_or(FALLBACK))
 }

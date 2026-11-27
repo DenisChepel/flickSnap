@@ -137,8 +137,10 @@ namespace FlickSnap.Drawing.Tests
             return (buffer[0], buffer[1], buffer[2], buffer[3]);
         }
 
-        [AvaloniaFact]
-        public void CornerRadius_ExportsTransparentCorners()
+        [AvaloniaTheory]
+        [InlineData(null)]
+        [InlineData(5)]
+        public void CornerRadius_ExportsTransparentCorners(int? mask)
         {
             var dir = Directory.CreateTempSubdirectory();
             try
@@ -148,7 +150,11 @@ namespace FlickSnap.Drawing.Tests
                 WriteSeamPng(imgPath, 60, 40, 30);
 
                 var canvas = new DrawingCanvas { Tool = ToolType.None };
-                var img = new GraphicImage(imgPath, new Rect(0, 0, 60, 40), default) { CornerRadius = 12 };
+                var img = new GraphicImage(imgPath, new Rect(0, 0, 60, 40), default)
+                {
+                    CornerRadius = 12,
+                    RoundedCornerMask = (byte?)mask
+                };
                 canvas.GraphicsList.Add(img);
 
                 using var bmp = canvas.GraphicsList.DrawGraphicsToBitmap(Brushes.Transparent);
@@ -156,9 +162,13 @@ namespace FlickSnap.Drawing.Tests
                 Assert.Equal(60, bmp.PixelSize.Width);
                 Assert.Equal(40, bmp.PixelSize.Height);
 
-                // the four corner pixels sit well outside a 12px arc → fully transparent
-                foreach (var (x, y) in new[] { (0, 0), (59, 0), (0, 39), (59, 39) })
-                    Assert.Equal(0, ExportPixel(bmp, x, y).A);
+                (int X, int Y)[] corners = [(0, 0), (59, 0), (0, 39), (59, 39)];
+                for (int i = 0; i < corners.Length; i++)
+                {
+                    var (x, y) = corners[i];
+                    int expectedAlpha = ((mask ?? 15) & (1 << i)) != 0 ? 0 : 255;
+                    Assert.Equal(expectedAlpha, ExportPixel(bmp, x, y).A);
+                }
 
                 // the straight edges between the arcs, and the interior, stay opaque
                 Assert.Equal(255, ExportPixel(bmp, 30, 0).A);

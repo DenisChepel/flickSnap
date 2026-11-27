@@ -1,7 +1,7 @@
 //! The Tips & Hotkeys panel, measured and painted by egui.
 //!
-//! The rule that decides which host draws it (the cursor's monitor, in
-//! the tips display mode, while nothing is captured), the pure layout the
+//! The rule that decides which host draws it (the cursor's monitor, while
+//! T has it up and nothing is captured), the pure layout the
 //! old `tips/layout.rs` held, and the painting. The layout is computed
 //! from galleys measured in the same pass rather than by an `egui::Area`,
 //! because the bottom-right/bottom-left corner rule needs the panel's own
@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use egui::{pos2, vec2, Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use egui::{pos2, vec2, Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect};
 
 use crate::ui::components::tips::model;
 use crate::ui::components::{InputCtx, Local};
@@ -20,18 +20,9 @@ use crate::ui::shared::UiMonitor;
 /// so the pass only has to measure and paint.
 #[derive(Clone, PartialEq)]
 pub struct TipsInputs {
-    /// The descriptions of the rows above the colour sampler. Their
-    /// hotkeys are static and come from [`model::TIPS_TOP`].
-    pub top: [String; model::TIPS_TOP.len()],
-    /// The descriptions of the four rows below it ([`model::TIPS_BOTTOM`]).
-    pub bottom: [String; model::TIPS_BOTTOM.len()],
-    /// `"#RRGGBB"`, or `"#------"` when there is no pixel under the cursor.
-    pub hex: String,
-    /// `"rgb(r, g, b)"`, or `None` in the same case — the second line of
-    /// the colour row is simply absent then, as it was before.
-    pub rgb: Option<String>,
-    /// The sampled pixel, or black.
-    pub swatch: Color32,
+    /// The rows' descriptions. Their hotkeys are static and come from
+    /// [`model::TIPS`].
+    pub rows: [String; model::TIPS.len()],
     /// The cursor in local points: the panel jumps to the other corner
     /// when it would otherwise sit under it.
     pub cursor: Pos2,
@@ -54,9 +45,7 @@ pub const MIN_PANEL_WIDTH: f32 = 400.0;
 pub const OPACITY: f32 = 0.70;
 /// The hard-edged drop shadow, black at the old 0.30.
 pub const SHADOW: Color32 = Color32::from_black_alpha(77);
-/// How far the description column sits right of the hotkey column: the
-/// 1.75 row heights the old monospace "<hotkey>   " prefix came to, which
-/// clears the widest hotkey ("W") with room to spare.
+/// Distance between the hotkey and description columns.
 pub const DESC_INDENT: f32 = ROW_H * 1.75;
 /// One body row's height — the old `body_row_height` of `font * 1.4`.
 pub const ROW_H: f32 = BODY_PT * 1.4;
@@ -68,30 +57,18 @@ pub const TITLE_H: f32 = TITLE_PT * 0.73;
 /// Whether this monitor draws the panel, and what it draws.
 ///
 /// The rule is the old `shared::tips_visibility`: the host holding the
-/// cursor shows it, in the tips display mode, while the overlays are on
-/// and nothing is captured, the mouse is up and the debug panels are down.
+/// cursor shows it, while T has it up, the overlays are on and nothing is
+/// captured, the mouse is up and the debug panels are down.
 pub fn inputs(index: usize, monitor: &UiMonitor, c: &InputCtx<'_>) -> Option<TipsInputs> {
     let i = c.input;
-    let shown = i.overlays_visible && !i.captured && !i.mouse_down && i.tips_mode.show_tips_panel() && !i.debug_visible;
+    let shown = i.overlays_visible && !i.captured && !i.mouse_down && i.tips_visible && !i.debug_visible;
     if !shown || c.cursor_index != Some(index) {
         return None;
     }
-    let row = |r: &model::TipRow| model::render_description(r.description_template, c.hovered_window_title, c.hovered_monitor_name);
-    let (hex, rgb, swatch) = match c.hovered_pixel_bgra {
-        Some([b, g, r, _]) => (
-            format!("#{r:02X}{g:02X}{b:02X}"),
-            Some(format!("rgb({r}, {g}, {b})")),
-            Color32::from_rgb(r, g, b),
-        ),
-        None => ("#------".to_owned(), None, Color32::BLACK),
-    };
+    let row = |r: &model::TipRow| model::render_description(r.description_template, c.hovered_monitor_name);
     let local = Local::of(monitor);
     Some(TipsInputs {
-        top: std::array::from_fn(|k| row(&model::TIPS_TOP[k])),
-        bottom: std::array::from_fn(|k| row(&model::TIPS_BOTTOM[k])),
-        hex,
-        rgb,
-        swatch,
+        rows: std::array::from_fn(|k| row(&model::TIPS[k])),
         cursor: local.pos(i.virtual_cursor.x, i.virtual_cursor.y),
         accent: c.accent,
     })
@@ -105,27 +82,17 @@ pub struct TipsLayout {
     pub title_bar: Rect,
     pub col_hotkey_x: f32,
     pub col_desc_x: f32,
-    pub top_block_y: f32,
-    pub color_row_y: f32,
-    pub bottom_block_y: f32,
-    pub swatch: Rect,
-    pub hex_pos: Pos2,
-    pub rgb_pos: Pos2,
+    pub rows_y: f32,
 }
 
 /// The old `tips::layout::compute_layout` with the DPI scaling gone: egui
 /// works in points and rounds to pixels itself.
 ///
-/// `longest_body` is the widest measured body row (the colour row
-/// included), measured from the description column, and `title_w` the
-/// measured title, both in points.
+/// `longest_body` is the widest measured body row, measured from the
+/// description column, and `title_w` the measured title, both in points.
 pub fn compute_layout(screen: Rect, cursor: Pos2, longest_body: f32, title_w: f32) -> TipsLayout {
     let panel_w = ((longest_body + DESC_INDENT).max(title_w) + 2.0 * PADDING).max(MIN_PANEL_WIDTH);
-    // Breathing room above and below the two-line colour row, so the
-    // swatch does not butt up against the text rows either side of it.
-    let gap = PADDING_HALF * 0.4;
-    let rows = model::TIPS_TOP.len() + model::TIPS_BOTTOM.len() + 2;
-    let body_h = ROW_H * rows as f32 + 2.0 * PADDING + 2.0 * gap;
+    let body_h = ROW_H * model::TIPS.len() as f32 + 2.0 * PADDING;
     let title_h = TITLE_H + PADDING;
     let panel_h = title_h + body_h;
 
@@ -140,22 +107,12 @@ pub fn compute_layout(screen: Rect, cursor: Pos2, longest_body: f32, title_w: f3
     };
     let panel = Rect::from_min_size(pos2(left, top), vec2(panel_w, panel_h));
 
-    let col_desc_x = PADDING + DESC_INDENT;
-    let top_block_y = title_h + PADDING;
-    let color_row_y = top_block_y + ROW_H * model::TIPS_TOP.len() as f32 + gap;
-    let bottom_block_y = color_row_y + ROW_H * 2.0 + gap;
-    let box_size = ROW_H * 2.0;
     TipsLayout {
         panel,
         title_bar: Rect::from_min_size(panel.min, vec2(panel_w, title_h)),
         col_hotkey_x: PADDING,
-        col_desc_x,
-        top_block_y,
-        color_row_y,
-        bottom_block_y,
-        swatch: Rect::from_min_size(panel.min + vec2(col_desc_x, color_row_y), Vec2::splat(box_size)),
-        hex_pos: panel.min + vec2(col_desc_x + box_size + PADDING_HALF, color_row_y),
-        rgb_pos: panel.min + vec2(col_desc_x + box_size + PADDING_HALF, color_row_y + ROW_H),
+        col_desc_x: PADDING + DESC_INDENT,
+        rows_y: title_h + PADDING,
     }
 }
 
@@ -166,30 +123,15 @@ pub fn show(p: &Painter, t: &TipsInputs, screen: Rect) {
         FontId::new(TITLE_PT, fonts::SEMIBOLD.clone()),
         Color32::WHITE,
     );
-    let rows: Vec<_> = t
-        .top
+    let rows: Vec<_> = t.rows.iter().map(|s| body(s)).collect();
+    let keys: Vec<_> = model::TIPS
         .iter()
-        .chain(t.bottom.iter())
-        .map(|s| body(s))
-        .collect();
-    let (hotkey, hex, rgb) = (body(model::COLOR_ROW_HOTKEY), body(&t.hex), t.rgb.as_deref().map(body));
-    let keys: Vec<_> = model::TIPS_TOP
-        .iter()
-        .chain(model::TIPS_BOTTOM.iter())
         .map(|r| body(r.hotkey))
         .collect();
-    // The colour row has to fit too: the swatch, its gap, and the wider of
-    // the two colour lines, all right of the description column.
-    let colour_row_w = ROW_H * 2.0
-        + PADDING_HALF
-        + hex
-            .size()
-            .x
-            .max(rgb.as_ref().map_or(0.0, |g| g.size().x));
     let longest = rows
         .iter()
         .map(|g| g.size().x)
-        .fold(colour_row_w, f32::max);
+        .fold(0.0, f32::max);
     let l = compute_layout(screen, t.cursor, longest, title.size().x);
 
     let pr = l.panel;
@@ -221,18 +163,8 @@ pub fn show(p: &Painter, t: &TipsInputs, screen: Rect) {
         p.galley(pos2(x, pr.top() + y), key.clone(), Color32::BLACK);
         p.galley(pos2(dx, pr.top() + y), desc.clone(), Color32::BLACK);
     };
-    for k in 0..model::TIPS_TOP.len() {
-        row(l.top_block_y + k as f32 * ROW_H, &keys[k], &rows[k]);
-    }
-    p.galley(pos2(x, pr.top() + l.color_row_y), hotkey, Color32::BLACK);
-    p.rect(l.swatch, 0u8, t.swatch, Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
-    p.galley(l.hex_pos, hex, Color32::BLACK);
-    if let Some(g) = rgb {
-        p.galley(l.rgb_pos, g, Color32::BLACK);
-    }
-    for k in 0..model::TIPS_BOTTOM.len() {
-        let idx = model::TIPS_TOP.len() + k;
-        row(l.bottom_block_y + k as f32 * ROW_H, &keys[idx], &rows[idx]);
+    for (k, (key, desc)) in keys.iter().zip(&rows).enumerate() {
+        row(l.rows_y + k as f32 * ROW_H, key, desc);
     }
 }
 
@@ -240,7 +172,6 @@ pub fn show(p: &Painter, t: &TipsInputs, screen: Rect) {
 mod tests {
     use super::*;
     use crate::interaction::InteractionState;
-    use crate::settings::TipsMode;
     use crate::ui::shared::monitor_index_at;
     use flicksnap_shared::geometry::{RectExt, ScreenPointF, ScreenRect};
 
@@ -271,19 +202,15 @@ mod tests {
             monitors,
             cursor_index: monitor_index_at(monitors, input.virtual_cursor),
             accent: Color32::RED,
-            hovered_window_title: Some("Notepad"),
             hovered_monitor_name: Some("DELL U2723"),
-            hovered_pixel_bgra: Some([0x10, 0x20, 0x30, 0xFF]),
-            cursor_image_rect: None,
-            cursor_overlay_visible: true,
         }
     }
 
-    /// A state with the tips panel up: the mode is the one thing the
-    /// neutral fixture does not already have.
+    /// A state with the tips panel up: the one thing the neutral fixture
+    /// does not already have.
     fn tips_state() -> InteractionState {
         let mut input = InteractionState::new();
-        input.tips_mode = TipsMode::Tips;
+        input.tips_visible = true;
         input.virtual_cursor = ScreenPointF::new(300.0, 300.0);
         input
     }
@@ -298,11 +225,10 @@ mod tests {
         assert_eq!(l.panel.bottom(), s.bottom() - SCREEN_MARGIN);
         assert!((l.title_bar.height() - (TITLE_H + PADDING)).abs() < 1e-3);
         assert_eq!(l.title_bar.width(), l.panel.width());
-        // The blocks run in reading order down the body, and the swatch
-        // sits on the colour row.
-        assert!(l.top_block_y < l.color_row_y && l.color_row_y < l.bottom_block_y);
-        assert!((l.swatch.top() - (l.panel.top() + l.color_row_y)).abs() < 1e-3);
-        assert!((l.rgb_pos.y - l.hex_pos.y - ROW_H).abs() < 1e-3);
+        // The rows start under the title bar and fill the body.
+        assert!((l.rows_y - (l.title_bar.height() + PADDING)).abs() < 1e-3);
+        let body = l.panel.height() - l.title_bar.height();
+        assert!((body - (ROW_H * model::TIPS.len() as f32 + 2.0 * PADDING)).abs() < 1e-3);
     }
 
     /// The cursor in the bottom-right corner zone sends the panel to the
@@ -354,10 +280,7 @@ mod tests {
 
         let shown = inputs(0, &m[0], &ctx(&input, &m)).expect("the cursor is on the primary");
         assert_eq!(shown.cursor, pos2(300.0, 300.0));
-        assert_eq!(shown.hex, "#302010");
-        assert_eq!(shown.rgb.as_deref(), Some("rgb(48, 32, 16)"));
-        assert_eq!(shown.swatch, Color32::from_rgb(0x30, 0x20, 0x10));
-        assert!(shown.top[1].contains("DELL U2723"), "{}", shown.top[1]);
+        assert!(shown.rows[0].contains("DELL U2723"), "{}", shown.rows[0]);
         assert!(inputs(1, &m[1], &ctx(&input, &m)).is_none(), "only the cursor's host draws it");
 
         input.mouse_down = true;
@@ -376,11 +299,9 @@ mod tests {
         assert!(inputs(0, &m[0], &ctx(&input, &m)).is_none(), "Q hides it");
         input.overlays_visible = true;
 
-        for mode in [TipsMode::Hints, TipsMode::Off] {
-            input.tips_mode = mode;
-            assert!(inputs(0, &m[0], &ctx(&input, &m)).is_none(), "{mode:?} has no tips panel");
-        }
-        input.tips_mode = TipsMode::Tips;
+        input.tips_visible = false;
+        assert!(inputs(0, &m[0], &ctx(&input, &m)).is_none(), "T put it away");
+        input.tips_visible = true;
 
         // On the 150 % neighbour the panel is that host's, and the cursor
         // arrives in its own points.
@@ -388,14 +309,5 @@ mod tests {
         assert!(inputs(0, &m[0], &ctx(&input, &m)).is_none());
         let far = inputs(1, &m[1], &ctx(&input, &m)).expect("the cursor moved to the neighbour");
         assert_eq!(far.cursor, pos2(400.0, 200.0));
-
-        // No pixel under the cursor: the placeholder hex and no rgb line.
-        input.virtual_cursor = ScreenPointF::new(300.0, 300.0);
-        let mut c = ctx(&input, &m);
-        c.hovered_pixel_bgra = None;
-        let blank = inputs(0, &m[0], &c).expect("still shown");
-        assert_eq!(blank.hex, "#------");
-        assert!(blank.rgb.is_none());
-        assert_eq!(blank.swatch, Color32::BLACK);
     }
 }

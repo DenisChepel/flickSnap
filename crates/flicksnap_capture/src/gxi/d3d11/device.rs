@@ -336,13 +336,8 @@ impl Device {
             .unwrap_or_else(|e| panic!("d3d11 texture '{}' ({}x{}): {e:#}", desc.label, desc.width, desc.height))
     }
 
-    /// Fallible variant of [`Device::create_texture_with_data`] for the
-    /// mid-render-loop, size-driven uploads (blurred desktop, peek):
-    /// those textures are optional cosmetics, and an `E_OUTOFMEMORY` on a
-    /// multi-4K desktop should be a logged skip, not a dead render worker
-    /// (this backend has no installed device error handler to catch it
-    /// otherwise). Size-mismatch asserts still panic — that is a
-    /// caller bug, not a runtime condition.
+    /// Fallible allocation and upload for textures sized at runtime.
+    /// The caller must supply enough pixels for the declared size.
     pub fn try_create_texture_with_data(&self, queue: &Queue, desc: &TextureDesc, data: &[u8]) -> Result<Texture> {
         let _ = queue; // the upload rides device creation; no context needed
         let expected = desc.format.bytes_per_pixel() as usize * desc.width as usize * desc.height as usize;
@@ -798,9 +793,7 @@ pub struct Texture {
 unsafe impl Send for Texture {}
 unsafe impl Sync for Texture {}
 
-/// A sampler. `Clone` is cheap (COM refcount) — the desktop snapshot
-/// keeps a clone of the shared sampler so the peek bind group can reuse
-/// it per frame.
+/// A D3D11 sampler state.
 #[derive(Clone)]
 pub struct Sampler {
     pub(super) raw: ID3D11SamplerState,

@@ -9,21 +9,17 @@
 //! `Dx12UseFrameLatencyWaitableObject::Wait`).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{ID3D11DepthStencilView, ID3D11RenderTargetView, ID3D11Texture2D, D3D11_VIEWPORT};
-use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget};
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput, IDXGISwapChain1, IDXGISwapChain2, DXGI_MWA_NO_ALT_ENTER, DXGI_SCALING_NONE, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIOutput, IDXGISwapChain1, IDXGISwapChain2, DXGI_MWA_NO_ALT_ENTER, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 use winit::window::Window;
@@ -53,7 +49,6 @@ pub struct Surface {
     /// destroys the window when the last `Arc` drops).
     _window: Arc<Window>,
     hwnd: isize,
-    transparent: bool,
     /// Set by `configure`; acquire/present need all of it.
     configured: Option<Configured>,
 }
@@ -77,7 +72,6 @@ struct Configured {
     device: Device,
     queue: Queue,
     swapchain: IDXGISwapChain1,
-    _composition: Option<(IDCompositionDevice, IDCompositionTarget)>,
     waitable: Waitable,
     /// `None` between a failed `ResizeBuffers` and the next successful
     /// reconfigure — acquire skips frames rather than draw into nothing.
@@ -97,36 +91,22 @@ impl Drop for Waitable {
     }
 }
 
+/// The device outlives the capture (`gpu::warm_devices`) while its
+/// swapchain does not: unbind everything this surface left on the
+/// context and flush, so the swapchain's buffers are really released
+/// before the next capture builds its own on the same device.
 impl Drop for Surface {
     fn drop(&mut self) {
-        if self.transparent {
-            if let Some(cfg) = self.configured.take() {
-                {
-                    let ctx = cfg.queue.lock();
-                    unsafe { ctx.0.ClearState() };
-                }
-                let queue = cfg.queue.clone();
-                drop(cfg);
-                unsafe { queue.lock().0.Flush() };
+        if let Some(cfg) = self.configured.take() {
+            {
+                let ctx = cfg.queue.lock();
+                unsafe { ctx.0.ClearState() };
             }
+            let queue = cfg.queue.clone();
+            drop(cfg);
+            unsafe { queue.lock().0.Flush() };
         }
     }
-}
-
-type CompositionSwapchain = (IDXGISwapChain1, Option<(IDCompositionDevice, IDCompositionTarget)>);
-
-unsafe fn composition_swapchain(device: &Device, hwnd: HWND, desc: &DXGI_SWAP_CHAIN_DESC1) -> Result<CompositionSwapchain> {
-    let swapchain = device
-        .factory()
-        .CreateSwapChainForComposition(device.raw(), desc, None::<&IDXGIOutput>)?;
-    let dxgi: IDXGIDevice = device.raw().cast()?;
-    let composition: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
-    let target = composition.CreateTargetForHwnd(hwnd, true)?;
-    let visual = composition.CreateVisual()?;
-    visual.SetContent(&swapchain)?;
-    target.SetRoot(&visual)?;
-    composition.Commit()?;
-    Ok((swapchain, Some((composition, target))))
 }
 
 impl Surface {
@@ -135,12 +115,7 @@ impl Surface {
     /// contract is main-thread — macOS requires it).
     ///
     /// `backdrop` is macOS-only and inert here.
-    pub fn create(
-        instance: &Instance,
-        window: Arc<Window>,
-        backdrop: Option<BackdropImage>,
-        transparent: bool,
-    ) -> Result<(Self, SurfaceViews)> {
+    pub fn create(instance: &Instance, window: Arc<Window>, backdrop: Option<BackdropImage>) -> Result<(Self, SurfaceViews)> {
         let _ = (instance, backdrop);
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let handle = window.window_handle()?;
@@ -152,7 +127,6 @@ impl Surface {
             Self {
                 _window: window,
                 hwnd,
-                transparent,
                 configured: None,
             },
             SurfaceViews::default(),
@@ -201,9 +175,7 @@ impl Surface {
                     cfg.height = height;
                     cfg.clear = clear;
                 }
-                // Leave `rtv` as None: acquire returns Skip until a later
-                // reconfigure succeeds, and a removed device is caught by
-                // acquire's device-removed check.
+                // Acquire reports the missing target as a render failure.
                 Err(e) => error!("d3d11 swapchain resize failed: {e}"),
             }
             return;
@@ -220,38 +192,21 @@ impl Surface {
             },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
-            Scaling: if self.transparent {
-                DXGI_SCALING_STRETCH
-            } else {
-                DXGI_SCALING_NONE
-            },
-            SwapEffect: if self.transparent {
-                DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
-            } else {
-                DXGI_SWAP_EFFECT_FLIP_DISCARD
-            },
-            AlphaMode: if self.transparent {
-                DXGI_ALPHA_MODE_PREMULTIPLIED
-            } else {
-                DXGI_ALPHA_MODE_IGNORE
-            },
+            Scaling: DXGI_SCALING_NONE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
         };
         let hwnd = HWND(self.hwnd as *mut core::ffi::c_void);
         // Panic on failure: a swapchain that
         // cannot be created at all leaves nothing to render to, and the
         // worker's fail path turns the panic into a counted failure.
-        let (swapchain, composition) = if self.transparent {
-            unsafe { composition_swapchain(device, hwnd, &desc) }.expect("create transparent composition swapchain")
-        } else {
-            let swapchain = unsafe {
-                device
-                    .factory()
-                    .CreateSwapChainForHwnd(device.raw(), hwnd, &desc, None, None::<&IDXGIOutput>)
-            }
-            .expect("CreateSwapChainForHwnd");
-            (swapchain, None)
-        };
+        let swapchain = unsafe {
+            device
+                .factory()
+                .CreateSwapChainForHwnd(device.raw(), hwnd, &desc, None, None::<&IDXGIOutput>)
+        }
+        .expect("CreateSwapChainForHwnd");
         // Alt+Enter must never flip a capture overlay to exclusive
         // fullscreen; ignore failure (purely defensive).
         let _ = unsafe {
@@ -271,7 +226,6 @@ impl Surface {
             device: device.clone(),
             queue: queue.clone(),
             swapchain,
-            _composition: composition,
             waitable,
             rtv,
             width,
@@ -301,25 +255,14 @@ impl Surface {
         // signal the waitable again, and mapping that to a 1 s timeout →
         // Skip loop would hide the loss from the render loop forever.
         if let Err(reason) = unsafe { cfg.device.raw().GetDeviceRemovedReason() } {
-            error!("d3d11 device removed (reason {reason}); reporting DeviceLost");
-            return AcquireResult::DeviceLost;
+            error!("d3d11 device removed (reason {reason})");
+            return AcquireResult::Failed;
         }
 
         let Some(rtv) = cfg.rtv.clone() else {
-            // Between a failed resize and the next reconfigure. Checked
-            // BEFORE the waitable wait: the latency semaphore is only
-            // replenished by presents retiring, so a successful wait
-            // followed by a Skip (no Present) would consume its one
-            // signal for good and wedge every later acquire on a 1 s
-            // timeout — even after a reconfigure restores the RTV.
-            //
-            // The sleep is the loop's pacing for this path: the render
-            // loop has no sleep of its own (its pacing normally comes
-            // from the waitable wait below), so an immediate Skip here
-            // would hot-spin a core — permanently, if `create_rtv` failed
-            // at startup and nothing ever reconfigures.
-            std::thread::sleep(Duration::from_millis(10));
-            return AcquireResult::Skip;
+            // This capture configures each window once. There is nothing
+            // to present when creating its render target failed.
+            return AcquireResult::Failed;
         };
 
         let t_wait = Instant::now();
@@ -327,12 +270,8 @@ impl Surface {
             WAIT_OBJECT_0 => {}
             WAIT_TIMEOUT => return AcquireResult::Skip,
             other => {
-                warn!("d3d11 frame-latency wait returned {other:?}; skipping frame");
-                // WAIT_FAILED returns instantly (e.g. an invalid waitable
-                // handle) — sleep so a permanently broken wait neither
-                // hot-spins the loop nor spams the warn above at loop rate.
-                std::thread::sleep(Duration::from_millis(10));
-                return AcquireResult::Skip;
+                error!("d3d11 frame-latency wait returned {other:?}");
+                return AcquireResult::Failed;
             }
         }
         let acquire_wait = t_wait.elapsed();

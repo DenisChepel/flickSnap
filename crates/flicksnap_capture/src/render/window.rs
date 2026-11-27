@@ -6,15 +6,15 @@ use std::thread::JoinHandle;
 use anyhow::Result;
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::capture_output::{save_to_file, ActionResult};
+use crate::capture_output::{save_to_file, ActionResult, Screenshot};
 use crate::gxi;
 use crate::render::protocol::{RenderMsg, WindowHandoff, WorkerInput};
 use crate::render::worker::WorkerSetup;
 use crate::settings::CapturerSettings;
-use crate::system::{CapturedCursor, CapturedDesktop};
+use crate::system::CapturedDesktop;
 use crate::telemetry::perf::{PerfSlot, PerfSnapshot};
 use crate::ui::shared::UiSharedState;
-use flicksnap_shared::geometry::{ScreenPointF, ScreenRect};
+use flicksnap_shared::geometry::ScreenRect;
 
 // ── WindowHandle ───────────────────────────────────────────────────
 
@@ -33,8 +33,6 @@ pub struct WindowHandle {
     perf_slot: PerfSlot,
     shown: Cell<bool>,
     #[cfg(target_os = "macos")]
-    live_region: bool,
-    #[cfg(target_os = "macos")]
     render_subview: Option<objc2::rc::Retained<objc2_app_kit::NSView>>,
     /// The frozen-desktop layer's host view, stacked *below*
     /// `render_subview`. Created unconditionally (even when the screenshot
@@ -51,17 +49,10 @@ impl WindowHandle {
         window: Arc<Window>,
         setup: WorkerSetup,
         instance: &gxi::Instance,
-        live_region: bool,
         #[cfg(target_os = "macos")] screenshot: Option<&CapturedDesktop>,
         #[cfg(not(target_os = "macos"))] _screenshot: Option<&CapturedDesktop>,
     ) -> Result<Self> {
-        apply_capture_window_tweaks(&window, live_region);
-
-        // Per-window winit cursor hide only; the *hardware* cursor hide is
-        // global (CGDisplay on macOS) and happens at capture-cycle start,
-        // not window creation.
-        #[cfg(not(windows))]
-        window.set_cursor_visible(live_region);
+        apply_capture_window_tweaks(&window);
 
         // `None` when the desktop capture is still in flight: the backdrop
         // layer is created empty and `install_backdrop` fills it once the
@@ -75,8 +66,7 @@ impl WindowHandle {
         // The backend builds the surface (macOS: including the backdrop +
         // render subviews the fields below keep driving) on this, the main
         // thread.
-        let (surface, views): (gxi::Surface, gxi::SurfaceViews) =
-            gxi::Surface::create(instance, window.clone(), screenshot_image, live_region)?;
+        let (surface, views): (gxi::Surface, gxi::SurfaceViews) = gxi::Surface::create(instance, window.clone(), screenshot_image)?;
         #[cfg(not(target_os = "macos"))]
         let _ = views;
 
@@ -95,8 +85,6 @@ impl WindowHandle {
             thread: Some(setup.thread),
             perf_slot: setup.perf_slot,
             shown: Cell::new(false),
-            #[cfg(target_os = "macos")]
-            live_region,
             #[cfg(target_os = "macos")]
             render_subview: views.render_view,
             #[cfg(target_os = "macos")]
@@ -156,11 +144,7 @@ impl WindowHandle {
             #[cfg(target_os = "macos")]
             show_window_without_focus(&self.window);
             #[cfg(target_os = "macos")]
-            if let Some(subview) = self
-                .render_subview
-                .as_ref()
-                .filter(|_| !self.live_region)
-            {
+            if let Some(subview) = self.render_subview.as_ref() {
                 if let Some(layer) = subview.layer() {
                     use objc2_foundation::{NSNumber, NSString};
                     use objc2_quartz_core::{kCAMediaTimingFunctionEaseOut, CABasicAnimation, CAMediaTiming, CAMediaTimingFunction};
@@ -233,30 +217,12 @@ impl WindowHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn save_to_file(
-        &self,
-        selection: ScreenRect,
-        corner_radius: f32,
-        buffer: &CapturedDesktop,
-        cursor: Option<&CapturedCursor>,
-        cursor_visible: bool,
-        settings: &CapturerSettings,
-    ) -> ActionResult {
-        save_to_file(selection, corner_radius, buffer, cursor, cursor_visible, settings, &self.window)
+    pub fn save_to_file(&self, screenshot: Screenshot<'_>, settings: &CapturerSettings) -> ActionResult {
+        save_to_file(screenshot, settings, &self.window)
     }
 
-    pub fn update_mouse_state(
-        &self,
-        pos: ScreenPointF,
-        zoom: f32,
-        selection: Option<ScreenRect>,
-        selection_radius: f32,
-        selection_dragging: bool,
-        captured: bool,
-    ) {
+    pub fn update_mouse_state(&self, selection: Option<ScreenRect>, selection_radius: f32, selection_dragging: bool, captured: bool) {
         let _ = self.tx.send(RenderMsg::MouseState {
-            pos,
-            zoom,
             selection,
             selection_radius,
             selection_dragging,
@@ -368,8 +334,7 @@ fn win32_hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
 /// SW_SHOWNOACTIVATE never raises, so on secondary monitors the overlay could
 /// otherwise stay below the current foreground window (e.g. a fullscreen app).
 /// Z-order raises are not subject to the foreground lock — only activation is.
-/// Release builds are additionally WS_EX_TOPMOST, which makes this belt-and-braces
-/// there, but it is the only raise debug builds get.
+/// The overlay is also topmost unless a debugger is attached to a debug build.
 #[cfg(windows)]
 fn raise_window_to_top(window: &Window) {
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE};
@@ -383,7 +348,7 @@ fn raise_window_to_top(window: &Window) {
 }
 
 #[cfg(windows)]
-fn apply_capture_window_tweaks(window: &Window, _live_region: bool) {
+fn apply_capture_window_tweaks(window: &Window) {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_TRANSITIONS_FORCEDISABLED};
 
     let Some(hwnd) = win32_hwnd(window) else {
@@ -398,7 +363,7 @@ fn apply_capture_window_tweaks(window: &Window, _live_region: bool) {
 }
 
 #[cfg(target_os = "macos")]
-fn apply_capture_window_tweaks(window: &Window, live_region: bool) {
+fn apply_capture_window_tweaks(window: &Window) {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     let Ok(handle) = window.window_handle() else {
@@ -421,13 +386,8 @@ fn apply_capture_window_tweaks(window: &Window, live_region: bool) {
         overlay::apply(&ns_window, OverlayFlags::OVERLAY);
         ns_window.setAnimationBehavior(NSWindowAnimationBehavior::None);
 
-        let background = if live_region {
-            NSColor::clearColor()
-        } else {
-            NSColor::blackColor()
-        };
-        ns_window.setBackgroundColor(Some(&background));
-        ns_window.setOpaque(!live_region);
+        ns_window.setBackgroundColor(Some(&NSColor::blackColor()));
+        ns_window.setOpaque(true);
     }
 }
 

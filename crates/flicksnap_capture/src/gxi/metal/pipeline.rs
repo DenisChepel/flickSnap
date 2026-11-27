@@ -45,13 +45,9 @@ impl Device {
     /// fallback (naga never runs on user machines), and MSL source the
     /// driver rejects can only mean a broken build or a drifted slot
     /// contract - never a legitimate runtime condition. Containment
-    /// depends on the call site: the desktop pipeline (worker Stage A)
-    /// panics with the fail guard armed and rides `ReadyGuard` →
-    /// `failed_count` → show gate → the shell's error dialog; the other
-    /// five pipelines (peek + the UI stack) are built on the deferred
-    /// builder thread, whose panic is absorbed in `render.rs` - that
-    /// monitor keeps a desktop-only overlay, no failure is counted, and
-    /// the only evidence is the log.
+    /// is handled by the render worker. A panic during desktop or deferred
+    /// pipeline creation ends the worker and its failure guard wakes the
+    /// capture loop so it can report the error.
     pub fn create_pipeline(&self, desc: &PipelineDesc) -> RenderPipeline {
         let src = shaders::source(desc.shader);
         let device = self.raw();
@@ -70,7 +66,7 @@ impl Device {
         rp_desc.setLabel(Some(&NSString::from_str(desc.label)));
         rp_desc.setVertexFunction(Some(&vs));
         rp_desc.setFragmentFunction(Some(&fs));
-        // `None` for the fullscreen-triangle passes (desktop, peek),
+        // `None` for the fullscreen-triangle passes,
         // which are driven by `[[vertex_id]]` alone.
         if let Some(v) = &desc.vertex {
             rp_desc.setVertexDescriptor(Some(&vertex_descriptor(v)));
@@ -85,7 +81,7 @@ impl Device {
         };
         attachment.setPixelFormat(SURFACE_FORMAT);
         match desc.blend {
-            // No blending (desktop and peek own every pixel).
+            // No blending.
             BlendMode::Replace => attachment.setBlendingEnabled(false),
             // Source-over with premultiplied source, both channels.
             BlendMode::PremultipliedAlpha => {

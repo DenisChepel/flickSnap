@@ -106,6 +106,9 @@ egui = { version = "0.37", default-features = false, features = ["bytemuck"] }
 # SVG rasterisation into egui textures (resvg under the hood) and live plots for the debug panel.
 egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
 egui_plot = "0.38"
+# Burns the capture overlay's drawn marks into the image it outputs. Already in the tree under
+# resvg (egui_extras' svg), so this adds no crate — only the version that one is on.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 arboard = "3.6"
 rfd = { version = "0.17", default-features = false }
 xdialog = "4.1"

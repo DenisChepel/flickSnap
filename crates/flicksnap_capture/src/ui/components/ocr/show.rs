@@ -483,11 +483,7 @@ mod tests {
             monitors,
             cursor_index: monitor_index_at(monitors, input.virtual_cursor),
             accent: Color32::RED,
-            hovered_window_title: None,
             hovered_monitor_name: None,
-            hovered_pixel_bgra: None,
-            cursor_image_rect: None,
-            cursor_overlay_visible: true,
         }
     }
 

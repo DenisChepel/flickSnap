@@ -1,4 +1,5 @@
 ﻿using System.Collections.Generic;
+using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
@@ -10,6 +11,7 @@ using Avalonia.Media.Imaging;
 using FlickSnap.Config;
 using FlickSnap.Drawing.Graphics;
 using FlickSnap.Interop.Testing;
+using FlickSnap.UI;
 using FlickSnap.UI.DrawOnScreen;
 using FlickSnap.UI.Helpers;
 using Xunit;
@@ -46,6 +48,57 @@ namespace FlickSnap.VideoSDK.Tests
             }
             finally
             {
+                DrawOnScreenSession.ActiveInstance?.ShutdownAsync();
+                SettingsRoot.Current = previousSettings;
+            }
+        }
+
+        [AvaloniaTheory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task Capture_preflight_blocks_opening_drawing_but_allows_closing_an_existing_session(bool drawFirst)
+        {
+            InteropTestGate.Require();
+            var previousSettings = SettingsRoot.Current;
+            SettingsRoot.Current = new SettingsRoot();
+            var permission = new TaskCompletionSource<bool>();
+            Task capture = null;
+            try
+            {
+                LoadDrawingToolbarResources();
+                if (drawFirst)
+                    DrawOnScreenSession.Toggle();
+                var drawing = DrawOnScreenSession.ActiveInstance;
+                Assert.Equal(drawFirst, drawing != null);
+
+                var page = new ScreenCapturePage();
+                capture = page.OpenAsync(CaptureMode.Region, RegionIntent.Capture, () => permission.Task);
+                Assert.True(ScreenCapturePage.IsCaptureOverlayOpen);
+                var duplicateEnteredPreflight = false;
+                await page.OpenAsync(CaptureMode.Region, RegionIntent.Capture, () =>
+                {
+                    duplicateEnteredPreflight = true;
+                    return Task.FromResult(false);
+                });
+                Assert.False(duplicateEnteredPreflight);
+
+                DrawOnScreenSession.Show();
+                DrawOnScreenSession.ToggleOnScreenshot();
+                Assert.Same(drawing, DrawOnScreenSession.ActiveInstance);
+                DrawOnScreenSession.Toggle();
+                Assert.Null(DrawOnScreenSession.ActiveInstance);
+
+                permission.SetResult(false);
+                await capture;
+                Assert.False(ScreenCapturePage.IsCaptureOverlayOpen);
+                DrawOnScreenSession.Toggle();
+                Assert.NotNull(DrawOnScreenSession.ActiveInstance);
+            }
+            finally
+            {
+                permission.TrySetResult(false);
+                if (capture != null)
+                    await capture;
                 DrawOnScreenSession.ActiveInstance?.ShutdownAsync();
                 SettingsRoot.Current = previousSettings;
             }

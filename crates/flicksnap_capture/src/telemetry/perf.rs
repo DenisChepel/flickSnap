@@ -179,8 +179,7 @@ pub struct PerfSnapshot {
 }
 
 /// Where a render worker publishes its latest [`PerfSnapshot`] for the app
-/// thread to poll. The app thread runs `ControlFlow::Poll`, so a slot needs
-/// no wake-up channel.
+/// thread to poll while the debug panel is visible.
 pub type PerfSlot = Arc<Mutex<Option<Arc<PerfSnapshot>>>>;
 
 /// Number of series the stats cache rotates through. One series is

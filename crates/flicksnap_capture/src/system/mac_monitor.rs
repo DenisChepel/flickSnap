@@ -11,6 +11,7 @@ use flicksnap_shared::geometry::{LogicalPoint, RectExt, ScreenRect};
 const FALLBACK_REFRESH_HZ: f32 = 60.0;
 
 struct RawMonitor {
+    display_id: u32,
     cg_x: f64,
     cg_y: f64,
     cg_w: f64,
@@ -41,6 +42,7 @@ pub fn all_monitors() -> Result<Vec<MonitorInfo>> {
         };
 
         raw.push(RawMonitor {
+            display_id: screen.id as u32,
             cg_x: f64::from(cg_bounds.min_x()),
             cg_y: f64::from(cg_bounds.min_y()),
             cg_w: f64::from(cg_bounds.width()),
@@ -59,16 +61,17 @@ pub fn all_monitors() -> Result<Vec<MonitorInfo>> {
     let origins = compute_physical_origins(&raw);
 
     let monitors = raw
-        .iter()
+        .into_iter()
         .zip(origins)
         .map(|(m, (px, py))| MonitorInfo {
             bounds: ScreenRect::from_xy_size(px, py, m.phys_w as i32, m.phys_h as i32),
             scale_factor: m.scale,
             is_primary: m.is_primary,
             refresh_hz: m.refresh_hz,
-            name: m.name.clone(),
+            name: m.name,
             adapter_id: None,
             logical_origin: LogicalPoint::new(m.cg_x, m.cg_y),
+            display_id: m.display_id,
         })
         .collect();
 

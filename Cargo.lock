@@ -1636,6 +1636,8 @@ dependencies = [
  "serde_json",
  "simplelog",
  "skrifa 0.44.0",
+ "tiny-skia",
+ "unicode-script",
  "windows",
  "winit",
  "xdialog",

@@ -47,9 +47,8 @@ pub struct Frame {
 /// `Surface::acquire` and `present` (the ui `prepare` calls sit in that
 /// window) unwinds through this drop. Releasing a command buffer whose
 /// render encoder was never ended trips a Metal assertion and aborts the
-/// process, which would defeat the crate's panic containment (the
-/// ReadyGuard/failed_count machinery the other backends unwind into), so
-/// end the encoding here before the fields drop.
+/// process before the worker's failure guard can run. End the encoding
+/// here before the fields drop.
 impl Drop for Frame {
     fn drop(&mut self) {
         if !self.presented {
@@ -202,7 +201,7 @@ impl Frame {
     /// (presentDrawable + commit); the `endEncoding` before it is
     /// encoding work, which the caller's own bracket around this call
     /// absorbs into its draw bucket, matching the other backends.
-    pub fn present(mut self, timings: Option<&GpuTimings>) -> Duration {
+    pub fn present(mut self, timings: Option<&GpuTimings>) -> Option<Duration> {
         self.encoder.endEncoding();
         // Disarm the drop guard: the encoder is ended for good.
         self.presented = true;
@@ -219,6 +218,6 @@ impl Frame {
         // shared memory this command buffer may still be reading. The
         // clone is a refcount bump (`Drop` types cannot move fields out).
         self.queue.store_submitted(self.cmd.clone());
-        elapsed
+        Some(elapsed)
     }
 }

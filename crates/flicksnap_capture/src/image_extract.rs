@@ -306,7 +306,6 @@ mod tests {
             width: 2,
             height: 2,
             bounds: ScreenRect::from_xy_size(10, 20, 2, 2),
-            monitors: Vec::new(),
             cursor: None,
         }
     }
@@ -322,17 +321,6 @@ mod tests {
         assert_eq!(rgba, vec![1, 2, 3, 255, 10, 20, 30, 255]);
     }
 
-    /// The BGRA peek compositor exists so OCR reads the composite the user
-    /// is looking at: byte order preserved (the pixels feed a Bgra8
-    /// SoftwareBitmap) and the clamped covered rect returned — the OCR
-    /// origin contract of `extract_selection_bgra`.
-    /// With a left overhang the extracted buffer starts at the CLAMPED
-    /// origin; compositing against the raw selection origin would paint the
-    /// peek `overhang` px too far right. Exercises the shared
-    /// `peek_overlap` placement through the BGRA path.
-    /// Same geometry through the RGBA path, which has to re-derive the
-    /// clamped origin itself (its extractor does not return a covered
-    /// rect).
     #[test]
     fn returns_none_when_selection_misses_buffer() {
         let desktop = desktop_2x2();
@@ -373,7 +361,6 @@ mod tests {
             width: 2,
             height: 2,
             bounds: ScreenRect::from_xy_size(-10, -20, 2, 2),
-            monitors: Vec::new(),
             cursor: None,
         };
         // Runs 2 px past the buffer's left and top edges.
@@ -402,7 +389,6 @@ mod tests {
             width: 4,
             height: 4,
             bounds: ScreenRect::from_xy_size(left, top, 4, 4),
-            monitors: Vec::new(),
             cursor: None,
         }
     }

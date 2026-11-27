@@ -335,13 +335,8 @@ namespace FlickSnap.Util
             {
                 ThrowIfDisposed();
 
-                if (_store.TryGetValue(propertyName, out var stor))
-                {
-                    if (stor == null)
-                        return default;
-                    if (stor.GetType().IsAssignableFrom(typeof(T)))
-                        return (T)stor;
-                }
+                if (_store.TryGetValue(propertyName, out var stored) && stored is T value)
+                    return value;
 
                 return default;
             }

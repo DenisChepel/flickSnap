@@ -18,7 +18,7 @@
 //!
 //! The strip's size is analytic — computed from the same numbers the
 //! widgets are laid out with — because placement needs it before the Area
-//! is positioned, and because each strip must be centred with its own
+//! is positioned, and because each strip must be placed with its own
 //! width for the set-swap guard's premise to hold. A test pins the
 //! analytic size against what egui actually lays out at every DPI.
 
@@ -80,23 +80,28 @@ fn tip_rect(axis: Axis, tray: Rect, button: Rect, chip: Vec2, screen: Rect) -> R
     rect.translate(vec2(dx, dy))
 }
 
-/// Run the hover clock for this pass and paint the chip once it has
-/// waited long enough. `hovered` is the button under the pointer (its id,
-/// rect and def), `None` when the pointer is on no button.
+/// The button under the pointer, as a strip hands it to [`show_tip`]: its
+/// id, its rect and what its chip says.
+pub type HoveredTip = (egui::Id, Rect, egui::text::LayoutJob);
+
+/// Run one strip's hover clock for this pass and paint its chip once it
+/// has waited long enough. `tip_id` names the strip's chip Area and the
+/// clock kept under it, so two strips never share a wait. `hovered` is the
+/// button under the pointer, `None` when the pointer is on no button.
 ///
 /// A new button restarts the wait unless a chip was on screen within the
 /// last `TIP_DELAY_SECS`: then it shows at once, so a pointer sliding
 /// along the strip — through the gap between two groups included — keeps
 /// its chip. Only a pause off every button as long as the wait itself
 /// brings the wait back.
-fn show_tip(ctx: &egui::Context, axis: Axis, tray: Rect, hovered: Option<(egui::Id, Rect, &'static ButtonDef)>, visible: bool) {
-    let key = egui::Id::unique(TIP_ID);
+pub fn show_tip(ctx: &egui::Context, tip_id: &'static str, axis: Axis, tray: Rect, hovered: Option<HoveredTip>, visible: bool) {
+    let key = egui::Id::unique(tip_id);
     let now = ctx.input(|i| i.time);
     let mut clock = ctx.data(|d| {
         d.get_temp::<TipClock>(key)
             .unwrap_or_default()
     });
-    let Some((button, rect, def)) = hovered else {
+    let Some((button, rect, job)) = hovered else {
         clock.button = None;
         ctx.data_mut(|d| d.insert_temp(key, clock));
         return;
@@ -116,7 +121,7 @@ fn show_tip(ctx: &egui::Context, axis: Axis, tray: Rect, hovered: Option<(egui::
     }
     clock.shown_at = Some(now);
     ctx.data_mut(|d| d.insert_temp(key, clock));
-    let text = ctx.fonts_mut(|f| f.layout_job(widgets::tip_job(def)));
+    let text = ctx.fonts_mut(|f| f.layout_job(job.clone()));
     // Whole points, so the chip's edges land where egui pins the Area.
     let chip = (text.size() + 2.0 * vec2(tokens::TIP_PAD_H, tokens::TIP_PAD_V)).ceil();
     let chip_rect = tip_rect(axis, tray, rect, chip, ctx.viewport_rect());
@@ -131,7 +136,7 @@ fn show_tip(ctx: &egui::Context, axis: Axis, tray: Rect, hovered: Option<(egui::
                 ui.set_opacity(0.0);
             }
             let (r, _) = ui.allocate_exact_size(chip, egui::Sense::hover());
-            widgets::tip(ui.painter(), r, def);
+            widgets::tip(ui.painter(), r, job);
         });
 }
 
@@ -396,12 +401,12 @@ fn measure_and_place(
     ctx: &egui::Context,
     p: &PanelInputs,
     monitor: UiMonitor,
-) -> (StripMetrics, f32, place::Side, flicksnap_shared::geometry::ScreenRect) {
+) -> (StripMetrics, f32, place::Side, flicksnap_shared::geometry::ScreenRect, f32) {
     let ppp = monitor.dpi_scale.max(0.1);
     let lock = p.set.axis_lock();
     let col_inner = col_inner_for(ctx, p, p.set);
     let m = StripMetrics::measure(ctx, p.set, p.features, p.style, p.word_count);
-    let fit = if PanelButtonSet::UNION.contains(&p.set) {
+    let mut fit = if PanelButtonSet::UNION.contains(&p.set) {
         let reserved = union_fit(ctx, p, ppp);
         // Keep the orientation stable across strip swaps when possible. On a
         // small monitor, a strip with fewer buttons might still fit on its own.
@@ -416,10 +421,34 @@ fn measure_and_place(
     } else {
         footprint(&m, col_inner, ppp)
     };
+    let row_scale = fit.scale_on(Axis::Row, monitor.bounds);
+    let col_scale = fit.scale_on(Axis::Column, monitor.bounds);
+    let (axis, scale) = match lock {
+        Some(Axis::Row) => (Axis::Row, row_scale),
+        Some(Axis::Column) => (Axis::Column, col_scale),
+        None if col_scale > row_scale => (Axis::Column, col_scale),
+        None => (Axis::Row, row_scale),
+    };
+    let (lock, scale) = if scale < 1.0 {
+        // Leave a physical pixel for the difference between logical layout
+        // and the rounded footprint used to choose the orientation.
+        let scale = scale
+            * (1.0
+                - 1.0
+                    / monitor
+                        .bounds
+                        .width()
+                        .min(monitor.bounds.height())
+                        .max(2) as f32);
+        fit = footprint(&m, col_inner, ppp * scale);
+        (Some(axis), scale)
+    } else {
+        (lock, scale)
+    };
     let (side, rect_px) = place::place(p.anchor, monitor.bounds, fit, Near::at_dpi(ppp), lock, |axis| {
-        outer_px(m.content_size(axis, col_inner), ppp)
+        outer_px(m.content_size(axis, col_inner), ppp * scale)
     });
-    (m, col_inner, side, rect_px)
+    (m, col_inner, side, rect_px, scale)
 }
 
 /// How a button says what it is. One per strip: the capture strip is
@@ -603,20 +632,27 @@ fn single_strip(
     }
 }
 
-/// Build the tray for one monitor and report what the pointer found.
-/// Called inside a host's run closure, so text measurement is legal here.
+/// Build the tray for one monitor and report what the pointer found, with
+/// the box it was placed at in physical pixels — what the drawing strip
+/// keeps clear of. Called inside a host's run closure, so text measurement
+/// is legal here.
 ///
 /// `visible` is the Q toggle. A hidden tray is still laid out, still
 /// hit-tested and still clicked — that is the overlay's long-standing
 /// behaviour — it simply paints nothing: at opacity 0 every shape the
 /// painter is handed becomes a `Shape::Noop`, while the widget rects and
 /// the hover animation carry on as they are.
-pub fn show(ctx: &egui::Context, p: &PanelInputs, monitor: UiMonitor, visible: bool) -> PanelOutcome {
+pub fn show(
+    ctx: &egui::Context,
+    p: &PanelInputs,
+    monitor: UiMonitor,
+    visible: bool,
+) -> (PanelOutcome, flicksnap_shared::geometry::ScreenRect) {
     // Ahead of any measurement: a mark that cannot be rasterised is logged
     // here rather than drawn as egui's placeholder glyph.
     assets::preload(ctx);
     let ppp = monitor.dpi_scale.max(0.1);
-    let (m, col_inner, side, rect_px) = measure_and_place(ctx, p, monitor);
+    let (m, col_inner, side, rect_px, scale) = measure_and_place(ctx, p, monitor);
     let axis = side.axis();
     let local = egui::pos2(
         (rect_px.left() - monitor.bounds.left()) as f32 / ppp,
@@ -625,16 +661,7 @@ pub fn show(ctx: &egui::Context, p: &PanelInputs, monitor: UiMonitor, visible: b
 
     let mut out = PanelOutcome::default();
     let mut hovered: Option<(egui::Id, Rect, &'static ButtonDef)> = None;
-    let area = egui::Area::new(egui::Id::unique(PANEL_ID))
-        .order(egui::Order::Foreground)
-        .fixed_pos(local)
-        // Never `constrain`: egui's symmetric clamp would override the
-        // tail-wins rule `place` just applied.
-        .constrain(false)
-        .fade_in(false)
-        .interactable(true)
-        // The dead chassis swallows clicks, as the C# strips do.
-        .sense(egui::Sense::CLICK);
+    let (area, transform) = theme::tray_area(ctx, PANEL_ID, local, scale);
     let inner = area.show(ctx, |ui| {
         if !visible {
             ui.set_opacity(0.0);
@@ -648,8 +675,9 @@ pub fn show(ctx: &egui::Context, p: &PanelInputs, monitor: UiMonitor, visible: b
     out.over_tray = inner.response.contains_pointer();
     // Only a presentation that wants a chip registers a hovered button,
     // so a `below` strip never raises one.
-    show_tip(ctx, axis, inner.response.rect, hovered, visible);
-    out
+    let hovered = hovered.map(|(id, rect, def)| (id, transform * rect, widgets::tip_job(def)));
+    show_tip(ctx, TIP_ID, axis, transform * inner.response.rect, hovered, visible);
+    (out, rect_px)
 }
 
 #[cfg(test)]
@@ -774,13 +802,12 @@ mod tests {
                 let monitor = self.monitor;
                 let mut out = PanelOutcome::default();
                 let full = self.ctx.run_ui(raw, |ui| {
-                    out = show(ui.ctx(), p, monitor, true);
+                    out = show(ui.ctx(), p, monitor, true).0;
                 });
                 full.drop_without_applying_deltas();
                 acc = PanelOutcome {
                     clicked: acc.clicked.or(out.clicked),
-                    over_button: out.over_button,
-                    over_tray: out.over_tray,
+                    ..out
                 };
             }
             acc
@@ -790,6 +817,14 @@ mod tests {
             self.ctx
                 .memory(|m| m.area_rect(egui::Id::unique(PANEL_ID)))
                 .expect("the tray has an area rect after a run")
+        }
+
+        fn global_area_rect(&self) -> Rect {
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(PANEL_ID));
+            self.ctx
+                .layer_transform_to_global(layer)
+                .unwrap_or_default()
+                * self.area_rect()
         }
 
         fn interactive_rects(&self) -> Vec<Rect> {
@@ -803,7 +838,7 @@ mod tests {
             let mut got = None;
             let raw = self.raw_input(None, &[]);
             let full = self.ctx.run_ui(raw, |ui| {
-                let (_, _, side, rect) = measure_and_place(ui.ctx(), p, monitor);
+                let (_, _, side, rect, _) = measure_and_place(ui.ctx(), p, monitor);
                 got = Some((side, rect));
             });
             full.drop_without_applying_deltas();
@@ -828,7 +863,7 @@ mod tests {
             upload: false,
             ..PanelFeatures::ALL
         };
-        for (w, h, features) in [(900, 1600, PanelFeatures::ALL), (600, 950, no_upload)] {
+        for (w, h, features) in [(700, 1600, PanelFeatures::ALL), (600, 950, no_upload)] {
             let bounds = rect(0, 0, w, h);
             let mon = monitor(bounds, 2.0);
             let mut harness = Harness::new(mon);
@@ -1065,10 +1100,12 @@ mod tests {
     }
 
     /// The single-strip sets keep the one-row chassis the `key` and
-    /// `below` styles size: 40 + 2 x 4 and 48 + 2 x 4.
+    /// `below` styles size: a key tile, or a `below` button, plus the
+    /// tray's padding on either side.
     #[test]
-    fn frame_is_48_tall_in_key_style_and_56_in_below_at_100_percent() {
-        for (style, height) in [(ButtonStyle::KeyHint, 48.0), (ButtonStyle::Below, 56.0)] {
+    fn frame_is_one_button_tall_plus_the_padding_in_either_style() {
+        for (style, button) in [(ButtonStyle::KeyHint, tokens::KEY_TILE), (ButtonStyle::Below, tokens::BELOW_HEIGHT)] {
+            let height = button + 2.0 * tokens::PAD;
             let mon = hd(1.0);
             let mut h = Harness::new(mon);
             let p = inputs(PanelButtonSet::Ocr, PanelFeatures::ALL, style, row_selection(), mon);
@@ -1092,10 +1129,38 @@ mod tests {
         rects
     }
 
-    /// A selection hugging the bottom of a tall monitor: every union set
-    /// answers it with a column.
+    #[test]
+    fn the_capture_buttons_stay_clickable_when_neither_orientation_fits() {
+        let bounds = rect(0, 0, 720, 300);
+        let mon = monitor(bounds, 4.0);
+        let mut h = Harness::new(mon);
+        let p = inputs(PanelButtonSet::Normal, PanelFeatures::ALL, ButtonStyle::KeyHint, bounds, mon);
+        h.run(&p, None);
+
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(PANEL_ID));
+        let transform = h
+            .ctx
+            .layer_transform_to_global(layer)
+            .expect("the tray was scaled");
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(180.0, 75.0));
+        assert!(viewport.contains_rect(transform * h.area_rect()));
+        let buttons = capture_buttons(&h, Axis::Row);
+        let commands: Vec<_> = p
+            .set
+            .visible_defs(p.features)
+            .map(|(_, d)| d.command)
+            .collect();
+        assert_eq!(buttons.len(), commands.len());
+        for (button, command) in buttons.iter().zip(commands) {
+            assert_eq!(h.press(&p, button.center()).clicked, Some(command));
+        }
+    }
+
+    /// A monitor too narrow for any set's row: every union set answers it
+    /// with a column, tucked inside the selection — the one place the tray
+    /// ever stands on its end.
     fn column_case() -> (UiMonitor, ScreenRect) {
-        (monitor(rect(0, 0, 1920, 1300), 1.0), rect(100, 300, 400, 998))
+        (monitor(rect(0, 0, 300, 1300), 1.0), rect(20, 100, 260, 1000))
     }
 
     /// The air the rule takes between the two runs, gaps included.
@@ -1266,12 +1331,9 @@ mod tests {
 
     #[test]
     fn area_rect_equals_the_analytic_strip() {
-        // A row anchor and a column anchor: a selection hugging the bottom
-        // of a tall monitor forces the column for either set.
-        let cases: [(UiMonitor, ScreenRect); 2] = [
-            (hd(1.0), row_selection()),
-            (monitor(rect(0, 0, 1920, 1300), 1.0), rect(100, 300, 400, 998)),
-        ];
+        // A row anchor and a column anchor: a monitor too narrow for the
+        // row forces the column for either set.
+        let cases: [(UiMonitor, ScreenRect); 2] = [(hd(1.0), row_selection()), column_case()];
         for &style in &[ButtonStyle::KeyHint, ButtonStyle::Below] {
             for &set in PanelButtonSet::ALL {
                 for (mon, sel) in cases {
@@ -1281,7 +1343,7 @@ mod tests {
                         let p = inputs(set, PanelFeatures::ALL, style, sel, mon);
                         h.run(&p, None);
                         let (_, expected) = h.analytic(&p);
-                        let area = h.area_rect();
+                        let area = h.global_area_rect();
                         let tol = 1.0 / dpi + 1e-3;
                         assert!(
                             (area.width() - expected.width() as f32 / dpi).abs() <= tol
@@ -1316,23 +1378,23 @@ mod tests {
             mon,
         );
         h.run(&low, None);
-        assert_eq!(h.analytic(&low).0.axis(), Axis::Column);
+        assert_eq!(h.analytic(&low).0, place::Side::Above);
     }
 
+    /// Every set's row ends at the selection's right edge, so a swap to a
+    /// strip of another width keeps the tray's right end where it was.
     #[test]
-    fn swap_recentres_with_the_new_width() {
+    fn every_set_ends_at_the_selections_right_edge() {
         for dpi in DPIS {
             let mon = hd(dpi);
-            let centres: Vec<f32> = PanelButtonSet::ALL
-                .iter()
-                .map(|&set| {
-                    let mut h = Harness::new(mon);
-                    let p = inputs(set, PanelFeatures::ALL, ButtonStyle::KeyHint, row_selection(), mon);
-                    h.run(&p, None);
-                    h.area_rect().center().x
-                })
-                .collect();
-            assert!((centres[0] - centres[1]).abs() <= 1.0 / dpi, "at {dpi}: {centres:?}");
+            for &set in PanelButtonSet::ALL {
+                let mut h = Harness::new(mon);
+                let p = inputs(set, PanelFeatures::ALL, ButtonStyle::KeyHint, row_selection(), mon);
+                h.run(&p, None);
+                let right = row_selection().right() as f32 / dpi;
+                let tray = h.area_rect();
+                assert!((tray.right() - right).abs() <= 1.0 / dpi, "{set:?} at {dpi}: {tray:?}");
+            }
         }
     }
 
@@ -1380,8 +1442,7 @@ mod tests {
     /// is the one every other set answers with a column.
     #[test]
     fn the_scroll_pick_strip_is_always_a_row() {
-        let mon = monitor(rect(0, 0, 1920, 1300), 1.0);
-        let sel = rect(100, 300, 400, 998);
+        let (mon, sel) = column_case();
         for &set in PanelButtonSet::ALL {
             let mut h = Harness::new(mon);
             let p = inputs(set, PanelFeatures::ALL, ButtonStyle::Below, sel, mon);
@@ -1401,8 +1462,7 @@ mod tests {
     /// tray under a different part of the selection.
     #[test]
     fn column_width_is_fixed_per_set_under_every_switch_combination() {
-        let mon = monitor(rect(0, 0, 1920, 1300), 1.0);
-        let sel = rect(100, 300, 400, 998);
+        let (mon, sel) = column_case();
         for &set in PanelButtonSet::UNION {
             let mut widths = Vec::new();
             for features in FEATURE_COMBINATIONS {

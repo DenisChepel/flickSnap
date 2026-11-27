@@ -16,6 +16,29 @@ use egui::{Color32, FontFamily, FontId, Margin, Shadow, TextStyle};
 
 use super::model::GroupTone;
 
+pub(crate) fn tray_area(ctx: &egui::Context, id: &str, origin: egui::Pos2, scale: f32) -> (egui::Area, egui::emath::TSTransform) {
+    let transform = egui::emath::TSTransform {
+        scaling: scale,
+        translation: origin.to_vec2() * (1.0 - scale),
+    };
+    let mut area = egui::Area::new(egui::Id::unique(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(origin)
+        .fade_in(false)
+        .sense(egui::Sense::CLICK);
+    if scale < 1.0 {
+        area = area.constrain_to(transform.inverse() * ctx.viewport_rect());
+    }
+    ctx.set_transform_layer(area.layer(), transform);
+    (area.constrain(false), transform)
+}
+
+pub(crate) fn fit_scale(size: egui::Vec2, available: egui::Vec2) -> f32 {
+    (available.x / size.x)
+        .min(available.y / size.y)
+        .min(1.0)
+}
+
 pub mod tokens {
     use egui::{vec2, Color32, CornerRadius, Shadow, Stroke, Vec2};
     use flicksnap_shared::contract::{tray as shared, Rgb};
@@ -23,6 +46,23 @@ pub mod tokens {
     /// A shared `0x00RRGGBB` token as an opaque egui colour.
     const fn rgb(c: Rgb) -> Color32 {
         Color32::from_rgb((c.0 >> 16) as u8, (c.0 >> 8) as u8, c.0 as u8)
+    }
+
+    /// How big the overlay's strips — the action tray, the drawing strip
+    /// and its colour popup — are drawn against the shared tray design
+    /// (`flicksnap_shared::contract::tray`, which the C# strips are drawn
+    /// at unscaled). Every length and font size inside a strip is the
+    /// design's times this; hairlines stay one point, and what lies between
+    /// a strip and anything else — the gap to the selection, the hover
+    /// chips — is not scaled.
+    pub const SCALE: f32 = 0.8;
+
+    /// `v` at [`SCALE`], to the nearest whole point. For every length a
+    /// strip is laid out with: egui frames take whole-point margins and
+    /// radii, and whole-point boxes keep the tiles' edges on the pixel
+    /// grid at 100 %.
+    pub const fn scaled(v: f32) -> f32 {
+        (v * SCALE + 0.5) as i32 as f32
     }
 
     /// Premultiplied white at `a`: `Color32::from_white_alpha` is not a
@@ -44,38 +84,38 @@ pub mod tokens {
         width: 1.0,
         color: rgb(shared::RING_EGUI),
     };
-    /// `ShadowCompact`: `0 3 10 #59000000`.
+    /// `ShadowCompact` (`0 3 10 #59000000`) at [`SCALE`].
     pub const SHADOW: Shadow = Shadow {
-        offset: [0, shared::SHADOW_OFFSET_Y as i8],
-        blur: shared::SHADOW_BLUR as u8,
+        offset: [0, scaled(shared::SHADOW_OFFSET_Y) as i8],
+        blur: scaled(shared::SHADOW_BLUR) as u8,
         spread: 0,
         color: Color32::from_black_alpha(shared::SHADOW_ALPHA as u8),
     };
     /// Corner radius of the chassis and of every item box.
-    pub const RADIUS: CornerRadius = CornerRadius::same(shared::RADIUS as u8);
+    pub const RADIUS: CornerRadius = CornerRadius::same(scaled(shared::RADIUS) as u8);
     /// Inset from the tray edge to its first item. The ring is part of the
     /// frame's margin, so `tray_frame` subtracts its width from this.
-    pub const PAD: f32 = shared::TRAY_PAD;
+    pub const PAD: f32 = scaled(shared::TRAY_PAD);
     /// Between items inside the tray.
-    pub const GAP: f32 = shared::GAP;
+    pub const GAP: f32 = scaled(shared::GAP);
     /// A button is never shorter than this along a row.
-    pub const BUTTON_MIN_LENGTH: f32 = shared::BUTTON_MIN_WIDTH;
+    pub const BUTTON_MIN_LENGTH: f32 = scaled(shared::BUTTON_MIN_WIDTH);
     /// The emblem's slot along the strip.
-    pub const EMBLEM_SLOT: f32 = shared::EMBLEM_LENGTH;
+    pub const EMBLEM_SLOT: f32 = scaled(shared::EMBLEM_LENGTH);
     /// The emblem mark, centred in its slot.
-    pub const EMBLEM_MARK: f32 = 32.0;
+    pub const EMBLEM_MARK: f32 = scaled(32.0);
     /// Between the emblem and the readout. The mark is smaller than its
     /// slot, so the slot already carries whitespace the button boxes do
     /// not: a full `GAP` on top of that reads as a wider hole than the
     /// gaps further along the strip.
-    pub const EMBLEM_GAP: f32 = GAP - 4.0;
+    pub const EMBLEM_GAP: f32 = GAP - scaled(4.0);
     /// Button icon cell.
-    pub const ICON: f32 = shared::ICON_SIZE;
+    pub const ICON: f32 = scaled(shared::ICON_SIZE);
     pub const ICON_SIZE: Vec2 = vec2(ICON, ICON);
     /// Clearance kept from the monitor edge in the placement fit test.
     pub const NEAR_MIN: f32 = 2.0;
     /// Gap between the selection and the chassis.
-    pub const NEAR_MAX: f32 = 15.0;
+    pub const NEAR_MAX: f32 = 12.0;
     /// Hover fade, linear, in and out.
     pub const HOVER_FADE_SECS: f32 = shared::FILL_TRANSITION.as_secs_f32();
     /// Hover veil on a grey group: white at 12 % over the group fill
@@ -100,21 +140,22 @@ pub mod tokens {
     /// White text at 70 %: the OCR readout's "words" caption.
     pub const FG_70: Color32 = white_alpha(179);
 
-    /// `key` style: a 40 pt square holding the icon and the accelerator
-    /// letter side by side.
-    pub const KEY_TILE: f32 = shared::BUTTON_HEIGHT;
-    pub const KEY_PAD_H: f32 = 4.0;
-    pub const KEY_GAP: f32 = 3.0;
-    /// 9 pt accelerator letter in the `key` button style.
-    pub const KEY_FONT: f32 = shared::KEY_HINT_FONT_SIZE;
+    /// `key` style: a square (40 pt in the design) holding the icon and
+    /// the accelerator letter side by side.
+    pub const KEY_TILE: f32 = scaled(shared::BUTTON_HEIGHT);
+    pub const KEY_PAD_H: f32 = scaled(4.0);
+    pub const KEY_GAP: f32 = scaled(3.0);
+    /// The accelerator letter in the `key` button style (9 pt in the
+    /// design).
+    pub const KEY_FONT: f32 = shared::KEY_HINT_FONT_SIZE * SCALE;
 
-    /// `below` style: icon over the label, 48 pt tall.
-    pub const BELOW_HEIGHT: f32 = 48.0;
-    pub const BELOW_PAD_H: f32 = 8.0;
-    pub const BELOW_GAP: f32 = 4.0;
-    /// Button label size: 12 pt SemiBold, the C# tray's primary-button
-    /// label (`TrayPrimaryButton.axaml`), so the two read the same.
-    pub const LABEL_FONT: f32 = 12.0;
+    /// `below` style: icon over the label (48 pt tall in the design).
+    pub const BELOW_HEIGHT: f32 = scaled(48.0);
+    pub const BELOW_PAD_H: f32 = scaled(8.0);
+    pub const BELOW_GAP: f32 = scaled(4.0);
+    /// Button label size: SemiBold at the C# tray's primary-button label
+    /// size (`TrayPrimaryButton.axaml`, 12 pt), so the two read the same.
+    pub const LABEL_FONT: f32 = 12.0 * SCALE;
 
     /// The rule before the capture strip's ways out: upright across a
     /// row, flat along a column.
@@ -127,24 +168,24 @@ pub mod tokens {
         color: white_alpha(31),
     };
     /// Air on either side of the rule.
-    pub const DIVIDER_PAD_V: f32 = 4.0;
+    pub const DIVIDER_PAD_V: f32 = scaled(4.0);
     /// How far the rule stops short of either edge.
-    pub const DIVIDER_INSET: f32 = 8.0;
+    pub const DIVIDER_INSET: f32 = scaled(8.0);
     /// The whole block the rule takes along the strip: the air, the
     /// line, the air.
     pub const DIVIDER_BLOCK: f32 = 2.0 * DIVIDER_PAD_V + DIVIDER.width;
 
-    /// 11 pt OCR word count, set on 1 em line boxes.
-    pub const READOUT_FONT: f32 = 11.0;
-    pub const READOUT_LINE: f32 = 11.0;
-    pub const READOUT_PAD_H: f32 = 4.0;
+    /// The OCR word count (11 pt in the design), set on 1 em line boxes.
+    pub const READOUT_FONT: f32 = 11.0 * SCALE;
+    pub const READOUT_LINE: f32 = READOUT_FONT;
+    pub const READOUT_PAD_H: f32 = scaled(4.0);
 
     /// The scroll-picker's instruction, in the readout's place: 11 pt on
-    /// 15 pt line boxes (prose, not a two-digit stack, so it is set
-    /// looser than the readout), padded like the readout is.
-    pub const HINT_FONT: f32 = 11.0;
-    pub const HINT_LINE: f32 = 15.0;
-    pub const HINT_PAD_H: f32 = 8.0;
+    /// 15 pt line boxes in the design (prose, not a two-digit stack, so it
+    /// is set looser than the readout), padded like the readout is.
+    pub const HINT_FONT: f32 = 11.0 * SCALE;
+    pub const HINT_LINE: f32 = 15.0 * SCALE;
+    pub const HINT_PAD_H: f32 = scaled(8.0);
     /// How many lines the instruction is allowed to take. The wrap search
     /// returns the narrowest width that fits it in this many, which is
     /// also the best-balanced one.
@@ -340,12 +381,14 @@ mod tests {
         let ctx = styled();
         let style = ctx.global_style();
         let size = |s: TextStyle| s.resolve(&style).size;
-        assert_eq!(size(TextStyle::Small), 9.0);
-        assert_eq!(size(TextStyle::Body), 12.0);
-        assert_eq!(size(TextStyle::Button), 12.0);
-        assert_eq!(size(TextStyle::Heading), 12.0);
+        // The strips' text is the design's at the strips' scale; the debug
+        // panels are not a strip and keep theirs.
+        assert_eq!(size(TextStyle::Small), 9.0 * tokens::SCALE);
+        assert_eq!(size(TextStyle::Body), 12.0 * tokens::SCALE);
+        assert_eq!(size(TextStyle::Button), 12.0 * tokens::SCALE);
+        assert_eq!(size(TextStyle::Heading), 12.0 * tokens::SCALE);
         assert_eq!(size(TextStyle::Monospace), 12.0);
-        assert_eq!(size(readout_style()), 11.0);
+        assert_eq!(size(readout_style()), 11.0 * tokens::SCALE);
     }
 
     #[test]
@@ -394,10 +437,26 @@ mod tests {
     }
 
     /// The ring is part of the frame's margin, so the distance from the
-    /// painted edge to the first item must still be the token's 4 pt.
+    /// painted edge to the first item must still be the token's `PAD`.
     #[test]
-    fn tray_frame_pad_is_four() {
+    fn tray_frame_pad_is_the_token() {
         assert_eq!(tray_frame().total_margin().left, tokens::PAD);
+    }
+
+    /// Every strip length is the design's at `SCALE`, on a whole point.
+    #[test]
+    fn strip_lengths_are_the_design_at_the_scale_on_whole_points() {
+        use flicksnap_shared::contract::tray as shared;
+        for (design, token) in [
+            (shared::BUTTON_HEIGHT, tokens::KEY_TILE),
+            (shared::ICON_SIZE, tokens::ICON),
+            (shared::TRAY_PAD, tokens::PAD),
+            (shared::GAP, tokens::GAP),
+            (shared::RADIUS, f32::from(tokens::RADIUS.nw)),
+        ] {
+            assert_eq!(token, token.round(), "{design}");
+            assert!((token - design * tokens::SCALE).abs() <= 0.5, "{design} -> {token}");
+        }
     }
 
     #[test]

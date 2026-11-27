@@ -34,7 +34,6 @@ pub(crate) fn source(id: ShaderId) -> ShaderBlobs {
     match id {
         ShaderId::Desktop => s!("/desktop_d11_vs.dxbc", "/desktop_d11_ps.dxbc"),
         ShaderId::Selection => s!("/selection_d11_vs.dxbc", "/selection_d11_ps.dxbc"),
-        ShaderId::Crosshair => s!("/crosshair_d11_vs.dxbc", "/crosshair_d11_ps.dxbc"),
         ShaderId::Egui => s!("/ui_egui_d11_vs.dxbc", "/ui_egui_d11_ps.dxbc"),
     }
 }

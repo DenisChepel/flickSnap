@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -56,9 +57,36 @@ namespace FlickSnap.VideoSDK.Tests
             Assert.Equal("/sessions/1/cropped.png", Read("PreviewImgPath"));
             Assert.Equal("/sessions/1/cursor.png", Read("CursorImgPath"));
             Assert.Equal(new ScreenRect(11, 12, 32, 32), Read("CursorPosition"));
+            Assert.Equal(true, Read("CursorVisible"));
             Assert.Equal(new ScreenRect(-20, 30, 640, 480), Read("CroppedRect"));
             Assert.Equal(new ScreenRect(-100, 0, 2560, 1440), Read("OriginalBounds"));
             Assert.Equal(16.0, Read("CornerRadius"));
+            Assert.Equal((byte)5, Read("RoundedCornerMask"));
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        [InlineData(null)]
+        public void Session_loads_cursor_visibility_when_present(bool? visible)
+        {
+            var sample = JsonNode.Parse(SessionContract.RustSample).AsObject();
+            if (visible.HasValue)
+                sample["CursorVisible"] = visible.Value;
+            else
+                sample.Remove("CursorVisible");
+
+            var path = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.json");
+            try
+            {
+                File.WriteAllText(path, sample.ToJsonString());
+                using var session = new SessionInfo(path);
+                Assert.Equal(visible, session.CursorVisible);
+            }
+            finally
+            {
+                File.Delete(path);
+            }
         }
     }
 }

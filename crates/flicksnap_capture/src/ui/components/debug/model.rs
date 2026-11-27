@@ -266,16 +266,11 @@ impl<'a> MonitorPanelData<'a> {
 /// Everything rendered in the top-right "Primary Debug" panel.
 pub struct PrimaryPanelData<'a> {
     pub startup: &'a StartupTimings,
-    pub zoom: f32,
     pub cursor: ScreenPointF,
     pub color_bgra: Option<[u8; 4]>,
     pub dragging: bool,
     pub captured: bool,
     pub selection: Option<ScreenRect>,
-    pub hovered_window_title: Option<&'a str>,
-    pub hovered_window_bounds: Option<ScreenRect>,
-    pub hovered_window_index: Option<usize>,
-    pub hovered_window_obstructed: bool,
     /// System-wide `(used_bytes, total_bytes)`.
     /// This process's working-set bytes.
     pub ram: Option<u64>,
@@ -369,7 +364,6 @@ impl<'a> PrimaryPanelData<'a> {
         }
         out.push_empty();
 
-        out.push(format_args!("zoom: {:.2}", self.zoom));
         out.push(format_args!("mouse: {:.2}, {:.2}", self.cursor.x, self.cursor.y));
         match self.color_bgra {
             Some([b, g, r, _]) => out.push(format_args!("color: rgb({}, {}, {})", r, g, b)),
@@ -388,36 +382,6 @@ impl<'a> PrimaryPanelData<'a> {
         match self.selection {
             Some(s) => out.push(format_args!("select: {}", DisplayRect(s))),
             None => out.push(format_args!("select: (none)")),
-        }
-
-        if let Some(title) = self.hovered_window_title {
-            out.push_empty();
-            out.push(format_args!("wnd_title: {}", TruncatedTitle(title, 60)));
-            if let Some(b) = self.hovered_window_bounds {
-                out.push(format_args!("wnd_bounds: {}", DisplayRect(b)));
-            }
-            if let Some(idx) = self.hovered_window_index {
-                out.push(format_args!("wnd_index: {}  obstructed: {}", idx, self.hovered_window_obstructed));
-            }
-        }
-    }
-}
-
-/// Format helper that writes `s` straight into the formatter, truncating
-/// to `max_chars` with an ellipsis.
-struct TruncatedTitle<'a>(&'a str, usize);
-
-impl<'a> std::fmt::Display for TruncatedTitle<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.0;
-        let max_chars = self.1;
-        if s.chars().count() <= max_chars {
-            f.write_str(s)
-        } else {
-            for ch in s.chars().take(max_chars.saturating_sub(1)) {
-                f.write_char(ch)?;
-            }
-            f.write_char('…')
         }
     }
 }

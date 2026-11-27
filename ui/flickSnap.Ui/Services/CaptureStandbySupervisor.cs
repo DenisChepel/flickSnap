@@ -45,7 +45,15 @@ namespace FlickSnap.UI
         /// request is about to put it there) — merged into ScreenCapturePage.IsCaptureActive
         /// for the IdleMonitor update gate.</summary>
         public static bool IsOverlayOpen =>
-            Volatile.Read(ref _current) is { } current && Volatile.Read(ref current._overlayOpen) != 0;
+            Volatile.Read(ref _current) is { } current && current.OverlayInProgress;
+
+        private enum CaptureState { Waiting, Ready, Requested, Open }
+
+        private CaptureState State => (CaptureState)Volatile.Read(ref _state);
+        private bool OverlayInProgress => State is CaptureState.Requested or CaptureState.Open;
+
+        private void Transition(CaptureState from, CaptureState to) =>
+            Interlocked.CompareExchange(ref _state, (int)to, (int)from);
 
         private readonly CancellationTokenSource _stop = new();
         private readonly object _stdinGate = new();
@@ -53,8 +61,7 @@ namespace FlickSnap.UI
         private Action _returnFocus;
         private HelperClient<CaptureEvent, CaptureCommand> _client;
         private string _lastSettings;
-        private int _ready;
-        private int _overlayOpen;
+        private int _state;
         private long _overlayOpenedAtTicks;
         private int _watchdogKilled;
 
@@ -88,27 +95,26 @@ namespace FlickSnap.UI
 
         private bool TrySendCapture(CaptureMode mode, Action returnFocus)
         {
-            // built before the CAS so no failure can strand _overlayOpen at 1
             var command = new CaptureCommand.Capture(mode switch
             {
                 CaptureMode.Screen => IpcCaptureMode.Screen,
                 CaptureMode.Window => IpcCaptureMode.Window,
                 _ => IpcCaptureMode.Region,
             });
-            if (Interlocked.CompareExchange(ref _overlayOpen, 1, 0) != 0)
-                return true;
-            // ticks after winning the CAS only — a losing click must not refresh a hung
-            // overlay's watchdog deadline. The ns-wide stale-stamp window this leaves is
-            // covered by the watchdog requiring two consecutive expired samples.
-            Volatile.Write(ref _overlayOpenedAtTicks, DateTime.UtcNow.Ticks);
             lock (_stdinGate)
             {
+                if (OverlayInProgress)
+                    return true;
+                if (State != CaptureState.Ready || !SendSettingsLocked())
+                    return false;
+                Volatile.Write(ref _overlayOpenedAtTicks, DateTime.UtcNow.Ticks);
                 Volatile.Write(ref _returnFocus, returnFocus);
+                Volatile.Write(ref _state, (int)CaptureState.Requested);
                 if (SendLocked(command, grantForeground: true))
                     return true;
                 Interlocked.Exchange(ref _returnFocus, null);
+                Transition(CaptureState.Requested, CaptureState.Waiting);
             }
-            Volatile.Write(ref _overlayOpen, 0);
             return false;
         }
 
@@ -170,7 +176,10 @@ namespace FlickSnap.UI
                         new HelperStartOptions { KillEntireTree = false });
                     var startedUtc = DateTime.UtcNow;
                     lock (_stdinGate)
+                    {
                         _client = client;
+                        _lastSettings = null;
+                    }
                     // Dekker pair with Dispose (Cancel then Kill-via-_client): a Dispose that ran
                     // before the publish above saw null and killed nothing, so re-check here;
                     // otherwise this child leaks alive.
@@ -186,25 +195,16 @@ namespace FlickSnap.UI
                         switch (ev)
                         {
                             case CaptureEvent.Ready:
-                                // ready means no overlay is in progress, and events are ordered:
-                                // this self-heals any stuck-open gate at the next cycle. Cleared
-                                // before _ready so a racing tray click can't slip a duplicate in.
-                                Interlocked.Exchange(ref _overlayOpen, 0);
-                                Volatile.Write(ref _ready, 1);
+                                Transition(CaptureState.Waiting, CaptureState.Ready);
                                 // off the reader: a write that blocks on a full stdin pipe must
                                 // never stall the loop that drains the child's stdout
-                                _ = Task.Run(() => SendSettings(force: true));
+                                _ = Task.Run(SendSettings);
                                 break;
 
                             case CaptureEvent.Session session:
                                 sessionDir = session.Dir;
-                                // overlay flag before clearing _ready: a TryCapture landing
-                                // between the two must read as "duplicate, drop" rather than
-                                // "not ready" and fall through to a one-shot spawn on top of
-                                // the overlay that is opening right now
                                 Volatile.Write(ref _overlayOpenedAtTicks, DateTime.UtcNow.Ticks);
-                                Interlocked.Exchange(ref _overlayOpen, 1);
-                                Volatile.Write(ref _ready, 0);
+                                Volatile.Write(ref _state, (int)CaptureState.Open);
                                 IdleMonitor.NotifyCaptureActivity();
                                 break;
 
@@ -212,21 +212,21 @@ namespace FlickSnap.UI
                                 sessionDir = null;
                                 failures = 0;
                                 var returnFocus = Interlocked.Exchange(ref _returnFocus, null);
-                                Interlocked.Exchange(ref _overlayOpen, 0);
+                                Transition(CaptureState.Open, CaptureState.Waiting);
                                 IdleMonitor.NotifyCaptureActivity();
                                 var dir = finished.Dir;
                                 Dispatcher.UIThread.Post(async () => await ScreenCapturePage.ProcessStandbySessionAsync(dir, returnFocus));
                                 break;
 
                             case CaptureEvent.Error { Fatal: false } error:
-                                // A refusal (a capture while one is open, a rejected snapshot, a
-                                // session-dir create failure): whatever we optimistically marked
-                                // open is not coming, and a stuck-at-1 gate would swallow every
-                                // later tray capture. Scoped to no-session so a refusal can never
-                                // open the gate mid-overlay.
                                 Debug.WriteLine($"Standby capturer refused a request: {error.Code}: {error.Message}");
-                                if (sessionDir == null)
-                                    Interlocked.Exchange(ref _overlayOpen, 0);
+                                // Only a failed session creation rejects a pending capture.
+                                // A settings rejection can arrive while a capture is requested.
+                                if (error.Code == IpcErrorCodes.IoFailed && sessionDir == null)
+                                {
+                                    Interlocked.Exchange(ref _returnFocus, null);
+                                    Transition(CaptureState.Requested, CaptureState.Waiting);
+                                }
                                 break;
                         }
                     }
@@ -274,9 +274,8 @@ namespace FlickSnap.UI
                     lock (_stdinGate)
                     {
                         _client = null;
-                        Volatile.Write(ref _ready, 0);
+                        Volatile.Write(ref _state, (int)CaptureState.Waiting);
                         Interlocked.Exchange(ref _returnFocus, null);
-                        Interlocked.Exchange(ref _overlayOpen, 0);
                     }
                     if (client != null)
                         await client.DisposeAsync();
@@ -306,8 +305,7 @@ namespace FlickSnap.UI
         /// supposedly been open far longer than any real capture, kill the process — the
         /// normal crash handling then cleans up, restarts, or falls back. Without this, a
         /// wedged child swallows every tray click and blocks updates until app restart.
-        /// Two consecutive expired samples are required so the instant between winning the
-        /// overlay CAS and stamping its timestamp can never kill a healthy process.</summary>
+        /// Two consecutive expired samples protect against a sample that straddles captures.</summary>
         private async Task WatchOverlayHangAsync(HelperClient<CaptureEvent, CaptureCommand> client, CancellationToken token)
         {
             try
@@ -317,7 +315,7 @@ namespace FlickSnap.UI
                 {
                     await Task.Delay(TimeSpan.FromMinutes(1), token);
                     var openedAt = new DateTime(Volatile.Read(ref _overlayOpenedAtTicks), DateTimeKind.Utc);
-                    if (Volatile.Read(ref _overlayOpen) != 1 || DateTime.UtcNow - openedAt < OverlayHangTimeout)
+                    if (!OverlayInProgress || DateTime.UtcNow - openedAt < OverlayHangTimeout)
                     {
                         expiredSamples = 0;
                         continue;
@@ -361,29 +359,38 @@ namespace FlickSnap.UI
             }
         }
 
-        private void SendSettings(bool force = false)
+        private void SendSettings()
+        {
+            lock (_stdinGate)
+            {
+                if (State == CaptureState.Ready)
+                    SendSettingsLocked();
+            }
+        }
+
+        private bool SendSettingsLocked()
         {
             try
             {
-                // built INSIDE the gate so lock order equals snapshot order: the forced send
-                // after a `ready` racing a PropertyChanged send must not put older settings on the
-                // wire last (the pipe write already sits under this lock anyway)
-                lock (_stdinGate)
+                // Refresh under the same lock as capture so a hotkey can never
+                // overtake settings changes made while the previous overlay was open.
+                var args = CaptureArguments.BuildStandby(PathConstants.SessionData, SettingsRoot.Current,
+                    SettingsRoot.Current.General.LastSavePath);
+                var fingerprint = JsonSerializer.Serialize(args);
+                if (fingerprint == _lastSettings)
+                    return true;
+                if (!SendLocked(new CaptureCommand.Settings(args)))
                 {
-                    var args = CaptureArguments.BuildStandby(PathConstants.SessionData, SettingsRoot.Current,
-                        SettingsRoot.Current.General.LastSavePath);
-                    var fingerprint = JsonSerializer.Serialize(args);
-                    if (!force && fingerprint == _lastSettings)
-                        return;
-                    _lastSettings = fingerprint;
-                    // A send that misses (capture in progress, process restarting) needs no
-                    // queue: every ready is answered with a forced full snapshot.
-                    SendLocked(new CaptureCommand.Settings(args));
+                    Transition(CaptureState.Ready, CaptureState.Waiting);
+                    return false;
                 }
+                _lastSettings = fingerprint;
+                return true;
             }
             catch (Exception ex)
             {
                 Debug.WriteLine("Failed to send standby settings: " + ex);
+                return false;
             }
         }
 
@@ -391,7 +398,7 @@ namespace FlickSnap.UI
         {
             try
             {
-                if (Volatile.Read(ref _ready) == 0 || _client is not { } client)
+                if (_client is not { } client)
                     return false;
                 // The overlay needs keyboard focus immediately (Esc / shortcuts), and a
                 // process poked from the background is denied SetForegroundWindow by the
@@ -399,15 +406,11 @@ namespace FlickSnap.UI
                 // because the user just clicked our tray/menu, so we hold the rights.
                 if (grantForeground)
                     HelperProcess.GrantForeground(client.ProcessId);
-                if (client.Send(command))
-                    return true;
-                Volatile.Write(ref _ready, 0);
-                return false;
+                return client.Send(command);
             }
             catch (Exception ex)
             {
                 Debug.WriteLine("Failed to write standby IPC: " + ex);
-                Volatile.Write(ref _ready, 0);
                 return false;
             }
         }

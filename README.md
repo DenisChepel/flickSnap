@@ -16,7 +16,7 @@
 
 ## Features
 
-- **Screenshots**: snap a window or crop to the pixel, with a magnifier.
+- **Screenshots**: snap a window or select a region with a pixel magnifier, then annotate it before exporting.
 - **Scrolling capture**: the whole page in one image.
 - **OCR**: copy text from anything on screen, on-device.
 - **Draw on screen**: draw over the desktop, then get back to work.

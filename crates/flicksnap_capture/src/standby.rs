@@ -108,7 +108,7 @@ impl Standby {
 
             // Everything queued meanwhile is stale: a raced capture request was
             // superseded by the overlay the user just saw, and the shell re-sends
-            // its complete settings snapshot after every `ready`. Capture requests
+            // settings before its next capture request. Capture requests
             // and malformed lines are still answered, in arrival order.
             while let Ok(input) = self.input_rx.try_recv() {
                 match input {

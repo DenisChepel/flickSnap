@@ -7,13 +7,11 @@ use crate::gxi;
 use crate::sync::VisibleLatch;
 use crate::system::CapturedDesktop;
 use crate::ui::shared::UiSharedState;
-use flicksnap_shared::geometry::{ScreenPointF, ScreenRect};
+use flicksnap_shared::geometry::ScreenRect;
 
 /// Messages the main thread sends to a render thread during the frame loop.
 pub enum RenderMsg {
     MouseState {
-        pos: ScreenPointF,
-        zoom: f32,
         selection: Option<ScreenRect>,
         /// Corner radius of `selection` in physical (virtual-desktop) px,
         /// 0 = square — see `InteractionState::selection_radius`.
@@ -31,9 +29,8 @@ pub enum RenderMsg {
 /// screenshot job, once the desktop bitmap is in, and broadcast to every
 /// worker.
 pub struct CycleParams {
-    pub snapshot: Option<Arc<CapturedDesktop>>,
+    pub snapshot: Arc<CapturedDesktop>,
     pub accent_color: [f32; 4],
-    pub initial_mouse: ScreenPointF,
     pub ready_count: Arc<AtomicUsize>,
     pub visible_latch: Arc<VisibleLatch>,
 }
@@ -48,7 +45,7 @@ pub enum WorkerInput {
     BeginCycle(Arc<CycleParams>),
     /// Sent by `WindowHandle::drop` so a worker still waiting on `BeginCycle`
     /// after its handoff wakes for teardown — channel disconnection alone
-    /// cannot be relied on while a screenshot/blur job holds `input_tx`
+    /// cannot be relied on while a screenshot job holds `input_tx`
     /// clones.
     Shutdown,
 }

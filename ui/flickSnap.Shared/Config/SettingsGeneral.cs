@@ -320,7 +320,7 @@ namespace FlickSnap.Config
         /// <summary>
         /// Everything the accent drives, from the same pick and the same contrast rule as
         /// <see cref="GetEffectiveAccentColor"/> (which is its <see cref="AccentColorPalette.Effective"/>):
-        /// the comet and the ramps <c>AccentTheme</c> repaints the app's theme with, in one call.
+        /// the ramps <c>AccentTheme</c> repaints the app's theme with, in one call.
         /// </summary>
         public AccentColorPalette GetAccentPalette()
             => AccentColors.Palette(GetPickedAccentColor(), MaintainMinimumContrast);
@@ -329,7 +329,7 @@ namespace FlickSnap.Config
         /// The accent as chosen — the OS accent when the user asked for it and there is one to read,
         /// otherwise their own pick — before any contrast correction. For surfaces that carry no white
         /// ink and want the color itself rather than a fill dark enough to write on, such as the
-        /// floating strips' glows and the capturer's hint comet (<see cref="AccentColors.CometColors"/>).
+        /// floating strips' glows.
         /// </summary>
         public Color GetPickedAccentColor()
             => (UseSystemAccentColor ? AccentColors.GetSystemAccent() : null) ?? AccentColor;

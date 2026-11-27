@@ -1,17 +1,10 @@
 // Desktop background pass: the frozen desktop snapshot, the captured
 // cursor composited into it, and the region treatment — untouched inside
 // the selection (or OCR-dimmed while that mode runs), darkened grayscale
-// outside it. NOTHING ELSE: the crosshair, the selection border, the
-// resize handles and the peeked window all live in their own passes
-// (crosshair.wgsl, selection.wgsl, peek.wgsl), drawn over this one, so
-// this fullscreen pass stays close to a plain textured triangle. See
-// render/frame.rs for the pass order.
+// outside it. The selection border and resize handles are drawn over
+// this fullscreen pass (see render/frame.rs).
 //
 // Per-window uniforms.
-//   uv_offset_scale.xy = where this monitor begins in the shared desktop
-//                        texture, in normalized UV space.
-//   uv_offset_scale.zw = the size of this monitor in the same UV space.
-//                        The magnifier zoom is folded in CPU-side.
 //   params.x           = grayscale fade factor in [0, 1].
 //                        0 = original color, 1 = darkened grayscale.
 //   selection_rect     = mouse-drag selection in window-local physical
@@ -33,7 +26,6 @@
 //   ocr_params.z       = OCR selection desaturation in [0, 1], same
 //                        shared clock as the dim (see render/desktop.rs).
 struct Uniforms {
-    uv_offset_scale: vec4<f32>,
     params:          vec4<f32>,
     selection_rect:  vec4<f32>,
     cursor_rect:     vec4<f32>,
@@ -63,8 +55,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
     var out: VsOut;
     out.pos = vec4<f32>(x, y, 0.0, 1.0);
     // Clip space is Y-up; texture v is Y-down. Flip here.
-    let window_uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
-    out.uv = u.uv_offset_scale.xy + window_uv * u.uv_offset_scale.zw;
+    out.uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
     return out;
 }
 
@@ -89,16 +80,6 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // The live region overlay is composited over the real desktop.
-    // Its selection is a transparent hole, so no screen texture is needed.
-    if u.params.y > 0.0 {
-        let p = in.pos.xy;
-        let r = u.selection_rect;
-        let inside = p.x >= r.x && p.x < r.z && p.y >= r.y && p.y < r.w;
-        let alpha = select(0.42, clamp(u.ocr_params.x, 0.0, 1.0), inside);
-        return vec4<f32>(0.0, 0.0, 0.0, alpha);
-    }
-
     let fade = clamp(u.params.x, 0.0, 1.0);
 
     let color = textureSample(desktop_tex, desktop_samp, in.uv);
@@ -124,14 +105,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     1.0,
                 );
             } else {
-                // Masked (AND/XOR): output = (screen * and_mask) xor'd with xor_color.
-                // Since and_mask values are 0.0 or 1.0 in unorm:
-                //   AND with 0.0 → 0.0, AND with 1.0 → keep
-                //   XOR with 0.0 → keep, XOR with 1.0 → invert
-                // Float-safe: AND = multiply, XOR = abs(a - b) when operands are 0 or 1.
+                // A masked cursor may have an arbitrary 8-bit XOR color.
                 let and_mask = textureSample(cursor_mask_tex, desktop_samp, cursor_uv);
-                let masked = base.rgb * and_mask.rgb;
-                base = vec4<f32>(abs(masked - cur_color.rgb), 1.0);
+                let screen = vec3<u32>(round(base.rgb * 255.0));
+                let bits = (screen & vec3<u32>(round(and_mask.rgb * 255.0))) ^ vec3<u32>(round(cur_color.rgb * 255.0));
+                base = vec4<f32>(vec3<f32>(bits) / 255.0, 1.0);
             }
         }
     }

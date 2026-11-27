@@ -32,16 +32,17 @@ use crate::telemetry::startup::StartupTimings;
 use crate::ui::command::Command;
 use crate::ui::components::debug::model::{LineBuf, MonitorPanelData, PrimaryPanelData};
 use crate::ui::components::debug::resources::ResourcePoller;
+use crate::ui::components::drawbar::show::DrawbarInputs;
 use crate::ui::components::panel::model::{ButtonStyle, PanelButtonSet, PanelFeatures};
 use crate::ui::components::panel::theme;
-use crate::ui::components::{self, accent_color32, area, hints, ocr, scope, tips, InputCtx, OverlayInputs};
+use crate::ui::components::{self, accent_color32, area, loupe, marks, notice, ocr, scope, tips, InputCtx, OverlayInputs};
 use crate::ui::egui_frame::{EguiFrame, TextureShadow};
 use crate::ui::fonts;
 use crate::ui::shared::{
     active_panel_set, debug_monitor_visibility, debug_primary_visibility, monitor_index_at, pick_monitor_containing_center, sample_bgra,
     UiMonitor,
 };
-use flicksnap_shared::geometry::{to_screen_point, RectExt, ScreenPointF, ScreenRect, ScreenRectF};
+use flicksnap_shared::geometry::{to_screen_point, RectExt, ScreenPointF, ScreenRect};
 
 /// The shortest gap between two scheduled runs of one host. egui asks for
 /// those repaints as "immediately", so without a floor a hover fade would
@@ -64,6 +65,8 @@ const MAX_PASSES: u32 = 4;
 pub struct HostInputs {
     /// The tray, on the one host that shows it.
     pub panel: Option<PanelInputs>,
+    /// The drawing strip, beside the tray while the capture strip is up.
+    pub drawbar: Option<DrawbarInputs>,
     /// The debug panels, on every host while the `D` toggle is on and this
     /// monitor's worker has published a perf snapshot.
     pub debug: Option<DebugInputs>,
@@ -130,8 +133,25 @@ pub struct PanelOutcome {
     pub clicked: Option<Command>,
     /// The pointer is over a button: the app thread shows the hand cursor.
     pub over_button: bool,
-    /// The pointer is anywhere on the tray, dead chassis included.
+    /// The pointer is anywhere on the tray, dead chassis included — or on
+    /// the drawing strip or its colour popup, which route the same way.
     pub over_tray: bool,
+    /// The pointer is on the drawing strip's colour popup: the one place
+    /// a press does not close it.
+    pub over_palette: bool,
+}
+
+impl PanelOutcome {
+    /// Two strips' outcomes as one: a click from either, the pointer on
+    /// either. One pointer, so at most one of them reports a click.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            clicked: self.clicked.or(other.clicked),
+            over_button: self.over_button || other.over_button,
+            over_tray: self.over_tray || other.over_tray,
+            over_palette: self.over_palette || other.over_palette,
+        }
+    }
 }
 
 /// Arguments for [`EguiHosts::sync`], grouped because the caller has them
@@ -142,18 +162,9 @@ pub struct SyncArgs<'a> {
     pub monitors: &'a [MonitorInfo],
     pub ui_monitors: &'a [UiMonitor],
     pub desktop_buffer: Option<&'a CapturedDesktop>,
-    pub hovered_title: Option<&'a str>,
     /// Name of the monitor under the cursor, which `broadcast_ui_state`
     /// already works out for the shared state.
     pub hovered_monitor_name: Option<&'a str>,
-    pub hovered_bounds: Option<ScreenRect>,
-    pub hovered_index: Option<usize>,
-    pub hovered_obstructed: bool,
-    /// The cursor image's rect, already `None` when the peek covers it —
-    /// `broadcast_ui_state` works both facts out once per tick.
-    pub cursor_image_rect: Option<ScreenRectF>,
-    /// Already ANDed with "the peek does not cover the cursor".
-    pub cursor_overlay_visible: bool,
 }
 
 /// The host index that shows the tray and what it shows, or `None` when
@@ -185,6 +196,16 @@ fn panel_inputs(ui_monitors: &[UiMonitor], input: &InteractionState, settings: &
             anchor,
         },
     ))
+}
+
+/// The drawing strip's inputs, or `None` when it is not up. It goes with
+/// the capture strip and nothing else: OCR and the scroll-picker own the
+/// selection while their strips are up, so there is nothing to draw on.
+fn drawbar_inputs(panel: &PanelInputs, input: &InteractionState) -> Option<DrawbarInputs> {
+    (panel.set == PanelButtonSet::Normal).then_some(DrawbarInputs {
+        state: input.draw,
+        can_undo: input.marks.can_undo(),
+    })
 }
 
 pub struct EguiHosts {
@@ -270,13 +291,7 @@ impl EguiHosts {
             monitors: args.ui_monitors,
             cursor_index: monitor_index_at(args.ui_monitors, cursor),
             accent: accent_color32(args.settings.accent_color),
-            hovered_window_title: args.hovered_title,
             hovered_monitor_name: args.hovered_monitor_name,
-            hovered_pixel_bgra: args
-                .desktop_buffer
-                .and_then(|b| sample_bgra(b, to_screen_point(cursor))),
-            cursor_image_rect: args.cursor_image_rect,
-            cursor_overlay_visible: args.cursor_overlay_visible,
         };
         let mut any_ran = false;
         let mut outcome = PanelOutcome::default();
@@ -288,19 +303,21 @@ impl EguiHosts {
             let debug = self.debug_inputs(index, monitor, &args);
             let overlays = OverlayInputs {
                 overlays_visible: args.input.overlays_visible,
-                comet: hints::trail::comet_colors(args.settings.picked_accent_color),
                 area: area::show::inputs(index, &monitor, &ictx),
                 tips: tips::show::inputs(index, &monitor, &ictx),
-                hints: hints::show::inputs(index, &monitor, &ictx),
-                notice: hints::show::notice_inputs(index, &monitor, &ictx),
+                notice: notice::show::inputs(index, &monitor, &ictx),
                 scope: scope::show::inputs(index, &monitor, &ictx),
                 ocr: ocr::show::inputs(index, &monitor, &ictx),
+                marks: marks::show::inputs(index, &monitor, &ictx),
+                loupe: loupe::inputs(index, &monitor, &ictx, args.desktop_buffer),
             };
             let host = &mut self.monitors[index];
+            let panel = panel
+                .filter(|(i, _)| *i == index)
+                .map(|(_, p)| p);
             let inputs = HostInputs {
-                panel: panel
-                    .filter(|(i, _)| *i == index)
-                    .map(|(_, p)| p),
+                panel,
+                drawbar: panel.and_then(|p| drawbar_inputs(&p, args.input)),
                 debug,
                 pointer: host.pointer(cursor),
                 overlays,
@@ -372,7 +389,6 @@ impl EguiHosts {
         if debug_primary_visibility(input.overlays_visible, input.debug_visible, input.virtual_cursor, monitor.bounds) {
             PrimaryPanelData {
                 startup: &self.startup,
-                zoom: input.zoom,
                 cursor: input.virtual_cursor,
                 color_bgra: args
                     .desktop_buffer
@@ -380,10 +396,6 @@ impl EguiHosts {
                 dragging: input.dragging,
                 captured: input.captured,
                 selection: input.selection,
-                hovered_window_title: args.hovered_title,
-                hovered_window_bounds: args.hovered_bounds,
-                hovered_window_index: args.hovered_index,
-                hovered_window_obstructed: args.hovered_obstructed,
                 ram: readings.ram,
                 vram_total: readings.vram_total,
             }
@@ -456,6 +468,7 @@ impl EguiHosts {
         };
         let inputs = HostInputs {
             panel: Some(panel),
+            drawbar: drawbar_inputs(&panel, input),
             // A press never re-derives the debug rows: whatever the last
             // `sync` gave this host stays, and no broadcast follows a
             // captured press anyway.
@@ -494,13 +507,17 @@ impl EguiHosts {
         }
     }
 
-    /// True when any host asked to be run again by now. The event loop
-    /// polls this: a scheduled repaint deliberately bypasses the input
-    /// memo, which is what lets an animation advance while nothing moves.
+    /// True when any host asked to be run again by now.
     pub fn repaint_due(&self, now: Instant) -> bool {
+        self.next_repaint().is_some_and(|t| t <= now)
+    }
+
+    /// Earliest animation tick, so the event loop can sleep without input.
+    pub fn next_repaint(&self) -> Option<Instant> {
         self.monitors
             .iter()
-            .any(|h| h.repaint_after.is_some_and(|t| t <= now))
+            .filter_map(|h| h.repaint_after)
+            .min()
     }
 
     /// Push the curated system faces onto every host and force one pass on
@@ -695,8 +712,7 @@ impl MonitorHost {
             }));
             acc = PanelOutcome {
                 clicked: acc.clicked.or(pass.clicked),
-                over_button: pass.over_button,
-                over_tray: pass.over_tray,
+                ..pass
             };
             passes += 1;
             let delay = full
@@ -748,6 +764,7 @@ mod tests {
         let mut host = MonitorHost::new(monitor(0, 1.0));
         let inputs = HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: Some(egui::pos2(10.0, 10.0)),
             overlays: OverlayInputs::default(),
@@ -796,6 +813,7 @@ mod tests {
         let mut host = MonitorHost::new(monitor(0, 1.0));
         let inputs = HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: Some(egui::pos2(10.0, 10.0)),
             overlays: OverlayInputs::default(),
@@ -818,6 +836,7 @@ mod tests {
         let mut host = MonitorHost::new(monitor(0, 1.0));
         let mut inputs = HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: Some(egui::pos2(10.0, 10.0)),
             overlays: OverlayInputs::default(),
@@ -836,7 +855,7 @@ mod tests {
     }
 
     /// Every animation in the migrated stack — the sweep, the reveal, the
-    /// comet, the notice fade, the debug plot — rides on one mechanism: a
+    /// notice fade, the debug plot — rides on one mechanism: a
     /// show function asks for a tick inside the pass, and the host turns
     /// the viewport's repaint delay into its own `repaint_after`. Break
     /// that link and the sweep freezes at its first band position with
@@ -847,6 +866,7 @@ mod tests {
         let region = ScreenRect::from_xy_size(200, 200, 800, 400);
         let lifted = |anchor: Instant| HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: None,
             overlays: OverlayInputs {
@@ -876,6 +896,7 @@ mod tests {
         // own request and nothing else.
         let quiet = HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: None,
             overlays: OverlayInputs::default(),
@@ -921,6 +942,7 @@ mod tests {
 
         let inputs = HostInputs {
             panel: None,
+            drawbar: None,
             debug: None,
             pointer: None,
             overlays: OverlayInputs::default(),
@@ -951,6 +973,7 @@ mod tests {
         };
         let visible = |on: bool, pointer: Option<Pos2>| HostInputs {
             panel: Some(panel),
+            drawbar: None,
             debug: None,
             pointer,
             overlays: OverlayInputs {
@@ -993,6 +1016,28 @@ mod tests {
                 })
                 .sum()
         })
+    }
+
+    /// The drawing strip rides with the capture strip alone: OCR and the
+    /// scroll-picker own the selection while their strips are up.
+    #[test]
+    fn the_drawing_strip_comes_with_the_capture_strip_only() {
+        let mut input = InteractionState::new();
+        input
+            .draw
+            .toggle_tool(crate::draw::DrawTool::Arrow);
+        let panel = |set| PanelInputs {
+            set,
+            features: PanelFeatures::ALL,
+            style: ButtonStyle::KeyHint,
+            accent: Color32::from_rgb(0x2F, 0x7C, 0xAE),
+            word_count: 0,
+            anchor: ScreenRect::from_xy_size(500, 300, 600, 400),
+        };
+        let shown = drawbar_inputs(&panel(PanelButtonSet::Normal), &input).expect("up beside the capture strip");
+        assert_eq!(shown.state, input.draw);
+        assert!(drawbar_inputs(&panel(PanelButtonSet::Ocr), &input).is_none());
+        assert!(drawbar_inputs(&panel(PanelButtonSet::ScrollPick), &input).is_none());
     }
 
     /// Decision 2: every host works in its own monitor's points, and a

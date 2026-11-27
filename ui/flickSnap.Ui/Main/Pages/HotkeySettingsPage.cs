@@ -18,7 +18,7 @@ namespace FlickSnap.UI.Pages
 {
     /// <summary>
     /// The Hotkeys settings page: the actions in titled sections (<see cref="HotkeyPageLayout"/>),
-    /// each row the action's name beside its shortcuts (<see cref="HotkeyShortcutsEditor"/>).
+    /// with editable shortcut lists and fixed keys for the capture overlay.
     /// Built by hand rather than by <see cref="SettingsControlFactory"/>, because a row edits a
     /// list of shortcuts through <see cref="HotkeyManager"/> rather than binding one property;
     /// the rows still follow their [VisibleWhen] the way generated rows do (the same helpers), so
@@ -152,10 +152,46 @@ namespace FlickSnap.UI.Pages
                 SettingsControlFactory.BindVisibleWhen(editor, settings, pd);
             }
 
+            if (section.Actions.Contains(HotkeyId.CaptureRegion))
+                AddCaptureMagnifierShortcut(panel);
+
             if (section.Actions.Contains(HotkeyId.DrawOnScreen) && SettingsRoot.Current?.DrawOnScreen is { } drawing)
                 AddZoomGridDefault(panel, drawing, reset);
 
             SettingsControlFactory.GateGroupVisibility(header, gates);
+        }
+
+        private static void AddCaptureMagnifierShortcut(SettingsRowsPanel panel)
+        {
+            var label = new TextBlock
+            {
+                Text = "Magnifier",
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(RowIndent, 8, 0, 8),
+            };
+            SettingsRowsPanel.SetRole(label, SettingsRowsPanel.Role.Label);
+
+            var key = new Border
+            {
+                MinWidth = 32,
+                MinHeight = 32,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Margin = new Thickness(FieldGap, 8, 4, 8),
+                CornerRadius = new CornerRadius(4),
+                Child = new TextBlock
+                {
+                    Text = "X",
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
+                },
+            };
+            key.Bind(Border.BackgroundProperty, key.GetResourceObservable("SemiColorFill0"));
+            AutomationProperties.SetName(key, "Magnifier shortcut X, in the capture overlay");
+            SettingsRowsPanel.SetRole(key, SettingsRowsPanel.Role.Editor);
+
+            panel.Children.Add(label);
+            panel.Children.Add(key);
         }
 
         private static void AddZoomGridDefault(SettingsRowsPanel panel, SettingsDrawOnScreen drawing, SettingsGroupReset reset)

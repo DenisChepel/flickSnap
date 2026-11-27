@@ -93,12 +93,7 @@ namespace FlickSnap
             => WithAlpha(color.A, ColorMath.Palette(Rgb(color), maintainContrast: true).Effective);
 
         /// <summary>
-        /// The two colours of the capture overlay's hint comet (the overlay derives its own from the
-        /// same pick through the same Rust code), from the accent as the user picked it (not the
-        /// contrast-darkened fill, which reads as muddy once it glows): the body, and the hot tint its
-        /// head burns towards. Worked in OKLCH, so the body keeps the pick's hue and as much of its
-        /// chroma as sRGB holds at a glowing lightness, and the head is the same hue, lighter, with
-        /// chroma eased off.
+        /// The former hint comet colours carried by the native palette contract.
         /// </summary>
         public static (Color Body, Color Head) CometColors(Color picked)
         {

@@ -1,6 +1,6 @@
-//! The overlay's Windows grabs, both through the shared GDI grab (`flicksnap_desktop::grab`, the one
-//! FlickSnap.Ui and the scrolling driver use): the whole virtual desktop for the frozen screenshot,
-//! and a selected rectangle for the live overlay.
+//! The overlay's Windows grab, through the shared GDI grab (`flicksnap_desktop::grab`, the one
+//! FlickSnap.Ui and the scrolling driver use): the whole virtual desktop, frozen when the capture
+//! starts.
 
 use anyhow::Result;
 use flicksnap_desktop::grab::{self, Options};

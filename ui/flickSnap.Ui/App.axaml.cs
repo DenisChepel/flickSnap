@@ -575,6 +575,9 @@ namespace FlickSnap
                 ApplyGesture(draw, HotkeyId.DrawOnScreen);
                 draw.Click += async (s, e) =>
                 {
+                    if (ScreenCapturePage.IsCaptureOverlayOpen)
+                        return;
+
                     // let the tray menu disappear first, or it is still on screen under the new overlay
                     await Task.Delay(400);
                     DrawOnScreenSession.Show();

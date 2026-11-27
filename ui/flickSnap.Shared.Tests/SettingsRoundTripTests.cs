@@ -92,7 +92,6 @@ namespace FlickSnap.Shared.Tests
             original.General.ConfirmClose = false;
             original.Capture.ScreenshotWithCursor = true;
             original.Capture.RoundedWindowCorners = false;
-            original.Capture.TipsMode = CapturerTipsMode.Off; // enum by name (non-default)
             original.ShareRegion.ObscureStyle = ShareRegionObscureStyle.Pixelate; // enum by name (non-default)
             original.ShareRegion.ObscureStrength = 77;
             original.ShareRegion.CaptureMethod = ScreenCaptureMethod.Dxgi; // enum by name (non-default)
@@ -137,7 +136,6 @@ namespace FlickSnap.Shared.Tests
             Assert.False(loaded.General.ConfirmClose);
             Assert.True(loaded.Capture.ScreenshotWithCursor);
             Assert.False(loaded.Capture.RoundedWindowCorners);
-            Assert.Equal(CapturerTipsMode.Off, loaded.Capture.TipsMode);
             // the share-region obscure pair rides the already-registered JsonStringEnumConverter, so
             // the style persists as the member name "Pixelate" and needs no converter of its own.
             Assert.Equal(ShareRegionObscureStyle.Pixelate, loaded.ShareRegion.ObscureStyle);
@@ -543,7 +541,6 @@ namespace FlickSnap.Shared.Tests
             File.WriteAllText(_path, """
                 {
                   "Capture": {
-                    "TipsMode": "Off",
                     "ScreenshotWithCursor": true
                   }
                 }
@@ -553,7 +550,6 @@ namespace FlickSnap.Shared.Tests
 
             // the section really did bind — without this the two assertions below would also pass
             // for a file the binder skipped entirely, which is a different test.
-            Assert.Equal(CapturerTipsMode.Off, loaded.Capture.TipsMode);
             Assert.True(loaded.Capture.ScreenshotWithCursor);
 
             Assert.Equal(ShareRegionObscureStyle.Blur, loaded.ShareRegion.ObscureStyle);

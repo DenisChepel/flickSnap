@@ -26,7 +26,7 @@ use super::timing::{FrameSlotId, GpuTimings};
 
 pub struct Frame {
     /// For the device-removed log on a failed present (the next
-    /// `Surface::acquire` is what actually reports `DeviceLost`).
+    /// `Surface::acquire` is what actually reports the failure).
     device: Device,
     queue: Queue,
     swapchain: IDXGISwapChain1,
@@ -175,14 +175,9 @@ impl Frame {
     /// the present, so the measured window covers the whole frame's GPU
     /// work.
     ///
-    /// Returns the time spent in the present call itself; there is no
-    /// separate submit on D3D11 (draws executed eagerly on the immediate
-    /// context), so the caller's draw bucket naturally absorbed that work
-    /// already. A `DXGI_ERROR_DEVICE_REMOVED/RESET` result is logged here
-    /// and *reported* by the next `Surface::acquire`, which returns
-    /// [`crate::gxi::AcquireResult::DeviceLost`] — `present` has no error
-    /// channel in its signature, by (Phase B) design.
-    pub fn present(self, timings: Option<&GpuTimings>) -> Duration {
+    /// Returns the time spent in Present, or `None` if DXGI rejected it.
+    /// D3D11 draws execute eagerly, so they are timed separately by the caller.
+    pub fn present(self, timings: Option<&GpuTimings>) -> Option<Duration> {
         let t_present = Instant::now();
         let hr = {
             // Present drives the immediate context (implicit flush), so it
@@ -196,7 +191,8 @@ impl Frame {
         if hr.is_err() {
             let reason = unsafe { self.device.raw().GetDeviceRemovedReason() };
             error!("d3d11 Present failed: {hr} (device-removed reason: {reason:?})");
+            return None;
         }
-        t_present.elapsed()
+        Some(t_present.elapsed())
     }
 }

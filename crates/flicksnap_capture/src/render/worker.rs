@@ -12,12 +12,9 @@ use flicksnap_shared::geometry::ScreenRect;
 pub struct RenderWorkerParams {
     pub monitor: MonitorInfo,
     pub monitor_index: usize,
-    pub live_region: bool,
     pub instance: gxi::Instance,
     pub startup: Arc<StartupTimings>,
-    /// Incremented (once, via `ReadyGuard`) when this worker dies without a
-    /// clean shutdown, so the app's show gate (`ready + failed >= expected`)
-    /// can never deadlock on a dead worker.
+    /// Incremented by the failure guard when a worker exits unexpectedly.
     pub failed_count: Arc<AtomicUsize>,
 }
 

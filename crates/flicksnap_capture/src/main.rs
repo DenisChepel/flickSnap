@@ -4,6 +4,7 @@ mod app;
 mod capture;
 mod capture_output;
 mod cycle_logger;
+mod draw;
 mod filename_pattern;
 mod gpu;
 mod gxi;
@@ -78,7 +79,7 @@ fn main() {
         Err(err) => fatal(ErrorCode::InitFailed, err),
     };
     #[cfg(windows)]
-    gpu::region_devices::warm();
+    gpu::warm_devices::warm();
 
     loop {
         match standby.wait(&mut args, &mut event_loop) {
@@ -227,7 +228,7 @@ fn run_cycle(
     // winit switches the policy back to Accessory at applicationDidFinishLaunching.
     timings.mark_event_loop_built();
 
-    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     let mut app = session.into_app();
     timings.mark_run_app_entered();
     use winit::platform::run_on_demand::EventLoopExtRunOnDemand;

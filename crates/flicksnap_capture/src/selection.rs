@@ -244,42 +244,6 @@ pub fn dpi_at_point(p: ScreenPointF, monitors: &[MonitorInfo]) -> f32 {
     1.0
 }
 
-/// Clamp the point to whichever monitor currently contains it, or to the
-/// nearest monitor if it's in the multi-monitor dead zone. A tiny epsilon
-/// is subtracted from the max edge so the point never lands on the
-/// exclusive right/bottom of a rect (matches Screens.cpp:147-153 which
-/// subtracts 0.001 from the right/bottom bounds).
-pub fn clamp_to_nearest_monitor(p: &mut ScreenPointF, monitors: &[MonitorInfo]) {
-    if monitors.is_empty() {
-        return;
-    }
-    // First try: already inside a monitor? Leave it alone.
-    for m in monitors {
-        if m.bounds.contains_point_f32(*p) {
-            return;
-        }
-    }
-    // Not inside any monitor — pick the one whose center is closest and
-    // clamp into its bounds. Distance-to-center is good enough as a
-    // "nearest monitor" heuristic for a cursor that's just crossed a
-    // boundary.
-    let (best_ix, _) = monitors
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let bf = m.bounds.to_f32();
-            let cx = bf.left() + bf.width() * 0.5;
-            let cy = bf.top() + bf.height() * 0.5;
-            let dx = p.x - cx;
-            let dy = p.y - cy;
-            (i, dx * dx + dy * dy)
-        })
-        .fold((0usize, f32::INFINITY), |(bi, bd), (i, d)| if d < bd { (i, d) } else { (bi, bd) });
-    let bf = monitors[best_ix].bounds.to_f32();
-    p.x = p.x.clamp(bf.left(), bf.right() - 0.001);
-    p.y = p.y.clamp(bf.top(), bf.bottom() - 0.001);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use winit::window::Window;
 
+use crate::draw::{burn::InkLayer, Mark};
 use crate::filename_pattern::suggested_file_name;
 use crate::image_extract::{apply_rounded_corners, composite_cursor_rgba, corners_to_round, extract_selection_rgba};
 use crate::settings::CapturerSettings;
-use crate::system::{CapturedCursor, CapturedDesktop};
+use crate::system::CapturedDesktop;
 use flicksnap_shared::geometry::ScreenRect;
 
 /// Result of a Copy or Save action.
@@ -19,46 +20,86 @@ pub enum ActionResult {
     Failed(String),
 }
 
-/// Extract the selection as straight-alpha RGBA,
-/// the cursor drawn if visible, and — for a picked window — its OS corner
-/// radius cut into the alpha (`corner_radius` > 0, see
-/// `InteractionState::selection_radius`). Shared by copy and save so the
-/// two can never disagree about what "the image" is.
-pub fn extract_output_image(
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor: Option<&CapturedCursor>,
-    cursor_visible: bool,
-) -> Option<(Vec<u8>, u32, u32)> {
-    let (mut rgba, width, height) = extract_selection_rgba(selection, buffer)?;
-    if cursor_visible {
-        if let Some(cur) = cursor {
-            composite_cursor_rgba(&mut rgba, width, height, selection, cur);
+/// Frozen inputs shared by all five screenshot actions.
+#[derive(Clone, Copy)]
+pub struct Screenshot<'a> {
+    pub selection: ScreenRect,
+    pub corner_radius: f32,
+    pub buffer: &'a CapturedDesktop,
+    pub cursor_visible: bool,
+    pub marks: &'a [Mark],
+}
+
+pub struct PreparedScreenshot<'a> {
+    original: Screenshot<'a>,
+    pub selection: ScreenRect,
+    ink: Option<InkLayer>,
+}
+
+impl<'a> Screenshot<'a> {
+    pub fn prepare(self) -> anyhow::Result<PreparedScreenshot<'a>> {
+        let selection = self
+            .selection
+            .intersection(&self.buffer.bounds)
+            .filter(|r| r.width() > 0 && r.height() > 0)
+            .ok_or_else(|| anyhow!("selection is outside the captured desktop"))?;
+        Ok(PreparedScreenshot {
+            selection,
+            ink: InkLayer::new(selection, self.marks)?,
+            original: self,
+        })
+    }
+
+    pub fn extract(self) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+        self.prepare()?.extract()
+    }
+}
+
+impl PreparedScreenshot<'_> {
+    /// Render just `bounds`, in overlay order: desktop, optional frozen
+    /// cursor, then ink clipped to the original selection.
+    pub fn pixels(&self, bounds: ScreenRect, cursor_visible: bool) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+        let bounds = bounds
+            .intersection(&self.original.buffer.bounds)
+            .ok_or_else(|| anyhow!("output is outside the captured desktop"))?;
+        let (mut rgba, width, height) =
+            extract_selection_rgba(bounds, self.original.buffer).ok_or_else(|| anyhow!("could not extract the capture pixels"))?;
+        // The desktop is opaque, but some grab backends leave its alpha
+        // undefined. Only the final corner mask should introduce transparency.
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel[3] = 255;
         }
+        if cursor_visible {
+            if let Some(cursor) = self.original.buffer.cursor.as_ref() {
+                composite_cursor_rgba(&mut rgba, width, height, bounds, cursor);
+            }
+        }
+        if let Some(ink) = &self.ink {
+            ink.blend(&mut rgba, bounds);
+        }
+        Ok((rgba, width, height))
     }
-    if corner_radius > 0.0 {
-        // The extract clamps to the desktop bitmap; a corner that was cut
-        // off by that clamp is not a window corner and stays square.
-        let clamped = selection
-            .intersection(&buffer.bounds)
-            .unwrap_or(selection);
-        apply_rounded_corners(&mut rgba, width, height, corner_radius, corners_to_round(selection, clamped));
+
+    pub fn extract(&self) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+        let (mut rgba, width, height) = self.pixels(self.selection, self.original.cursor_visible)?;
+        if self.original.corner_radius > 0.0 {
+            apply_rounded_corners(
+                &mut rgba,
+                width,
+                height,
+                self.original.corner_radius,
+                corners_to_round(self.original.selection, self.selection),
+            );
+        }
+        Ok((rgba, width, height))
     }
-    Some((rgba, width, height))
 }
 
 /// Copy the selected region to the clipboard.
-pub fn copy_to_clipboard(
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor: Option<&CapturedCursor>,
-    cursor_visible: bool,
-) -> ActionResult {
-    let Some((rgba, width, height)) = extract_output_image(selection, corner_radius, buffer, cursor, cursor_visible) else {
-        log::warn!("copy: no selection or failed to extract");
-        return ActionResult::Failed("No selection to copy".to_string());
+pub fn copy_to_clipboard(screenshot: Screenshot<'_>) -> ActionResult {
+    let (rgba, width, height) = match screenshot.extract() {
+        Ok(image) => image,
+        Err(e) => return ActionResult::Failed(format!("Could not prepare image: {e:#}")),
     };
 
     match set_clipboard_image(&rgba, width as usize, height as usize) {
@@ -193,21 +234,7 @@ where
 /// The dialog opens on the shell's last save path with the shell's filename
 /// pattern already rendered into the name box, so saving here and saving from
 /// the editor put identically named files in the same folder (`filename_pattern`).
-#[allow(clippy::too_many_arguments)]
-pub fn save_to_file(
-    selection: ScreenRect,
-    corner_radius: f32,
-    buffer: &CapturedDesktop,
-    cursor: Option<&CapturedCursor>,
-    cursor_visible: bool,
-    settings: &CapturerSettings,
-    window: &Window,
-) -> ActionResult {
-    let Some((rgba, width, height)) = extract_output_image(selection, corner_radius, buffer, cursor, cursor_visible) else {
-        log::warn!("save: no selection or failed to extract");
-        return ActionResult::Failed("No selection to save".to_string());
-    };
-
+pub fn save_to_file(screenshot: Screenshot<'_>, settings: &CapturerSettings, window: &Window) -> ActionResult {
     let suggested = suggested_file_name(settings.save_directory.as_deref(), &settings.filename_pattern);
 
     let mut dialog = rfd::FileDialog::new()
@@ -232,6 +259,10 @@ pub fn save_to_file(
     let Some(mut path) = path else {
         log::info!("save: dialog canceled");
         return ActionResult::Canceled;
+    };
+    let (rgba, width, height) = match screenshot.extract() {
+        Ok(image) => image,
+        Err(e) => return ActionResult::Failed(format!("Could not prepare image: {e:#}")),
     };
 
     let ext = path

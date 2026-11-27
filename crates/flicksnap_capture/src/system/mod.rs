@@ -38,7 +38,7 @@ mod active_window_macos;
 
 #[cfg(target_os = "macos")]
 use flicksnap_shared::geometry::{LogicalPoint, LogicalSize};
-use flicksnap_shared::geometry::{RectExt, ScreenPoint, ScreenPointF, ScreenRect, WindowPoint};
+use flicksnap_shared::geometry::{RectExt, ScreenPoint, ScreenRect};
 
 /// Bounds and corner radius resolved once for the Active Window shortcut.
 #[derive(Clone, Copy)]
@@ -74,17 +74,8 @@ pub struct MonitorInfo {
     /// between the CG logical coordinate space and physical pixels.
     #[cfg(target_os = "macos")]
     pub logical_origin: LogicalPoint,
-}
-
-#[allow(dead_code)]
-impl MonitorInfo {
-    pub fn window_to_screen(&self, pt: WindowPoint) -> ScreenPointF {
-        flicksnap_shared::geometry::window_to_screen(self.bounds, pt)
-    }
-
-    pub fn screen_to_window(&self, pt: ScreenPointF) -> WindowPoint {
-        flicksnap_shared::geometry::screen_to_window(self.bounds, pt)
-    }
+    #[cfg(target_os = "macos")]
+    pub display_id: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -109,32 +100,6 @@ impl MonitorInfo {
         let s = self.scale_factor as f64;
         LogicalSize::new(w as f64 / s, h as f64 / s)
     }
-}
-
-/// Read only the selected area, after the overlay windows have been hidden.
-pub fn capture_region(bounds: ScreenRect, monitors: &[MonitorInfo]) -> anyhow::Result<CapturedDesktop> {
-    #[cfg(windows)]
-    let (bgra, width, height) = {
-        // Ensure the compositor has processed the overlay hides before reading
-        // the desktop DC. This is only paid on a screenshot action.
-        unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }?;
-        let image = win_capture::capture_desktop(&bounds)?;
-        (image.bgra, image.width, image.height)
-    };
-    #[cfg(target_os = "macos")]
-    let (bgra, width, height) = {
-        let image = mac_capture::capture_region(bounds, monitors)?;
-        (image.bgra, image.width, image.height)
-    };
-
-    Ok(CapturedDesktop {
-        bgra,
-        width,
-        height,
-        bounds,
-        monitors: monitors.to_vec(),
-        cursor: SystemInterop::capture_cursor(monitors),
-    })
 }
 
 /// Bounding box of all monitor physical rects in virtual-desktop coordinates.
@@ -298,12 +263,10 @@ pub struct CapturedCursor {
 
 /// Raw virtual-desktop snapshot. The pixel data is in BGRA byte order
 /// exactly as `GetDIBits` produces it — no CPU swizzle. The GPU uploads it
-/// directly into a `Bgra8UnormSrgb` texture and the sampler hardware
+/// directly into a `Bgra8Unorm` texture and the sampler hardware
 /// reorders to RGBA at fetch time, which is free.
 ///
-/// All sizes / coordinates are in raw physical pixels; nothing here is
-/// scaled. `scale_factor` and `monitors[i].scale_factor` exist purely so
-/// callers can convert to logical units when they need to.
+/// All sizes and coordinates are in physical pixels.
 pub struct CapturedDesktop {
     pub bgra: Vec<u8>,
     /// Width in raw physical pixels (one byte quad per pixel in `bgra`).
@@ -314,13 +277,6 @@ pub struct CapturedDesktop {
     /// capture. May have negative origin coordinates when secondary
     /// monitors extend left/up of the primary.
     pub bounds: ScreenRect,
-    /// Snapshot of the monitor topology at the same instant as the
-    /// bitmap. Each entry carries that monitor's bounds (in the same
-    /// raw-pixel virtual-desktop coordinate space as `bounds`) and its
-    /// own DPI scale. Bundling them with the bitmap avoids any race
-    /// where the topology could change between capture and enumeration.
-    #[allow(dead_code)]
-    pub monitors: Vec<MonitorInfo>,
     /// OS cursor state at the instant of capture. `None` if cursor
     /// capture failed. The cursor is always captured; the user toggle
     /// controls only whether it is rendered/composited.
@@ -344,10 +300,6 @@ impl SystemInterop {
 
     pub fn get_mouse_position(_monitors: &[MonitorInfo]) -> ScreenPoint {
         flicksnap_desktop::cursor_position().unwrap_or_default()
-    }
-
-    pub fn set_mouse_position(pos: ScreenPoint, _monitors: &[MonitorInfo]) {
-        flicksnap_desktop::set_cursor_position(pos);
     }
 
     /// Record the shell's pid (`--shell-pid`) for
@@ -382,11 +334,9 @@ impl SystemInterop {
         win_cursor::capture_cursor()
     }
 
-    /// Capture the desktop bitmap using pre-enumerated monitors. The
-    /// bitmap is a raw BitBlt of the virtual desktop; the monitors are
-    /// bundled into the result for downstream consumers.
-    pub fn capture_desktop_bitmap(monitors: Vec<MonitorInfo>, cursor: Option<CapturedCursor>) -> CapturedDesktop {
-        let vd = virtual_desktop_bounds(&monitors);
+    /// Capture the pre-enumerated virtual desktop via BitBlt.
+    pub fn capture_desktop_bitmap(monitors: &[MonitorInfo], cursor: Option<CapturedCursor>) -> CapturedDesktop {
+        let vd = virtual_desktop_bounds(monitors);
         // Runs on the screenshot thread: a panic here would leave the main thread
         // blocked on the screenshot latch forever with nothing on screen, so treat
         // failure as fatal for the whole process and let the shell report it.
@@ -406,7 +356,6 @@ impl SystemInterop {
             width: bitmap.width,
             height: bitmap.height,
             bounds: bitmap.bounds,
-            monitors,
             cursor,
         }
     }
@@ -472,10 +421,6 @@ impl SystemInterop {
             },
         })
     }
-
-    pub fn install_pinch_monitor() -> Option<PinchMonitor> {
-        None
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -491,10 +436,6 @@ impl SystemInterop {
 
     pub fn get_mouse_position(monitors: &[MonitorInfo]) -> ScreenPoint {
         mac_mouse::get_position(monitors)
-    }
-
-    pub fn set_mouse_position(pos: ScreenPoint, monitors: &[MonitorInfo]) {
-        mac_mouse::set_position(pos, monitors)
     }
 
     /// No foreground lock on macOS, so there is nothing to hand back and
@@ -523,11 +464,11 @@ impl SystemInterop {
     /// Capture the desktop bitmap using pre-enumerated monitors. On
     /// macOS the monitor topology is used to position each display's
     /// capture in the composite buffer.
-    pub fn capture_desktop_bitmap(monitors: Vec<MonitorInfo>, cursor: Option<CapturedCursor>) -> CapturedDesktop {
+    pub fn capture_desktop_bitmap(monitors: &[MonitorInfo], cursor: Option<CapturedCursor>) -> CapturedDesktop {
         // Runs on the screenshot thread: a panic here would leave the main thread
         // blocked on the screenshot latch forever with nothing on screen, so treat
         // failure as fatal for the whole process and let the shell report it.
-        let bitmap = match mac_capture::capture_bitmap(&monitors) {
+        let bitmap = match mac_capture::capture_bitmap(monitors) {
             Ok(bitmap) => bitmap,
             Err(err) => {
                 error!("unable to capture the desktop: {err:#}");
@@ -538,13 +479,12 @@ impl SystemInterop {
                 );
             }
         };
-        let vd = virtual_desktop_bounds(&monitors);
+        let vd = virtual_desktop_bounds(monitors);
         CapturedDesktop {
             bgra: bitmap.bgra,
             width: bitmap.width,
             height: bitmap.height,
             bounds: vd,
-            monitors,
             cursor,
         }
     }
@@ -555,58 +495,6 @@ impl SystemInterop {
 
     pub fn active_window_target(monitors: &[MonitorInfo], rounded: bool) -> Option<WindowTarget> {
         active_window_macos::target(monitors, rounded)
-    }
-
-    pub fn install_pinch_monitor() -> Option<PinchMonitor> {
-        crate::system::install_pinch_monitor()
-    }
-}
-
-pub struct PinchMonitor {
-    #[cfg(target_os = "macos")]
-    accum: std::sync::Arc<std::sync::Mutex<f64>>,
-    #[cfg(target_os = "macos")]
-    _token: objc2::rc::Retained<objc2::runtime::AnyObject>,
-}
-
-#[cfg(target_os = "macos")]
-fn install_pinch_monitor() -> Option<PinchMonitor> {
-    use block2::RcBlock;
-    use core::ptr::NonNull;
-    use objc2_app_kit::{NSEvent, NSEventMask};
-    use std::sync::{Arc, Mutex};
-
-    let accum = Arc::new(Mutex::new(0.0f64));
-    let accum_clone = accum.clone();
-
-    let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
-        let mag = unsafe { event.as_ref().magnification() };
-        if let Ok(mut g) = accum_clone.lock() {
-            *g += mag;
-        }
-        core::ptr::null_mut()
-    });
-
-    let token = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Magnify, &block) }?;
-
-    Some(PinchMonitor {
-        accum,
-        _token: token,
-    })
-}
-
-impl PinchMonitor {
-    #[cfg(target_os = "macos")]
-    pub fn drain(&self) -> f64 {
-        let mut g = self.accum.lock().unwrap();
-        let v = *g;
-        *g = 0.0;
-        v
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn drain(&self) -> f64 {
-        0.0
     }
 }
 
@@ -689,10 +577,8 @@ pub fn lower_thread_priority() {
 }
 
 /// Drop the CALLING thread to true background scheduling — the lowest
-/// tier, for disk-bound work nobody is waiting on (the system-font scan,
-/// peek captures). The cold-start freeze was as much disk contention
-/// (page-cache-evicted files, on-access AV scanning) as CPU, and plain
-/// priority drops do not touch I/O scheduling.
+/// tier, for disk-bound work like the system-font scan. Lowering CPU
+/// priority alone leaves I/O scheduling unchanged.
 ///
 /// Windows: `THREAD_MODE_BACKGROUND_BEGIN` — lowest CPU priority AND very
 /// low I/O priority AND low memory priority, regardless of the process's

@@ -57,7 +57,6 @@ pub struct Surface {
     /// The render subview's hosted layer; `configure` points it at the
     /// device, `acquire` pulls drawables from it.
     layer: Retained<CAMetalLayer>,
-    transparent: bool,
     /// The hosting `NSWindow`, retained as an untyped object for the
     /// occlusion guard in `acquire` (its one message send there,
     /// `occlusionState`, needs no typed binding).
@@ -103,12 +102,7 @@ impl Surface {
     /// `backdrop`: the cropped screenshot for the backdrop layer, when it
     /// is already available at window-creation time (pass `None`
     /// otherwise and fill the returned backdrop view later).
-    pub fn create(
-        instance: &Instance,
-        window: Arc<Window>,
-        backdrop: Option<BackdropImage>,
-        transparent: bool,
-    ) -> Result<(Self, SurfaceViews)> {
+    pub fn create(instance: &Instance, window: Arc<Window>, backdrop: Option<BackdropImage>) -> Result<(Self, SurfaceViews)> {
         use objc2::{MainThreadMarker, MainThreadOnly};
         use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -149,7 +143,7 @@ impl Surface {
         // on: the layer stays invisible until the fade-in animates it to 1.
         let layer = CAMetalLayer::new();
         layer.setContentsScale(window.scale_factor());
-        layer.setOpacity(if transparent { 1.0 } else { 0.0 });
+        layer.setOpacity(0.0);
         subview.setLayer(Some(&layer));
         subview.setWantsLayer(true);
 
@@ -165,7 +159,6 @@ impl Surface {
             Self {
                 _window: window,
                 layer,
-                transparent,
                 ns_window,
                 configured: None,
             },
@@ -193,7 +186,7 @@ impl Surface {
         self.layer.setDevice(Some(device.raw()));
         self.layer.setPixelFormat(SURFACE_FORMAT);
         self.layer.setFramebufferOnly(true);
-        self.layer.setOpaque(!self.transparent);
+        self.layer.setOpaque(true);
         self.layer.setDrawableSize(NSSize {
             width: width as f64,
             height: height as f64,

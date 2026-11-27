@@ -8,13 +8,13 @@ use crate::gpu::overlay::{OverlayUniforms, OVERLAY_UNIFORMS_SIZE};
 use crate::gpu::{self};
 use crate::gxi::{self, AcquireResult, BindingRes, GpuTimings, ShaderId, SurfaceConfig};
 use crate::interaction::OcrState;
-use crate::sync::ReadyGuard;
-use crate::telemetry::perf::{PerfSample, PerfSlot, PerfTracker, Series};
+use crate::sync::RenderFailureGuard;
+use crate::telemetry::perf::{PerfSlot, PerfTracker, Series};
 use crate::telemetry::startup::{AtomicDuration, StartupTimings, WorkerTimings};
 use crate::ui::gpu::egui_painter::EguiPainter;
 use crate::ui::gpu::UiRenderer;
 use crate::ui::shared::{UiMonitor, UiSharedState};
-use flicksnap_shared::geometry::{RectExt, ScreenPointF, ScreenRect};
+use flicksnap_shared::geometry::ScreenRect;
 
 pub mod desktop;
 pub mod frame;
@@ -41,8 +41,7 @@ use worker::RenderWorkerParams;
 ///
 /// It is built on a side thread started the moment the device exists, so it
 /// overlaps the screenshot wait, the window handoff and frame 0 itself. It is
-/// NEVER blocked on: the render loop starts without it — the desktop pass,
-/// the software cursor and the crosshair are all Stage-A pipelines — and
+/// NEVER blocked on: the render loop starts with the Stage-A desktop pass and
 /// polls the handle each iteration, folding the stack in the moment it
 /// lands. On a warm start that is before the overlay is even visible; on a
 /// cold one (driver shader cache empty, the DLLs not yet paged in) the
@@ -122,66 +121,39 @@ fn spawn_deferred_stack(
 /// all inert on frame 0 (`UiRenderer::prepare`
 /// bails on the absent state, and there is no perf history to sample).
 ///
-/// Returns whether the frame actually reached `queue.present()` — a
-/// lost/outdated/timed-out surface returns early — so the caller's
-/// `first_present` mark means "pixels handed to the compositor", not
-/// "a draw was attempted". [`FirstFrame::DeviceLost`] is terminal: the
-/// worker must exit with its fail guard still armed so the show gate
-/// counts the display as failed instead of waiting on it.
-fn present_first_frame(surface: &mut gxi::Surface, pipeline: &gxi::RenderPipeline, snapshot_state: Option<&SnapshotState>) -> FirstFrame {
-    // macOS: the early order-front (`app.rs::order_window_front_early`) is
-    // asynchronous — `orderFrontRegardless` returns before AppKit has heard
-    // back from the window server, and the metal backend's `acquire`
-    // returns `Occluded` until the NSWindow's occlusionState gains
-    // `NSWindowOcclusionStateVisible` (the guard carried over from
-    // wgpu-hal's gfx-rs/wgpu#8309 workaround). On
-    // a warm run this worker reaches the acquire within a millisecond or
-    // two of the order-front — and can even beat it, since the main thread
-    // only orders front once its screenshot pickup poll fires — so the
-    // FIRST attempt reliably fails; treating that as
-    // terminal (as `draw_once` correctly does mid-loop) silently turned
-    // frame 0 into a 0.01 ms no-op on every warm launch, and the show gate
-    // then faded in a surface nothing had ever painted. So frame 0 — and
-    // only frame 0 — waits the transition out. Bounded well under the 5 s
-    // `SHOW_GATE_TIMEOUT`: a window that genuinely never becomes visible
-    // (covered, wedged WindowServer) falls back to the old skip-and-continue
-    // path with the render loop picking up the first paint. The common case
-    // where the surface is already acquirable — every non-macOS platform,
-    // and any macOS run slow enough that AppKit caught up — breaks out of
-    // the loop on the first attempt and never sleeps.
-    let occluded_deadline = Instant::now() + Duration::from_millis(500);
+/// Wait briefly for a usable first frame. An occluded macOS window can
+/// wait for Metal with its frozen AppKit backdrop visible.
+fn present_first_frame(surface: &mut gxi::Surface, pipeline: &gxi::RenderPipeline, snapshot_state: &SnapshotState) -> FirstFrame {
+    let timeout = if cfg!(target_os = "macos") {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(2)
+    };
+    let deadline = Instant::now() + timeout;
     let mut frame = loop {
         match surface.acquire(None) {
-            AcquireResult::Frame(f) => break f,
-            AcquireResult::Occluded if cfg!(target_os = "macos") && Instant::now() < occluded_deadline => {
+            AcquireResult::Frame(frame) => break frame,
+            AcquireResult::Occluded | AcquireResult::Skip if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(1));
             }
-            // Like the other misses, the render loop picks up the first
-            // paint.
-            AcquireResult::Skip | AcquireResult::Occluded => return FirstFrame::Skipped,
-            AcquireResult::DeviceLost => return FirstFrame::DeviceLost,
+            AcquireResult::Occluded if cfg!(target_os = "macos") => return FirstFrame::Backdrop,
+            _ => return FirstFrame::Failed,
         }
     };
-
     frame.set_pipeline(pipeline);
-    if let Some(state) = snapshot_state {
-        frame.set_bind_group(0, &state.bind_group);
-        frame.draw(0..3, 0..1);
+    frame.set_bind_group(0, &snapshot_state.bind_group);
+    frame.draw(0..3, 0..1);
+    match frame.present(None) {
+        Some(_) => FirstFrame::Presented,
+        None => FirstFrame::Failed,
     }
-    frame.present(None);
-    FirstFrame::Presented
 }
 
-/// What [`present_first_frame`] achieved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FirstFrame {
-    /// Pixels were handed to the compositor.
     Presented,
-    /// Transient miss — the render loop picks up the first paint.
-    Skipped,
-    /// The device is gone (see [`frame::DrawStatus::DeviceLost`]) — the
-    /// worker must exit via its fail path. Dead on the metal backend.
-    DeviceLost,
+    Backdrop,
+    Failed,
 }
 
 // ── Messages ────────────────────────────────────────────────────────
@@ -202,7 +174,6 @@ fn render_worker_main(
     let RenderWorkerParams {
         monitor,
         monitor_index,
-        live_region,
         instance,
         startup,
         failed_count,
@@ -213,10 +184,7 @@ fn render_worker_main(
     // out of our hands (libblur's pool). See the helper's docs.
     crate::system::raise_render_thread_priority();
 
-    // Armed for the worker's whole life: any exit that isn't a clean
-    // shutdown bumps `failed_count`, so the app's show gate
-    // (ready + failed >= expected) is never deadlocked by a dead worker.
-    let mut fail_guard = ReadyGuard::new(failed_count);
+    let mut fail_guard = RenderFailureGuard::new(failed_count);
     let monitor_bounds = monitor.bounds;
     let scale_factor = monitor.scale_factor;
     let refresh_hz = monitor.refresh_hz;
@@ -229,7 +197,7 @@ fn render_worker_main(
     // ── Stage A: eager GPU prep (no window/surface/screenshot) ──────
 
     let worker_timings = &startup.background.workers[monitor_index];
-    let bundle = match gpu::stage_a_create_device(instance, &monitor, live_region, startup.t_start, worker_timings) {
+    let bundle = match gpu::stage_a_create_device(instance, &monitor, startup.t_start, worker_timings) {
         Ok(b) => b,
         Err(e) => {
             error!("render worker {monitor_index}: GPU init failed: {e:?}");
@@ -260,23 +228,31 @@ fn render_worker_main(
     // creation instead of after it. The snapshot rides along with the cycle so
     // the two can never be paired up wrongly.
 
-    let mut pending_cycle: Option<(Arc<CycleParams>, Option<Arc<gpu::desktop::DesktopSnapshot>>)> = None;
+    let mark = |field: fn(&WorkerTimings) -> &AtomicDuration| {
+        field(worker_timings).set_once(startup.t_start.elapsed());
+    };
+    let upload_snapshot = |p: &CycleParams| {
+        mark(|t| &t.upload_start);
+        match gpu::desktop::upload_snapshot(&bundle.device, &bundle.queue, &p.snapshot, monitor_bounds) {
+            Ok(snapshot) => {
+                mark(|t| &t.upload);
+                Some(snapshot)
+            }
+            Err(e) => {
+                error!("render worker {monitor_index}: could not upload display pixels: {e:#}");
+                None
+            }
+        }
+    };
+    let mut pending_cycle = None;
     let handoff = loop {
         match input_rx.recv() {
             Ok(WorkerInput::Handoff(h)) => break *h,
             Ok(WorkerInput::BeginCycle(p)) => {
-                let stamp = |field: fn(&WorkerTimings) -> &AtomicDuration| {
-                    if let Some(t) = startup.background.workers.get(monitor_index) {
-                        field(t).set_once(startup.t_start.elapsed());
-                    }
+                let Some(snapshot) = upload_snapshot(&p) else {
+                    return;
                 };
-                stamp(|t| &t.upload_start);
-                let snapshot = p
-                    .snapshot
-                    .as_deref()
-                    .and_then(|desktop| gpu::desktop::upload_snapshot(&bundle.device, &bundle.queue, desktop, &bundle.desktop_sampler));
-                stamp(|t| &t.upload);
-                pending_cycle = Some((p, snapshot));
+                pending_cycle = Some((p, Some(snapshot)));
             }
             Ok(WorkerInput::Shutdown) => {
                 fail_guard.disarm();
@@ -288,7 +264,7 @@ fn render_worker_main(
             }
         }
     };
-    let _window = handoff.window;
+    fail_guard.attach_window(handoff.window);
     let mut surface = handoff.surface;
 
     worker_timings
@@ -329,7 +305,7 @@ fn render_worker_main(
                 Ok(WorkerInput::Shutdown) => {
                     // WindowHandle::drop — clean shutdown. (Channel
                     // disconnection can't be relied on here: a still-
-                    // running screenshot/blur job holds sender clones.)
+                    // running screenshot job holds sender clones.)
                     fail_guard.disarm();
                     return;
                 }
@@ -342,56 +318,17 @@ fn render_worker_main(
         },
     };
 
-    // `.get()` so a worker-count mismatch (impossible today — the monitor
-    // list sizes both) degrades to missing debug rows instead of panicking
-    // the render worker.
-    let mark = |field: fn(&WorkerTimings) -> &AtomicDuration| {
-        if let Some(t) = startup.background.workers.get(monitor_index) {
-            field(t).set_once(startup.t_start.elapsed());
-        }
-    };
-
     // ── Stage B: upload this cycle's desktop snapshot ───────────
     // Done during the handoff wait when the BeginCycle beat the window,
-    // which is the common case. `set_once` keeps the marks stamped there.
-
-    mark(|t| &t.upload_start);
-    let snapshot = if live_region {
-        Some(gpu::desktop::live_placeholder(
-            &bundle.device,
-            &bundle.queue,
-            &bundle.desktop_sampler,
-        ))
-    } else {
-        preloaded_snapshot.or_else(|| {
-            cycle
-                .snapshot
-                .as_deref()
-                .and_then(|desktop| gpu::desktop::upload_snapshot(&bundle.device, &bundle.queue, desktop, &bundle.desktop_sampler))
-        })
+    // which is the common case.
+    let Some(snapshot) = preloaded_snapshot.or_else(|| upload_snapshot(&cycle)) else {
+        return;
     };
-    mark(|t| &t.upload);
 
     // ── Stage C: per-cycle uniforms + bind group, draw frame 0 ──
-    // Accent color and initial mouse come from CycleParams, not from
-    // settings baked in at worker spawn.
-
-    let mut snapshot_state: Option<SnapshotState> = snapshot.as_ref().map(|snap| {
-        let mf = monitor_bounds.to_f32();
-        let vd_x = snap.vdesktop_origin[0];
-        let vd_y = snap.vdesktop_origin[1];
-        let vd_w = snap.vdesktop_size[0];
-        let vd_h = snap.vdesktop_size[1];
-        let base_uv_offset_scale = [
-            (mf.left() - vd_x) / vd_w,
-            (mf.top() - vd_y) / vd_h,
-            mf.width() / vd_w,
-            mf.height() / vd_h,
-        ];
-
+    let mut snapshot_state = {
         let uniforms = WindowUniforms {
-            uv_offset_scale: base_uv_offset_scale,
-            params: [0.0, if live_region { 1.0 } else { 0.0 }, 0.0, 0.0],
+            params: [0.0, 0.0, 0.0, 0.0],
             selection_rect: [0.0, 0.0, -1.0, -1.0],
             cursor_rect: [0.0, 0.0, -1.0, -1.0],
             cursor_params: [0.0, 0.0, 0.0, 0.0],
@@ -406,7 +343,7 @@ fn render_worker_main(
             .write_buffer(&ubo, 0, bytemuck::bytes_of(&uniforms));
 
         let placeholder_cursor = create_placeholder_cursor_texture(&bundle.device, &bundle.queue);
-        let (cursor_color, cursor_mask) = match &snap.cursor {
+        let (cursor_color, cursor_mask) = match &snapshot.cursor {
             Some(ct) => (&ct.color, &ct.mask),
             None => (&placeholder_cursor, &placeholder_cursor),
         };
@@ -416,17 +353,16 @@ fn render_worker_main(
             ShaderId::Desktop,
             &[
                 BindingRes::Uniform(&ubo),
-                BindingRes::Texture(&snap.texture),
-                BindingRes::Sampler(&snap.sampler),
+                BindingRes::Texture(&snapshot.texture),
+                BindingRes::Sampler(&bundle.desktop_sampler),
                 BindingRes::Texture(cursor_color),
                 BindingRes::Texture(cursor_mask),
             ],
         );
 
-        // The overlay passes (crosshair + selection) share one uniform
-        // buffer, zero-initialized here: fade 0 and an empty selection
-        // mean both passes draw nothing until the first
-        // `update_uniforms` — and neither is drawn on frame 0 anyway.
+        // The selection pass's uniform buffer, zero-initialized here: fade
+        // 0 and an empty selection mean it draws nothing until the first
+        // `update_uniforms` — and it is not drawn on frame 0 anyway.
         let overlay_ubo = bundle
             .device
             .create_uniform_buffer("overlay uniforms", OVERLAY_UNIFORMS_SIZE);
@@ -434,22 +370,13 @@ fn render_worker_main(
         bundle
             .queue
             .write_buffer(&overlay_ubo, 0, bytemuck::bytes_of(&overlay_uniforms));
-        let crosshair_bind_group = bundle.device.create_bind_group(
-            "crosshair bind group",
-            ShaderId::Crosshair,
-            &[
-                BindingRes::Uniform(&overlay_ubo),
-                BindingRes::Texture(&snap.texture),
-                BindingRes::Sampler(&snap.sampler),
-            ],
-        );
         let selection_bind_group = bundle.device.create_bind_group(
             "selection bind group",
             ShaderId::Selection,
             &[
                 BindingRes::Uniform(&overlay_ubo),
-                BindingRes::Texture(&snap.texture),
-                BindingRes::Sampler(&snap.sampler),
+                BindingRes::Texture(&snapshot.texture),
+                BindingRes::Sampler(&bundle.desktop_sampler),
             ],
         );
 
@@ -457,23 +384,19 @@ fn render_worker_main(
             ubo,
             bind_group,
             uniforms,
-            base_uv_offset_scale,
             overlay_ubo,
-            crosshair_bind_group,
             selection_bind_group,
             overlay_uniforms,
             accent_color: cycle.accent_color,
             dpi_scale: scale_factor,
             held_dash_period: None,
         }
-    });
+    };
 
     mark(|t| &t.first_render_start);
-    let presented = present_first_frame(&mut surface, &bundle.desktop_pipeline, snapshot_state.as_ref());
-    if presented == FirstFrame::DeviceLost {
-        // Exit with `fail_guard` still armed: the bump lets the show gate
-        // count this display as failed instead of waiting on it.
-        error!("render worker {monitor_index}: GPU device lost at frame 0");
+    let presented = present_first_frame(&mut surface, &bundle.desktop_pipeline, &snapshot_state);
+    if presented == FirstFrame::Failed {
+        error!("render worker {monitor_index}: could not present the first frame");
         return;
     }
     // Marks pixels actually handed to the compositor rather than merely a
@@ -484,21 +407,12 @@ fn render_worker_main(
     }
     bundle
         .device
-        .wait_idle(Duration::from_secs(5));
+        .wait_idle(Duration::from_secs(1));
 
     mark(|t| &t.first_render);
 
     // Reported ready BEFORE joining the deferred build: the show gate must
     // never wait on work whose output the user cannot see yet.
-    //
-    // Disarmed first so this worker contributes to the gate EXACTLY ONCE.
-    // The gate opens on `ready + failed >= expected`, and everything below
-    // this point is fallible (the deferred join can carry a panic). Leaving
-    // the guard armed across the bump would let one worker count on both
-    // sides and open the gate while a sibling is still creating its device —
-    // inverting the guard's purpose from "a dead worker cannot hold the
-    // overlay hostage" into "a dying worker shows the overlay early".
-    fail_guard.disarm();
     cycle
         .ready_count
         .fetch_add(1, Ordering::Release);
@@ -508,11 +422,11 @@ fn render_worker_main(
     // loop (see `DeferredStack`): blocking on it here — between the show
     // gate opening and the first loop iteration — is what made a cold start
     // feel worse than the old blocking layout. The overlay was on screen
-    // (frame 0, hardware cursor hidden) while this thread sat in `join()`
+    // (frame 0) while this thread sat in `join()`
     // for however long a cold shader compile took, so
     // nothing followed the mouse and nothing drew. Warm the build is long
     // done by now and the first iteration picks it up immediately.
-    let mut gpu = gpu::finalize_window_gpu(bundle, snapshot);
+    let mut gpu = gpu::finalize_window_gpu(bundle);
     let mut deferred: Option<thread::JoinHandle<DeferredStack>> = Some(deferred);
     let mut ui_renderer: Option<UiRenderer> = None;
     // The latest UiSharedState that arrived while the UI stack was still
@@ -525,8 +439,6 @@ fn render_worker_main(
     let mut gpu_timing = GpuTimings::new(&gpu.device, &gpu.queue);
     cycle.visible_latch.wait();
     let start = Instant::now();
-    let mut mouse_pos: ScreenPointF = cycle.initial_mouse;
-    let mut zoom: f32 = 1.0;
     let mut selection: Option<ScreenRect> = None;
     let mut selection_radius: f32 = 0.0;
     let mut selection_dragging: bool = false;
@@ -547,14 +459,12 @@ fn render_worker_main(
     // compares against. One snapshot per frame while the panels are up —
     // the plot is only as smooth as the samples reaching it.
     let mut perf_seq: u64 = 0;
+    let mut idle = false;
 
     loop {
         // Fold the deferred build in the iteration it finishes. `is_finished`
         // is a non-blocking flag read; the join that follows is then
-        // immediate. Degraded rather than `.expect` on a panicked builder:
-        // readiness is already published, so unwinding here would run
-        // `ReadyGuard::drop` and double-count — and the desktop-only loop is
-        // still a working (if chrome-less) overlay for this monitor.
+        // immediate.
         if deferred
             .as_ref()
             .is_some_and(|h| h.is_finished())
@@ -576,38 +486,34 @@ fn render_worker_main(
                     ui_renderer = Some(ui);
                 }
                 Some(Err(_)) => {
-                    error!("render worker {monitor_index}: UI builder thread panicked; this monitor keeps a desktop-only overlay (no panel or hints)");
+                    error!("render worker {monitor_index}: UI builder thread panicked");
+                    return;
                 }
                 None => {}
             }
         }
 
-        // The live picker has no animation before selection. Wait for input
-        // instead of repainting an unchanged desktop on every refresh.
-        let mut pending = if live_region && !captured && deferred.is_none() {
-            match msg_rx.recv() {
-                Ok(message) => Some(message),
-                Err(_) => return,
-            }
+        let mut pending = if idle {
+            let Ok(message) = msg_rx.recv() else {
+                fail_guard.disarm();
+                return;
+            };
+            last_iter = Instant::now();
+            Some(message)
         } else {
             None
         };
         loop {
             match pending
                 .take()
-                .map(Ok)
-                .unwrap_or_else(|| msg_rx.try_recv())
+                .map_or_else(|| msg_rx.try_recv(), Ok)
             {
                 Ok(RenderMsg::MouseState {
-                    pos,
-                    zoom: z,
                     selection: sel,
                     selection_radius: radius,
                     selection_dragging: dragging,
                     captured: cap,
                 }) => {
-                    mouse_pos = pos;
-                    zoom = z;
                     selection = sel;
                     selection_radius = radius;
                     selection_dragging = dragging;
@@ -635,40 +541,28 @@ fn render_worker_main(
         // Evaluated every frame (not only on UiState receipt): the
         // dim/desaturation are animations on the phase's shared
         // anchor clock, and frames keep flowing between broadcasts.
-        // Hoisted above the snapshot block because the PEEK uniforms
-        // below need the same values — the peek quad covers the
-        // desktop pass inside the selection, so it re-applies the
-        // identical treatment (see peek.wgsl).
         let ocr_fx = desktop::ocr_overlay(&ocr);
 
-        let mut overlay_vis = desktop::OverlayVisibility::default();
-        if let Some(state) = snapshot_state.as_mut() {
-            let cursor_textures = gpu
-                .snapshot
-                .as_ref()
-                .and_then(|s| s.cursor.as_ref());
-            overlay_vis = state.update_uniforms(
-                &gpu.queue,
-                &FrameState {
-                    monitor_bounds,
-                    mouse_pos,
-                    zoom,
-                    selection,
-                    selection_radius,
-                    selection_dragging,
-                    captured,
-                    overlays_visible,
-                    cursor_overlay_visible,
-                    scroll_pick_mode,
-                    ocr_dim: ocr_fx.dim,
-                    ocr_gray: ocr_fx.gray,
-                    ocr_active: ocr_fx.active,
-                    elapsed: start.elapsed().as_secs_f32(),
-                    surface_size,
-                },
-                cursor_textures,
-            );
-        }
+        let elapsed = start.elapsed().as_secs_f32();
+        let overlay_vis = snapshot_state.update_uniforms(
+            &gpu.queue,
+            &FrameState {
+                monitor_bounds,
+                selection,
+                selection_radius,
+                selection_dragging,
+                captured,
+                overlays_visible,
+                cursor_overlay_visible,
+                scroll_pick_mode,
+                ocr_dim: ocr_fx.dim,
+                ocr_gray: ocr_fx.gray,
+                ocr_active: ocr_fx.active,
+                elapsed,
+                surface_size,
+            },
+            snapshot.cursor.as_ref(),
+        );
 
         if let Some(gt) = gpu_timing.as_mut() {
             for gpu_dur in gt.poll_completed(&gpu.device) {
@@ -683,29 +577,32 @@ fn render_worker_main(
         // multi-hundred-ms gap in the seconds right after show. The debug
         // overlay only shows live sessions; this leaves the evidence in
         // the log where a report can carry it.
-        if !live_region && overall > Duration::from_millis(250) && startup.t_start.elapsed() < Duration::from_secs(12) {
+        if overall > Duration::from_millis(250) && startup.t_start.elapsed() < Duration::from_secs(12) {
             warn!("render worker {monitor_index}: {overall:?} inter-frame gap during startup window");
         }
 
-        let mut sample: Option<PerfSample> = None;
-        let status = draw_once(
+        let sample = match draw_once(
             &mut surface,
             &gpu,
             surface_size,
-            snapshot_state.as_ref(),
+            &snapshot_state,
             overlay_vis,
             ui_renderer.as_mut(),
             gpu_timing.as_ref(),
-            &mut sample,
-        );
-        if status == DrawStatus::DeviceLost {
-            // Terminal: a dead device fails every acquire instantly, so
-            // looping would hot-spin. The show gate has already been
-            // satisfied by this worker (`fail_guard` was disarmed before
-            // the loop), so exiting is the whole fail path here.
-            error!("render worker {monitor_index}: GPU device lost; exiting render loop");
-            return;
-        }
+        ) {
+            DrawStatus::Presented(sample) => Some(sample),
+            DrawStatus::Retry => None,
+            DrawStatus::Failed => {
+                error!("render worker {monitor_index}: preview surface failed");
+                return;
+            }
+        };
+        idle = sample.is_some()
+            && deferred.is_none()
+            && selection.is_none()
+            && !captured
+            && !debug_visible
+            && elapsed >= desktop::FADE_DURATION_SECS;
         if let Some(mut s) = sample {
             s.overall = overall;
             perf.record(s);
@@ -724,9 +621,3 @@ fn render_worker_main(
         }
     }
 }
-
-// ── Peek texture storage ────────────────────────────────────────────
-
-// ── Per-window snapshot state (unchanged) ───────────────────────────
-
-// ── draw_once (unchanged) ───────────────────────────────────────────

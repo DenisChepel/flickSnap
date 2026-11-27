@@ -48,10 +48,12 @@ pub fn write_session(session_dir: &Path, composite: Composite) -> anyhow::Result
         preview_img_path: preview_path.to_string_lossy().into_owned(),
         cursor_img_path: None,
         cursor_position: None,
+        cursor_visible: None,
         cropped_rect: ScreenRect::from_xy_size(0, 0, width as i32, height as i32).into(),
         original_bounds: ScreenRect::zero().into(),
         // A stitched page is a rectangle of content, not a window frame.
         corner_radius: 0.0,
+        rounded_corner_mask: None,
     };
 
     let json_path = session_dir.join("session.json");

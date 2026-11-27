@@ -49,9 +49,8 @@ flags that differ (`CaptureArguments.Build`).
 | Flag | Value | Default | Meaning |
 |---|---|---|---|
 | `--session-dir` | path | none | Directory for the session payload. Omit = standalone mode (no files written, actions handled in-process). |
-| `--accent-color` | `#RRGGBB` / `#RRGGBBAA` (leading `#` optional) | `#3B97D2` | The accent as the user picked it (the OS accent, or their own). The capturer derives everything it paints from it the same way the shell does (`src/accent.rs` mirrors `AccentColors`): the crosshair, selection borders and UI highlights wear it darkened until white labels on it read at 4.5:1, and the hint comet its own OKLCH-derived body and head. |
+| `--accent-color` | `#RRGGBB` / `#RRGGBBAA` (leading `#` optional) | `#3B97D2` | The accent as the user picked it (the OS accent, or their own). The capturer derives everything it paints from it the same way the shell does (`src/accent.rs` mirrors `AccentColors`): selection borders and UI highlights wear it darkened until white labels on it read at 4.5:1. |
 | `--no-accent-contrast` | flag | correction on | Use `--accent-color` exactly as given for the fills, skipping the contrast correction (the shell's "Maintain minimum contrast" setting, off). |
-| `--tips-mode` | `hints` \| `tips` \| `off` | `hints` | Tips/hints overlay at startup (user cycles with `T`). |
 | `--no-cursor` | flag | cursor on | Start with the captured cursor hidden (user toggles with `M`). |
 | `--no-rounded-corners` | flag | rounded on | Keep window selections square. By default a selection made by Active Window (`--capture-mode window`) takes on that window's OS corner radius: the dashed border is drawn rounded and the corner pixels are transparent in the copied / saved image and in `cropped.png`. Dragged, moved or resized selections are always square. The radius is asked of the OS where possible (DWM on Windows 11; the window server's own corner mask on macOS) with a per-version table as fallback — `src/system/corners.rs`. `desktop.png` is never rounded. |
 | `--no-upload` | flag | UPLOAD shown | Hide the UPLOAD button — in the capture strip *and* the OCR strip — and drop its `U` accelerator. |
@@ -60,7 +59,7 @@ flags that differ (`CaptureArguments.Build`).
 | `--no-video` | flag | VIDEO shown | Hide the VIDEO button and drop its `V` accelerator. Sent when the shell has recording switched off entirely (there is no per-button switch for VIDEO). Like `--no-share`, it hides the button only: `--video` is a mode that never shows the strip and is unaffected. |
 | `--no-ocr` | flag | OCR shown | Hide the OCR button and drop its `O` accelerator. The button is the only way into OCR mode, so this also removes the OCR strip. |
 | `--no-image-search` | flag | SEARCH shown | Hide the SEARCH (reverse image search) button and drop its `A` accelerator. Unlike `--no-share` and `--no-video` this removes the action as well as the button: nothing else reaches it. |
-| `--capture-mode` | `region` \| `screen` \| `window` | `region` | `region` = drag a rectangle over the live desktop; `screen`/`window` pre-select the active monitor / foreground window and show the action panel. |
+| `--capture-mode` | `region` \| `screen` \| `window` | `region` | `region` = drag a rectangle over the desktop, frozen when the capture starts; `screen`/`window` pre-select the active monitor / foreground window and show the action panel. |
 | `--video` | flag | off | Video-region picker: first confirmed selection dispatches the VIDEO action immediately. Requires `--session-dir`. |
 | `--share` | flag | off | Share-region picker: first confirmed selection dispatches the SHARE action immediately, skipping the panel. Requires `--session-dir`. The same auto-dispatch shape as `--video`, and mutually exclusive with it: passing both is rejected by clap as a malformed command line, like any other bad flag, because the first confirmed selection cannot be both a recording region and a mirror region. Without the flag the SHARE action is still reachable — from its button on the capture strip. |
 | `--filename-pattern` | .NET date-format string | `yyyy-MM-dd HH-mm-ss` | Name the SAVE dialog opens with, rendered against the local clock at the moment SAVE is pressed and uniquified against `--save-dir` (`name`, `name (1)`, …). Mirrors the shell's "Filename pattern" setting, so a capture saved from the overlay is named exactly as one saved from the editor (`src/filename_pattern.rs`, matching `PathConstants.GetFreePatternFileName`). Month/day names render in English and the timezone specifiers (`z`, `K`) are passed through as literals — neither can appear in a pattern that names a file. A pattern that renders to nothing, or to something the OS cannot spell, falls back to `yyyyMMdd_HHmmss_fff`; an extension typed into it is stripped. |
@@ -119,14 +118,14 @@ backoff) or falls back as above.
 Stdin commands received while an overlay is active are stale and discarded
 before the next `ready` (a `capture` request is still answered with
 `error{rejected}` and a malformed line with `bad_command`, in arrival order).
-The shell re-sends its full settings snapshot in response to every `ready`, so
-dropped settings cannot be lost.
+The shell sends settings only after `ready`. It refreshes the snapshot before
+each capture request and sends it if it differs from the last one sent to this
+process.
 
 | Outcome | Files written | `action.txt` content |
 |---|---|---|
 | EDIT | `desktop.png`, `cropped.png`, [`cursor.png`], `session.json` | none (any stale marker from a failed retry is deleted) |
 | UPLOAD | same as EDIT + `action.txt` | `upload` |
-| SELECT-COLOR | `action.txt` only | `select-color #RRGGBB` |
 | VIDEO | `cropped.png` (poster frame), `action.txt` | `video X,Y,W,H [R]` |
 | SCROLL | `action.txt` only | `scroll X,Y,W,H PX,PY HWND` |
 | SHARE | `action.txt` only | `share X,Y,W,H` |
@@ -140,7 +139,7 @@ File contents:
 
 | File | Contents |
 |---|---|
-| `desktop.png` | Source bitmap without the cursor. Region and screen modes store only the selected area. Active Window retains the frozen desktop for its editor session. |
+| `desktop.png` | Frozen source bitmap without the cursor, with drawn marks clipped to the selection. Region and screen store only the selection; Active Window retains the full desktop for reframing in the editor. |
 | `cropped.png` | Preview of the selection; cursor composited only if visible to the user; corners transparent when the selection is a picked window and rounded corners are on (`--no-rounded-corners`). For VIDEO: the poster shows the visible desktop. For SEARCH-IMAGE: exactly as for EDIT/UPLOAD — it is the image the user is looking up, so it must be the image they were shown. |
 | `cursor.png` | Desktop crop at the cursor rect with the cursor composited. Absent when no cursor was captured or the OS reported it hidden. |
 | `session.json` | Session metadata (§1.3). |
@@ -166,7 +165,7 @@ these files:
 4. OCR-UPLOAD: `ocr.txt` first, then **`action.txt` last**. Its appearance is
    the completion signal; no PNGs and no `session.json` — the recognized text
    is the entire payload, and the shell uploads it as a text paste.
-5. SELECT-COLOR / SCROLL / SHARE: `action.txt` only.
+5. SCROLL / SHARE: `action.txt` only.
 6. Neither `session.json` nor `action.txt` present = the capture was
    canceled; the shell deletes the pre-created directory.
 
@@ -239,6 +238,8 @@ Rects serialize as `{ "X": …, "Y": …, "Width": …, "Height": … }`
 | `PreviewImgPath` | string | Absolute path to `cropped.png` |
 | `CursorImgPath` | string, optional | Absolute path to `cursor.png`; present only with `CursorPosition` |
 | `CursorPosition` | rect, optional | Cursor rect relative to the desktop bitmap origin |
+| `CursorVisible` | boolean, optional | Initial cursor visibility in the image editor. Older sessions use the capture setting. |
+| `RoundedCornerMask` | integer, optional | Bits 0–3 identify rounded corners in TL, TR, BL, BR order. Absent means all corners use `CornerRadius`. |
 | `CroppedRect` | rect | Selection relative to the desktop bitmap origin |
 | `OriginalBounds` | rect | Selection in virtual-desktop coordinates |
 | `CornerRadius` | number, optional | Corner radius in pixels of `CroppedRect` that the capture's corners are rounded with — the OS corner radius of the window the user picked (see `--no-rounded-corners`). Present only when non-zero; absent = square. `cropped.png` already has these corners transparent; `desktop.png` does not, so the editor applies the radius itself when it crops (its image graphic's `CornerRadius`, which the user can then edit). |
@@ -421,10 +422,8 @@ as `stopped` with everything captured so far.
 ## 3. Text recognizer (`flicksnap_ai ocr`)
 
 The only protocol here that the shell is not a party to. When the user presses
-OCR, the overlay extracts the selected region's pixels — compositing a
-click-locked peek if one is up, so what is recognized is what the user can
-actually see — spawns `flicksnap_ai ocr`, and waits for it on the detached `ocr`
-worker thread. **One request, one process, one answer.**
+OCR, the overlay extracts the region from the frozen desktop, spawns
+`flicksnap_ai ocr`, and waits for it on the detached `ocr` worker thread.
 
 It is a **separate binary** because recognition runs on a large native engine
 (PaddleOCR models on ONNX Runtime, via the `ort` crate). A Rust panic in it

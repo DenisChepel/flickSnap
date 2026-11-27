@@ -118,7 +118,7 @@ fn series(g: &MonitorPanelInputs, full: f32, n: f64) -> (Vec<[f64; 2]>, Vec<[f64
 /// The frame-time plot: a filled cpu+gpu series with the filled cpu series
 /// over it, which is what the old stacked bars amounted to. Every knob
 /// that would make the plot interactive is off — the panels sit over a
-/// live selection drag, and a plot that senses a press would swallow it.
+/// selection area, and a plot that senses a press would swallow the drag.
 fn plot(ui: &mut egui::Ui, g: &MonitorPanelInputs, width: f32) {
     let budget_ms = g
         .target_period
@@ -317,8 +317,8 @@ mod tests {
     }
 
     /// The plot must stay out of the hit-test: the panels float over a
-    /// live selection drag, and a plot rect that senses a press would take
-    /// it. Drawn here inside a non-interactable `Area`, exactly as the
+    /// selection area, and a plot rect that senses a press would take
+    /// the drag. Drawn here inside a non-interactable `Area`, exactly as the
     /// panels do it.
     #[test]
     fn the_plot_registers_no_interactive_rect() {

@@ -21,10 +21,6 @@
     "args": [
       "--accent-color",
       "#3B97D2",
-      "--tips-mode",
-      "hints",
-      "--peek-threshold",
-      "0.8",
     ],
     "build": {
       "command": "cargo",

@@ -30,7 +30,7 @@ pub const LIFT_PX: f32 = 4.0;
 /// pressed, HOLDS through the reveal, and fades out on exit. There is
 /// deliberately no deeper "lifted" dim: an earlier build darkened a second
 /// time as the text rendered, which read as the screenshot dimming twice
-/// (owner call). Composed with the desaturation in desktop.wgsl/peek.wgsl
+/// (owner call). Composed with the desaturation in desktop.wgsl,
 /// this leaves the region at ~65% of its luma — darkened, never crushed.
 pub const DIM_MAX: f32 = 0.35;
 

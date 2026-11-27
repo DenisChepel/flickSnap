@@ -1,26 +1,13 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use crate::draw::{DrawState, Marks};
 use crate::ocr::OcrOutcome;
 use crate::selection::{dpi_at_point, hit_test, DragMode, Hittest};
-use crate::settings::TipsMode;
 use crate::system::MonitorInfo;
-use flicksnap_shared::geometry::{ScreenPoint, ScreenPointF, ScreenRect};
+use flicksnap_shared::geometry::{ScreenPointF, ScreenRect};
+use winit::keyboard::ModifiersState;
 use winit::window::CursorIcon;
-
-pub const ZOOM_MIN: f32 = 1.0;
-pub const ZOOM_MAX: f32 = 256.0;
-
-const VELOCITY_WINDOW: Duration = Duration::from_secs(5);
-/// Speed thresholds for the scroll hint, in physical px per second at
-/// 100 % — `evaluate` scales the measured speed down by the DPI so the
-/// same hand movement reads the same on every display.
-const SLOW_SPEED_THRESHOLD: f32 = 15.0;
-const FAST_SPEED_THRESHOLD: f32 = 40.0;
-const HINT_MIN_DISPLAY: Duration = Duration::from_secs(3);
-const MIN_HISTORY: Duration = Duration::from_secs(3);
-const MAX_VELOCITY_SAMPLES: usize = 512;
 
 /// How long an OCR notice stays up before it expires, in seconds. The last
 /// [`NOTICE_FADE_SECS`] of that window fades it out.
@@ -179,95 +166,9 @@ impl OcrState {
     }
 }
 
-pub(crate) struct MouseVelocityTracker {
-    samples: VecDeque<(Instant, ScreenPointF)>,
-    hint_shown_at: Option<Instant>,
-}
-
-impl MouseVelocityTracker {
-    pub fn new() -> Self {
-        Self {
-            samples: VecDeque::with_capacity(MAX_VELOCITY_SAMPLES),
-            hint_shown_at: None,
-        }
-    }
-
-    pub fn record(&mut self, now: Instant, pos: ScreenPointF) {
-        let cutoff = now - VELOCITY_WINDOW;
-        while self
-            .samples
-            .front()
-            .is_some_and(|(t, _)| *t < cutoff)
-        {
-            self.samples.pop_front();
-        }
-        if self.samples.len() >= MAX_VELOCITY_SAMPLES {
-            self.samples.pop_front();
-        }
-        self.samples.push_back((now, pos));
-    }
-
-    fn average_speed(&self, now: Instant) -> f32 {
-        if self.samples.len() < 2 {
-            return 0.0;
-        }
-        let mut total_distance: f32 = 0.0;
-        let mut prev: Option<&ScreenPointF> = None;
-        for (_, pos) in &self.samples {
-            if let Some(p) = prev {
-                let dx = pos.x - p.x;
-                let dy = pos.y - p.y;
-                total_distance += (dx * dx + dy * dy).sqrt();
-            }
-            prev = Some(pos);
-        }
-        let first_time = self.samples.front().unwrap().0;
-        let elapsed = now
-            .duration_since(first_time)
-            .max(Duration::from_secs(1));
-        total_distance / elapsed.as_secs_f32()
-    }
-
-    /// `dpi` is the scale of the monitor under the cursor: the samples
-    /// are physical pixels, the thresholds are 100 % pixels.
-    pub fn evaluate(&mut self, now: Instant, currently_shown: bool, dpi: f32) -> bool {
-        let speed = self.average_speed(now) / dpi.max(1.0);
-        if currently_shown {
-            if let Some(shown_at) = self.hint_shown_at {
-                if now.duration_since(shown_at) < HINT_MIN_DISPLAY {
-                    return true;
-                }
-            }
-            if speed > FAST_SPEED_THRESHOLD {
-                self.hint_shown_at = None;
-                return false;
-            }
-            true
-        } else {
-            let has_enough_history = self
-                .samples
-                .front()
-                .is_some_and(|(t, _)| now.duration_since(*t) >= MIN_HISTORY);
-            if has_enough_history && speed < SLOW_SPEED_THRESHOLD {
-                self.hint_shown_at = Some(now);
-                true
-            } else {
-                false
-            }
-        }
-    }
-
-    pub fn dismiss_hint(&mut self) {
-        self.hint_shown_at = None;
-    }
-}
-
 pub(crate) struct InteractionState {
+    /// The pointer, in virtual-desktop physical px.
     pub virtual_cursor: ScreenPointF,
-    pub zoom: f32,
-    pub anchored: bool,
-    pub anchor_just_engaged: bool,
-    pub anchor: ScreenPoint,
     pub mouse_down: bool,
     pub mouse_down_pt: Option<ScreenPointF>,
     pub mouse_down_dpi: f32,
@@ -286,20 +187,16 @@ pub(crate) struct InteractionState {
     pub hittest: Hittest,
     pub drag_mode: Option<DragMode>,
     pub drag_anchor_selection: Option<ScreenRect>,
-    pub tips_mode: TipsMode,
+    /// The Tips & Hotkeys panel is up (T shows and hides it).
+    pub tips_visible: bool,
+    pub loupe_visible: bool,
     pub debug_visible: bool,
-    pub last_scroll_end: Option<Instant>,
-    pub scroll_momentum: bool,
     pub overlays_visible: bool,
     pub cursor_overlay_visible: bool,
-    pub has_ever_scrolled: bool,
-    pub show_scroll_hint: bool,
-    pub velocity_tracker: MouseVelocityTracker,
-    pub has_used_magnifier: bool,
     /// SCROLL was pressed and we are waiting for the user to click the
     /// point the driver will aim wheel events from. The selection is
     /// already captured and frozen — this mode only collects a point, so
-    /// the panel hides, the cursor becomes a crosshair, and clicks are
+    /// the panel hides, a reticle stands in for the pointer, and clicks are
     /// routed to the picker instead of the panel/drag machinery. Escape
     /// leaves the mode without canceling the cycle.
     pub scroll_pick_mode: bool,
@@ -322,6 +219,15 @@ pub(crate) struct InteractionState {
     /// the user reads it, `ocr` is back to `Idle`, so it cannot live inside
     /// the state enum.
     pub ocr_notice: Option<OcrNotice>,
+    /// The drawing strip's picks: the tool, the colour, whether the colour
+    /// popup is open. A reset puts the tool down with the selection it was
+    /// picked for (`DrawState::reset`).
+    pub draw: DrawState,
+    /// What has been drawn on the selection, and the mark being dragged.
+    pub marks: Marks,
+    /// The keyboard modifiers held: Shift snaps a mark being drawn
+    /// (`draw::geometry::snap_for`), and Ctrl+Z (Cmd+Z on macOS) is UNDO.
+    pub modifiers: ModifiersState,
 }
 
 #[derive(Default)]
@@ -329,14 +235,12 @@ pub(crate) struct InteractionEffects {
     pub broadcast_mouse: bool,
     pub broadcast_ui: bool,
     pub update_cursor_visibility: bool,
-    pub restore_mouse: Option<ScreenPoint>,
     pub set_cursor: Option<CursorIcon>,
 }
 
 impl InteractionState {
     /// A neutral state for tests: the cursor at the virtual-desktop
-    /// origin, nothing selected, nothing captured, no zoom and the
-    /// overlays on. Every overlay's per-host rule is tested by taking one
+    /// origin, nothing selected, nothing captured and the overlays on. Every overlay's per-host rule is tested by taking one
     /// of these and setting only the fields that rule reads, so the
     /// fixture lives beside the struct rather than being copied into each
     /// component.
@@ -344,10 +248,6 @@ impl InteractionState {
     pub fn new() -> Self {
         Self {
             virtual_cursor: ScreenPointF::new(0.0, 0.0),
-            zoom: 1.0,
-            anchored: false,
-            anchor_just_engaged: false,
-            anchor: ScreenPoint::new(0, 0),
             mouse_down: false,
             mouse_down_pt: None,
             mouse_down_dpi: 1.0,
@@ -358,20 +258,18 @@ impl InteractionState {
             hittest: Hittest::Outside,
             drag_mode: None,
             drag_anchor_selection: None,
-            tips_mode: TipsMode::default(),
+            tips_visible: false,
+            loupe_visible: false,
             debug_visible: false,
-            last_scroll_end: None,
-            scroll_momentum: false,
             overlays_visible: true,
             pointer_over_tray: false,
             cursor_overlay_visible: true,
-            has_ever_scrolled: false,
-            show_scroll_hint: false,
-            velocity_tracker: MouseVelocityTracker::new(),
-            has_used_magnifier: false,
             scroll_pick_mode: false,
             ocr: OcrState::Idle,
             ocr_notice: None,
+            draw: DrawState::default(),
+            marks: Marks::default(),
+            modifiers: ModifiersState::empty(),
         }
     }
 }
@@ -379,56 +277,6 @@ impl InteractionState {
 pub(crate) struct InteractionController;
 
 impl InteractionController {
-    pub fn apply_zoom_factor(input: &mut InteractionState, factor: f32) -> InteractionEffects {
-        if !factor.is_finite() || factor <= 0.0 {
-            return InteractionEffects::default();
-        }
-        let new_zoom = (input.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        if (new_zoom - input.zoom).abs() < f32::EPSILON {
-            return InteractionEffects::default();
-        }
-
-        let restore_mouse = if !input.anchored && new_zoom > 1.0 {
-            input.anchored = true;
-            input.anchor_just_engaged = true;
-            Some(input.anchor)
-        } else {
-            None
-        };
-
-        input.zoom = new_zoom;
-
-        // Auto-exit magnifier mode when zoom returns to 1×.
-        let restore_mouse = if input.anchored && (new_zoom - 1.0).abs() < f32::EPSILON {
-            input.overlays_visible = true;
-            Self::release_anchor(input)
-        } else {
-            restore_mouse
-        };
-
-        InteractionEffects {
-            broadcast_mouse: true,
-            broadcast_ui: true,
-            restore_mouse,
-            ..Default::default()
-        }
-    }
-
-    /// Leave magnifier mode's cursor anchoring: the hardware cursor is parked
-    /// at `anchor` while zoomed, so it must go back to where the user was
-    /// pointing. Returns that point, or `None` when the cursor was not anchored.
-    pub fn release_anchor(input: &mut InteractionState) -> Option<ScreenPoint> {
-        if !input.anchored {
-            return None;
-        }
-        input.anchored = false;
-        input.anchor_just_engaged = false;
-        Some(ScreenPoint::new(
-            input.virtual_cursor.x.floor() as i32,
-            input.virtual_cursor.y.floor() as i32,
-        ))
-    }
-
     pub fn finalize_selection(
         input: &mut InteractionState,
         rect: ScreenRect,
@@ -445,9 +293,6 @@ impl InteractionController {
         input.captured = true;
         input.overlays_visible = true;
 
-        let restore_mouse = Self::release_anchor(input);
-        input.zoom = 1.0;
-
         let dpi = dpi_at_point(input.virtual_cursor, monitors);
         let ht = hit_test(input.virtual_cursor, rect, dpi);
         input.hittest = ht;
@@ -456,7 +301,6 @@ impl InteractionController {
             broadcast_mouse: true,
             broadcast_ui: true,
             update_cursor_visibility: true,
-            restore_mouse,
             set_cursor: Some(ht.cursor()),
         }
     }
@@ -467,7 +311,7 @@ impl InteractionController {
         input.captured = false;
         // Pick mode only means anything while a captured selection exists
         // to click inside; dropping the selection must drop the mode too,
-        // or the crosshair/hidden-panel state would outlive its reason.
+        // or the reticle/hidden-panel state would outlive its reason.
         input.scroll_pick_mode = false;
         // Same reasoning as pick mode, one step stronger: a recognition
         // result is a set of rects positioned against the selection that
@@ -476,6 +320,9 @@ impl InteractionController {
         // so the mode — and any notice it raised — goes with it.
         input.ocr = OcrState::Idle;
         input.ocr_notice = None;
+        input.draw.reset();
+        // The marks were drawn on the selection being dropped.
+        input.marks.clear();
         input.hittest = Hittest::Outside;
         input.drag_mode = None;
         input.drag_anchor_selection = None;
@@ -504,16 +351,14 @@ mod tests {
             adapter_id: None,
             #[cfg(target_os = "macos")]
             logical_origin: flicksnap_shared::geometry::LogicalPoint::new(0.0, 0.0),
+            #[cfg(target_os = "macos")]
+            display_id: 0,
         }
     }
 
     fn state() -> InteractionState {
         InteractionState {
             virtual_cursor: ScreenPointF::new(30.0, 30.0),
-            zoom: 2.0,
-            anchored: true,
-            anchor_just_engaged: true,
-            anchor: ScreenPoint::new(100, 60),
             mouse_down: true,
             mouse_down_pt: Some(ScreenPointF::new(20.0, 20.0)),
             mouse_down_dpi: 1.0,
@@ -524,20 +369,18 @@ mod tests {
             hittest: Hittest::Outside,
             drag_mode: None,
             drag_anchor_selection: None,
-            tips_mode: TipsMode::Hints,
+            tips_visible: false,
+            loupe_visible: false,
             debug_visible: false,
-            last_scroll_end: None,
-            scroll_momentum: false,
             overlays_visible: true,
             pointer_over_tray: false,
             cursor_overlay_visible: true,
-            has_ever_scrolled: false,
-            show_scroll_hint: false,
-            velocity_tracker: MouseVelocityTracker::new(),
-            has_used_magnifier: false,
             scroll_pick_mode: false,
             ocr: OcrState::Idle,
             ocr_notice: None,
+            draw: DrawState::default(),
+            marks: Marks::default(),
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -553,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_selection_resets_drag_zoom_and_restores_anchor() {
+    fn finalize_selection_ends_the_drag_and_captures() {
         let mut input = state();
         let rect = ScreenRect::from_xy_size(20, 20, 40, 30);
 
@@ -563,36 +406,8 @@ mod tests {
         assert_eq!(input.selection_radius, 12.0);
         assert!(input.captured);
         assert!(!input.mouse_down);
-        assert_eq!(input.zoom, 1.0);
-        assert!(!input.anchored);
-        assert_eq!(effects.restore_mouse, Some(ScreenPoint::new(30, 30)));
         assert!(effects.broadcast_mouse);
         assert!(effects.broadcast_ui);
-    }
-
-    #[test]
-    fn release_anchor_returns_the_virtual_cursor_once() {
-        let mut input = state();
-        input.virtual_cursor = ScreenPointF::new(319.6, 260.2);
-
-        assert_eq!(InteractionController::release_anchor(&mut input), Some(ScreenPoint::new(319, 260)));
-        assert!(!input.anchored);
-        assert!(!input.anchor_just_engaged);
-        assert_eq!(InteractionController::release_anchor(&mut input), None);
-    }
-
-    #[test]
-    fn apply_zoom_factor_engages_anchor_on_first_zoom_in() {
-        let mut input = state();
-        input.zoom = 1.0;
-        input.anchored = false;
-
-        let effects = InteractionController::apply_zoom_factor(&mut input, 2.0);
-
-        assert_eq!(input.zoom, 2.0);
-        assert!(input.anchored);
-        assert_eq!(effects.restore_mouse, Some(input.anchor));
-        assert!(effects.broadcast_mouse);
     }
 
     #[test]
@@ -696,91 +511,5 @@ mod tests {
         assert!(n.visible());
         assert_eq!(notice_alpha(n.anchor.elapsed().as_secs_f32()), 1.0);
         assert!(!n.kind.message().is_empty());
-    }
-
-    /// The thresholds are 100 % pixels: the same slow hand at 200 % moves
-    /// twice the physical pixels and must still count as slow.
-    #[test]
-    fn slow_threshold_scales_with_dpi() {
-        let mut tracker = MouseVelocityTracker::new();
-        let start = Instant::now();
-        // 20 px/s over four seconds (past MIN_HISTORY): fast at 100 %
-        // (>= 15), slow at 200 % (10).
-        for i in 0..80 {
-            let t = start + Duration::from_millis(i * 50);
-            tracker.record(t, ScreenPointF::new(100.0 + i as f32, 100.0));
-        }
-        let now = start + Duration::from_millis(4000);
-        assert!(!tracker.evaluate(now, false, 1.0));
-        assert!(tracker.evaluate(now, false, 2.0));
-    }
-
-    #[test]
-    fn velocity_tracker_slow_mouse_shows_hint() {
-        let mut tracker = MouseVelocityTracker::new();
-        let start = Instant::now();
-        for i in 0..25 {
-            let t = start + Duration::from_millis(i * 200);
-            tracker.record(t, ScreenPointF::new(100.0 + i as f32 * 0.5, 100.0));
-        }
-        let now = start + Duration::from_millis(24 * 200);
-        assert!(tracker.evaluate(now, false, 1.0));
-    }
-
-    #[test]
-    fn velocity_tracker_fast_mouse_no_hint() {
-        let mut tracker = MouseVelocityTracker::new();
-        let start = Instant::now();
-        for i in 0..25 {
-            let t = start + Duration::from_millis(i * 200);
-            tracker.record(t, ScreenPointF::new(100.0 + i as f32 * 100.0, 100.0));
-        }
-        let now = start + Duration::from_millis(24 * 200);
-        assert!(!tracker.evaluate(now, false, 1.0));
-    }
-
-    #[test]
-    fn velocity_tracker_hint_stays_for_min_duration() {
-        let mut tracker = MouseVelocityTracker::new();
-        let start = Instant::now();
-        for i in 0..20 {
-            let t = start + Duration::from_millis(i * 200);
-            tracker.record(t, ScreenPointF::new(100.0, 100.0));
-        }
-        let show_time = start + Duration::from_millis(19 * 200);
-        assert!(tracker.evaluate(show_time, false, 1.0));
-
-        let fast_time = show_time + Duration::from_secs(1);
-        tracker.record(fast_time, ScreenPointF::new(500.0, 500.0));
-        assert!(tracker.evaluate(fast_time, true, 1.0));
-    }
-
-    #[test]
-    fn velocity_tracker_hides_after_min_duration_with_fast_movement() {
-        let mut tracker = MouseVelocityTracker::new();
-        let start = Instant::now();
-        for i in 0..20 {
-            let t = start + Duration::from_millis(i * 200);
-            tracker.record(t, ScreenPointF::new(100.0, 100.0));
-        }
-        let show_time = start + Duration::from_millis(19 * 200);
-        assert!(tracker.evaluate(show_time, false, 1.0));
-
-        let later = show_time + Duration::from_secs(4);
-        for i in 0..30 {
-            let t = show_time + Duration::from_secs(3) + Duration::from_millis(i * 30);
-            tracker.record(t, ScreenPointF::new(100.0 + i as f32 * 80.0, 100.0));
-        }
-        assert!(!tracker.evaluate(later, true, 1.0));
-    }
-
-    #[test]
-    fn velocity_tracker_no_hint_before_enough_history() {
-        let mut tracker = MouseVelocityTracker::new();
-        let start = Instant::now();
-        tracker.record(start, ScreenPointF::new(100.0, 100.0));
-        let now = start + Duration::from_millis(500);
-        tracker.record(now, ScreenPointF::new(100.0, 100.0));
-        assert!(!tracker.evaluate(now, false, 1.0));
     }
 }

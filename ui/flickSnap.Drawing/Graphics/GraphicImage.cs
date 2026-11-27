@@ -96,6 +96,13 @@ namespace FlickSnap.Drawing.Graphics
             set => Set(ref _crop, value);
         }
 
+        /// <summary>Rounded corners in crop order (TL, TR, BL, BR). Null rounds all four.</summary>
+        public byte? RoundedCornerMask
+        {
+            get => _roundedCornerMask;
+            set => Set(ref _roundedCornerMask, value);
+        }
+
         /// <summary>
         /// For an image the inherited <see cref="GraphicRectangle.CornerRadius"/> is read in
         /// <b>bitmap (crop) pixels</b>, not canvas units: it is seeded from the capturer's
@@ -162,6 +169,7 @@ namespace FlickSnap.Drawing.Graphics
         private int _scaleX = 1;
         private int _scaleY = 1;
         private PixelRect _crop;
+        private byte? _roundedCornerMask;
         private Size _originalSize;
         private ObscuredShape[] _obscuredShapes = new ObscuredShape[0];
         /// <summary>The decoded source bitmap (exposed for tests of the shared decode cache).</summary>
@@ -226,6 +234,7 @@ namespace FlickSnap.Drawing.Graphics
             map[nameof(CursorVisible)] = sourceAspects;
             map[nameof(ObscuredShapes)] = InvalidationAspects.ImageCache;
             map[nameof(Crop)] = InvalidationAspects.Bounds;
+            map[nameof(RoundedCornerMask)] = InvalidationAspects.Bounds;
             map[nameof(FlipX)] = InvalidationAspects.Bounds;
             map[nameof(FlipY)] = InvalidationAspects.Bounds;
         }
@@ -294,7 +303,14 @@ namespace FlickSnap.Drawing.Graphics
         {
             Rect r = UnrotatedBounds;
             var radius = _imageSource == null ? 0 : DrawnCornerRadius(r, Crop.IsEmptyRect() ? new Rect(_imageSource.Size) : Crop.ToRect());
-            DrawTransformed(ctx, c => c.DrawRectangle(null, pen, r, radius, radius));
+            DrawTransformed(ctx, c => c.DrawRectangle(null, pen, RoundedBounds(r, radius)));
+        }
+
+        private RoundedRect RoundedBounds(Rect rect, double radius)
+        {
+            var mask = RoundedCornerMask ?? 0b1111;
+            double At(int corner) => (mask & (1 << corner)) != 0 ? radius : 0;
+            return new RoundedRect(rect, At(0), At(1), At(3), At(2));
         }
 
         private void DrawImageBody(DrawingContext ctx)
@@ -309,9 +325,9 @@ namespace FlickSnap.Drawing.Graphics
             // clip is pushed inside the rotate/flip transforms the body runs under, so it follows
             // them for free. No clip at all for 0: the plain path stays byte-identical.
             var radius = DrawnCornerRadius(r, src);
-            if (radius > 0)
+            if (radius > 0 && RoundedCornerMask != 0)
             {
-                using (ctx.PushClip(new RoundedRect(r, radius)))
+                using (ctx.PushClip(RoundedBounds(r, radius)))
                     DrawImagePixels(ctx, src, r);
             }
             else

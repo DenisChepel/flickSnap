@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -9,8 +8,11 @@ use crate::telemetry::startup::WorkerTimings;
 pub mod desktop;
 pub mod overlay;
 
+/// The capture's GPU devices, kept warm between captures: creating one is
+/// the largest single cost of opening the overlay, and the standby process
+/// pays it ahead of the first capture (`warm`) and then once per display.
 #[cfg(windows)]
-pub mod region_devices {
+pub mod warm_devices {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
 
@@ -46,7 +48,7 @@ pub mod region_devices {
 
     pub fn warm() {
         let _ = std::thread::Builder::new()
-            .name("region-gpu-warmup".into())
+            .name("capture-gpu-warmup".into())
             .spawn(|| {
                 crate::system::lower_thread_priority();
                 let instance = Instance::new();
@@ -66,7 +68,6 @@ pub struct DeviceBundle {
     pub queue: gxi::Queue,
     pub adapter_name: String,
     pub desktop_pipeline: gxi::RenderPipeline,
-    pub crosshair_pipeline: gxi::RenderPipeline,
     pub desktop_sampler: gxi::Sampler,
 }
 
@@ -78,17 +79,11 @@ pub struct WindowGpu {
     pub device: gxi::Device,
     pub queue: gxi::Queue,
     pub pipeline: gxi::RenderPipeline,
-    /// The crosshair pass (Stage A, like the desktop pipeline: it must
-    /// track the mouse from the first visible frames).
-    pub crosshair: gxi::RenderPipeline,
     /// The selection border + handles pass. Built alongside the UI pipeline
     /// (a selection needs user interaction, which needs a visible
     /// overlay), so on a cold start the border appears a beat after the
     /// desktop — the same policy as the rest of the deferred stack.
     pub selection: Option<gxi::RenderPipeline>,
-    #[allow(dead_code)]
-    pub adapter_name: String,
-    pub snapshot: Option<Arc<desktop::DesktopSnapshot>>,
 }
 
 // ── Stage A: device + pipelines (no window needed) ──────────────────
@@ -96,7 +91,6 @@ pub struct WindowGpu {
 pub fn stage_a_create_device(
     instance: gxi::Instance,
     monitor: &crate::system::MonitorInfo,
-    live_region: bool,
     t_start: Instant,
     timings: &WorkerTimings,
 ) -> Result<DeviceBundle> {
@@ -113,23 +107,14 @@ pub fn stage_a_create_device(
             .set_once(t_start.elapsed()),
     };
     #[cfg(windows)]
-    let (device, queue) = if live_region {
-        region_devices::get(&instance, monitor, mark)?
-    } else {
-        gxi::Device::create(&instance, monitor.adapter_id, mark)?
-    };
+    let (device, queue) = warm_devices::get(&instance, monitor, mark)?;
     #[cfg(not(windows))]
-    let (device, queue) = {
-        let _ = live_region;
-        gxi::Device::create(&instance, monitor.adapter_id, mark)?
-    };
+    let (device, queue) = gxi::Device::create(&instance, monitor.adapter_id, mark)?;
     let adapter_name = device.adapter_name().to_string();
 
-    // What frame 0 draws (one triangle sampling the desktop snapshot)
-    // plus the crosshair pass, which must exist the moment the overlay
-    // is visible — the mouse is being tracked from the first frames.
-    // Every other pipeline in the process (selection and the UI
-    // stack) is compiled off this path.
+    // What frame 0 draws: one triangle sampling the desktop snapshot.
+    // Every other pipeline in the process (selection and the UI stack)
+    // is compiled off this path.
     let desktop_sampler = device.create_sampler("desktop snapshot sampler", SamplerFilter::Nearest);
     let desktop_pipeline = device.create_pipeline(&PipelineDesc {
         label: "desktop pipeline",
@@ -137,7 +122,6 @@ pub fn stage_a_create_device(
         vertex: None,
         blend: BlendMode::Replace,
     });
-    let crosshair_pipeline = overlay::create_crosshair_pipeline(&device);
 
     timings
         .prep_pipelines
@@ -148,22 +132,18 @@ pub fn stage_a_create_device(
         queue,
         adapter_name,
         desktop_pipeline,
-        crosshair_pipeline,
         desktop_sampler,
     })
 }
 
 // ── Assemble final WindowGpu ────────────────────────────────────────
 
-pub fn finalize_window_gpu(bundle: DeviceBundle, snapshot: Option<Arc<desktop::DesktopSnapshot>>) -> WindowGpu {
+pub fn finalize_window_gpu(bundle: DeviceBundle) -> WindowGpu {
     WindowGpu {
         device: bundle.device,
         queue: bundle.queue,
         pipeline: bundle.desktop_pipeline,
-        crosshair: bundle.crosshair_pipeline,
         selection: None,
-        adapter_name: bundle.adapter_name,
-        snapshot,
     }
 }
 
@@ -196,7 +176,6 @@ mod tests {
             blend: BlendMode::Replace,
         });
         let _selection = overlay::create_selection_pipeline(&device);
-        let _crosshair = overlay::create_crosshair_pipeline(&device);
         let _egui = crate::ui::gpu::egui_painter::EguiPainter::new(&device);
 
         // The bind-group tables the constructors above do NOT build —
@@ -247,15 +226,6 @@ mod tests {
         let _overlay_bg = device.create_bind_group(
             "smoke overlay bind group",
             ShaderId::Selection,
-            &[
-                BindingRes::Uniform(&ubo),
-                BindingRes::Texture(&immutable),
-                BindingRes::Sampler(&sampler),
-            ],
-        );
-        let _crosshair_bg = device.create_bind_group(
-            "smoke crosshair bind group",
-            ShaderId::Crosshair,
             &[
                 BindingRes::Uniform(&ubo),
                 BindingRes::Texture(&immutable),

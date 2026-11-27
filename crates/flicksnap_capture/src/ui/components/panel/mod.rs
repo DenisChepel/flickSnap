@@ -28,9 +28,10 @@
 //!     button styles ([`model::ButtonStyle`]), the shell's opt-out switches
 //!     ([`model::PanelFeatures`]), and the accelerator lookup. No geometry.
 //!
-//! Each strip is centred with its own width, so a set swap moves the tray
-//! under the cursor; the re-click hazard that creates is `PanelSwapGuard`'s
-//! job (app.rs), not this module's.
+//! Each strip is placed with its own width, its row ending at the
+//! selection's right edge, so a set swap moves the buttons under the
+//! cursor; the re-click hazard that creates is `PanelSwapGuard`'s job
+//! (app.rs), not this module's.
 
 pub mod assets;
 pub mod model;

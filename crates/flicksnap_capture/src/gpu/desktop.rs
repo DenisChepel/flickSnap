@@ -1,18 +1,16 @@
-use std::sync::Arc;
+use std::borrow::Cow;
 
 use crate::gxi::{self, TexFormat, TextureDesc};
 use crate::system::{CapturedCursor, CapturedDesktop, CursorImage};
-use flicksnap_shared::geometry::{RectExt, ScreenPoint};
+use flicksnap_shared::geometry::{ScreenPoint, ScreenRect};
 
-/// Uniforms for the desktop background pass (desktop.wgsl): snapshot UV
-/// mapping, opening fade, selection interior + OCR treatment, and the
-/// frozen cursor composite. Everything overlay-shaped that used to live
-/// here (crosshair, selection border, handles) moved to
-/// [`crate::gpu::overlay::OverlayUniforms`] with its own passes.
+/// Uniforms for the desktop background pass (desktop.wgsl): opening
+/// fade, selection interior + OCR treatment, and the
+/// frozen cursor composite. The selection border and handles have their
+/// own pass ([`crate::gpu::overlay::OverlayUniforms`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WindowUniforms {
-    pub uv_offset_scale: [f32; 4],
     /// x = grayscale fade factor in [0, 1]; y/z/w spare.
     pub params: [f32; 4],
     /// Selection in window-local physical px (l, t, r, b); empty
@@ -45,62 +43,27 @@ pub struct CursorTextures {
 
 pub struct DesktopSnapshot {
     pub texture: gxi::Texture,
-    pub sampler: gxi::Sampler,
-    pub vdesktop_origin: [f32; 2],
-    pub vdesktop_size: [f32; 2],
     pub cursor: Option<CursorTextures>,
-}
-
-// The live overlay binds a single unused texel to keep the existing shaders'
-// binding layout. It never allocates or uploads a desktop image.
-pub fn live_placeholder(device: &gxi::Device, queue: &gxi::Queue, sampler: &gxi::Sampler) -> Arc<DesktopSnapshot> {
-    Arc::new(DesktopSnapshot {
-        texture: create_placeholder_cursor_texture(device, queue),
-        sampler: sampler.clone(),
-        vdesktop_origin: [0.0; 2],
-        vdesktop_size: [1.0; 2],
-        cursor: None,
-    })
 }
 
 pub fn upload_snapshot(
     device: &gxi::Device,
     queue: &gxi::Queue,
     captured: &CapturedDesktop,
-    sampler: &gxi::Sampler,
-) -> Option<Arc<DesktopSnapshot>> {
-    let width = captured.width;
-    let height = captured.height;
+    bounds: ScreenRect,
+) -> anyhow::Result<DesktopSnapshot> {
+    let width = bounds.width() as u32;
+    let height = bounds.height() as u32;
     let max = device.max_texture_dimension_2d();
     if width > max || height > max {
-        error!(
-            "virtual desktop {}x{} exceeds max texture dimension {}; skipping snapshot",
-            width, height, max
-        );
-        return None;
+        bail!("display snapshot {width}x{height} exceeds GPU texture limit {max}");
     }
     if width == 0 || height == 0 {
-        error!("virtual desktop has zero dimension; skipping snapshot");
-        return None;
+        bail!("display snapshot has zero dimension");
     }
 
-    // No forced empty submit after this upload on purpose. Under the old
-    // wgpu backend one existed to force the pending ~33 MB staging copy
-    // into a real submission right away, purely so wgpu-core's
-    // "wait for all work" step inside `configure_surface` had something
-    // to wait on; it was dropped once measurement showed frame 0's own
-    // submit flushes the write regardless. Neither current backend
-    // stages uploads behind a submission at all (d3d11 UpdateSubresource
-    // and Metal replaceRegion write directly), so there is nothing to
-    // force anymore either.
-    //
-    // TRADEOFF, and it is a real one: the upload no longer starts early
-    // enough to overlap window creation, so the copy is serialized into
-    // frame 0 instead of hidden behind it. Whether that is a net win
-    // depends on how long window creation actually takes on the machine.
-    // A/B it against the `upload` -> `first_render` per-worker deltas in
-    // the start-up report before assuming either way.
-    let texture = device.create_texture_with_data(
+    let pixels = monitor_pixels(captured, bounds).ok_or_else(|| anyhow!("display {bounds:?} is outside the captured desktop"))?;
+    let texture = device.try_create_texture_with_data(
         queue,
         &TextureDesc {
             label: "desktop snapshot",
@@ -108,8 +71,8 @@ pub fn upload_snapshot(
             height,
             format: TexFormat::Bgra8Unorm,
         },
-        &captured.bgra,
-    );
+        &pixels,
+    )?;
 
     let cursor = captured.cursor.as_ref().and_then(|c| {
         if !c.visible {
@@ -118,14 +81,18 @@ pub fn upload_snapshot(
         upload_cursor_textures(device, queue, c)
     });
 
-    let bounds_f = captured.bounds.to_f32();
-    Some(Arc::new(DesktopSnapshot {
+    Ok(DesktopSnapshot {
         texture,
-        sampler: sampler.clone(),
-        vdesktop_origin: [bounds_f.left(), bounds_f.top()],
-        vdesktop_size: [bounds_f.width(), bounds_f.height()],
         cursor,
-    }))
+    })
+}
+
+fn monitor_pixels(captured: &CapturedDesktop, bounds: ScreenRect) -> Option<Cow<'_, [u8]>> {
+    if captured.bounds == bounds {
+        return Some(Cow::Borrowed(&captured.bgra));
+    }
+    let (pixels, _, _, covered) = crate::image_extract::extract_selection_bgra(bounds, captured)?;
+    (covered == bounds).then_some(Cow::Owned(pixels))
 }
 
 fn create_small_texture(device: &gxi::Device, queue: &gxi::Queue, bgra: &[u8], width: u32, height: u32, label: &str) -> gxi::Texture {
@@ -192,5 +159,33 @@ fn upload_cursor_textures(device: &gxi::Device, queue: &gxi::Queue, cursor: &Cap
                 visible: true,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flicksnap_shared::geometry::RectExt;
+
+    #[test]
+    fn monitor_upload_crops_wide_desktop_with_negative_origin() {
+        let bounds = ScreenRect::from_xy_size(-9000, -10, 18000, 2);
+        let mut bgra = vec![0; 18000 * 2 * 4];
+        bgra[0] = 11;
+        bgra[9000 * 4] = 22;
+        bgra[(18000 + 9000) * 4] = 33;
+        let desktop = CapturedDesktop {
+            bgra,
+            width: 18000,
+            height: 2,
+            bounds,
+            cursor: None,
+        };
+        let left = monitor_pixels(&desktop, ScreenRect::from_xy_size(-9000, -10, 9000, 2)).unwrap();
+        let right = monitor_pixels(&desktop, ScreenRect::from_xy_size(0, -10, 9000, 2)).unwrap();
+        assert_eq!(left.len(), 9000 * 2 * 4);
+        assert_eq!((left[0], right[0], right[9000 * 4]), (11, 22, 33));
+        assert!(matches!(monitor_pixels(&desktop, bounds), Some(Cow::Borrowed(_))));
+        assert!(monitor_pixels(&desktop, ScreenRect::from_xy_size(8999, -10, 2, 2)).is_none());
     }
 }
