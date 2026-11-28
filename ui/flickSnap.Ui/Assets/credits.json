@@ -342,7 +342,7 @@
           "url": "https://github.com/pykeio/ort"
         },
         {
-          "name": "PaddleOCR PP-OCRv6 models",
+          "name": "PaddleOCR PP-OCRv6 and PP-OCRv5 East Slavic models",
           "version": "",
           "license": "Apache-2.0",
           "url": "https://github.com/PaddlePaddle/PaddleOCR"

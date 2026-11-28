@@ -5,7 +5,8 @@
 //! [`client`] spawns per request; this module is the seam. (Windows.Media.Ocr
 //! was the original Windows backend and proved too inaccurate — it garbled
 //! small and dark-mode text that PaddleOCR reads character-perfectly — so
-//! what runs there now is PP-OCRv6 on ONNX Runtime, on every platform that
+//! what runs there now is PaddleOCR (PP-OCRv6 for Latin and CJK, the PP-OCRv5
+//! East Slavic recognizer for Cyrillic) on ONNX Runtime, on every platform that
 //! has an ONNX Runtime build (not Intel macOS), with the models embedded in
 //! that binary. No OS engine, language pack or download is involved.)
 //!

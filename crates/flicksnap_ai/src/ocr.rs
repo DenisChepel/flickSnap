@@ -14,7 +14,8 @@
 //!
 //! Fully self-contained and platform-independent: the models are embedded,
 //! inference runs on the CPU, and recognition covers Chinese/Japanese/Latin
-//! scripts without any OS engine or language pack.
+//! (PP-OCRv6) and Cyrillic (PaddleOCR's East Slavic recognizer) scripts
+//! without any OS engine or language pack.
 //!
 //! # Pipeline
 //!
@@ -190,6 +191,19 @@ static CHARSET: &str = include_str!("../assets/models/ppocrv6_dict.txt");
 static TINY_REC_MODEL: &[u8] = include_bytes!("../assets/models/pp-ocrv6_tiny_rec.onnx");
 static TINY_CHARSET: &str = include_str!("../assets/models/ppocrv6_tiny_dict.txt");
 
+// PP-OCRv6 has no Cyrillic in its charset. East Slavic is the second
+// recognizer on each detected line, including selections using the tiny tier.
+static ESLAV_REC_MODEL: &[u8] = include_bytes!("../assets/models/eslav_pp-ocrv5_mobile_rec.onnx");
+static ESLAV_CHARSET: &str = include_str!("../assets/models/ppocrv5_eslav_dict.txt");
+
+/// A line counts as Cyrillic when the East Slavic reading has at least this
+/// many [`is_distinct_cyrillic`] letters, or when they make up at least
+/// [`CYRILLIC_MIN_SHARE`] of its letters. Both, because a short Russian word
+/// ("да", "ПК") has one or two such letters, while a Latin line the East
+/// Slavic model misreads picks up at most a stray one in a long line.
+const CYRILLIC_MIN_COUNT: usize = 3;
+const CYRILLIC_MIN_SHARE: f32 = 0.15;
+
 /// Where a panic should leave its explanation. Set once, from [`run`].
 static OUT_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -326,19 +340,23 @@ struct Recognizer {
     charset: Vec<&'static str>,
 }
 
+/// Which embedded recognition model to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecModel {
+    Small,
+    Tiny,
+    Eslav,
+}
+
 impl Recognizer {
-    /// Build the ONE recognition model the tier choice landed on.
-    ///
-    /// Deliberately after detection and deliberately not cached: parsing both
-    /// tiers (21 MB + 4.5 MB of weights) would be a tax on every OCR press for
-    /// a model that is never used. The tier is not known until det has
-    /// produced its boxes, so this cannot be hoisted; it can only be made to
-    /// load one model instead of two.
-    fn load(use_tiny: bool) -> Option<Self> {
-        let (model, dict, name) = if use_tiny {
-            (TINY_REC_MODEL, TINY_CHARSET, "tiny")
-        } else {
-            (REC_MODEL, CHARSET, "small")
+    /// Build a recognition model after detection. Each request loads only
+    /// the PP-OCRv6 tier selected for its crop widths and the East Slavic
+    /// model. Blank requests need neither.
+    fn load(which: RecModel) -> Option<Self> {
+        let (model, dict, name) = match which {
+            RecModel::Tiny => (TINY_REC_MODEL, TINY_CHARSET, "tiny"),
+            RecModel::Small => (REC_MODEL, CHARSET, "small"),
+            RecModel::Eslav => (ESLAV_REC_MODEL, ESLAV_CHARSET, "East Slavic"),
         };
         let t = Instant::now();
         match cpu_session(model) {
@@ -487,21 +505,6 @@ pub fn recognize(req: &OcrRequest) -> Result<OcrOutcome, OcrError> {
         boxes.truncate(MAX_LINES);
     }
 
-    // Tier choice — see the cost model constants. Logged with the numbers
-    // so a slow-feeling capture can be diagnosed from the log alone.
-    let predicted_ms = predict_small_rec_ms(boxes.iter().map(|b| (b.width, b.height)));
-    let use_tiny = predicted_ms > SMALL_TIER_BUDGET_MS;
-    log::info!(
-        "OCR det {:?} ({} boxes), predicted small-rec {:.0} ms -> {} tier",
-        det_elapsed,
-        boxes.len(),
-        predicted_ms,
-        if use_tiny { "tiny" } else { "small" },
-    );
-    let Some(mut rec) = Recognizer::load(use_tiny) else {
-        return Err(OcrError::Unavailable);
-    };
-
     let t_rec = Instant::now();
 
     // The detector box expanded by the context border, clamped to the image.
@@ -514,7 +517,165 @@ pub fn recognize(req: &OcrRequest) -> Result<OcrOutcome, OcrError> {
         .iter()
         .map(|b| img.crop_for_rec(b))
         .collect();
-    let results = recognize_crops(&mut rec, &crops);
+    let all: Vec<&RgbaImage> = crops.iter().collect();
+
+    let predicted_ms = predict_small_rec_ms(boxes.iter().map(|b| (b.width, b.height)));
+    let use_tiny = predicted_ms > SMALL_TIER_BUDGET_MS;
+    log::info!(
+        "OCR det {:?} ({} boxes), predicted small-rec {:.0} ms -> {} tier",
+        det_elapsed,
+        boxes.len(),
+        predicted_ms,
+        if use_tiny { "tiny" } else { "small" },
+    );
+    if all.is_empty() {
+        return Ok(OcrOutcome {
+            lines: Vec::new(),
+            full_text: String::new(),
+            text_angle: 0.0,
+        });
+    }
+    let Some(mut rec) = Recognizer::load(if use_tiny { RecModel::Tiny } else { RecModel::Small }) else {
+        return Err(OcrError::Unavailable);
+    };
+    let mut primary = recognize_crops(&mut rec, &all);
+    let mut cyrillic = Vec::new();
+    if let Some(mut eslav) = Recognizer::load(RecModel::Eslav) {
+        let t = Instant::now();
+        // PP-OCRv6 can fill Cyrillic with plausible look-alikes, especially
+        // in the tiny tier. Its output cannot rule out Cyrillic.
+        let mut east = recognize_crops(&mut eslav, &all);
+        for (i, v6) in primary.iter().enumerate() {
+            if let Some(v6) = v6 {
+                if let Some(mixed) = recognize_around_cjk(&mut eslav, &crops[i], v6) {
+                    east[i] = Some(mixed);
+                }
+            }
+            if boxes[i].width <= boxes[i].height * 2
+                && east[i]
+                    .as_ref()
+                    .is_none_or(|r| r.confidence() < 0.8)
+                && v6
+                    .as_ref()
+                    .is_none_or(|r| r.confidence() < 0.8)
+            {
+                // Fixed five-pixel padding can dominate the tensor of a
+                // single glyph. Use its tight box when the models disagree.
+                let tight = img.crop_for_rec(&boxes[i]);
+                if let Some(mut retry) = recognize_crops(&mut eslav, &[&tight])
+                    .pop()
+                    .flatten()
+                {
+                    if is_cyrillic_line(&retry.text())
+                        && east[i]
+                            .as_ref()
+                            .is_none_or(|r| retry.confidence() > r.confidence())
+                    {
+                        retry.place_in_input(boxes[i].left - expanded[i].left, boxes[i].width, tight.width());
+                        for glyph in &mut retry.glyphs {
+                            glyph.x *= crops[i].width() as f32 / expanded[i].width as f32;
+                        }
+                        east[i] = Some(retry);
+                    }
+                }
+            }
+        }
+        let supported: Vec<bool> = east
+            .iter()
+            .map(|r| {
+                r.as_ref()
+                    .is_some_and(|r| r.confidence() >= MIN_CONFIDENCE && is_cyrillic_line(&r.text()))
+            })
+            .collect();
+        for (i, read) in east.into_iter().enumerate() {
+            let Some(mut reading) = read else { continue };
+            if supported[i] || (is_cyrillic_context(i, &boxes, &supported) && restore_cyrillic_label(&mut reading, &eslav.charset)) {
+                cyrillic.push((i, reading));
+            } else if reading.confidence() >= MIN_CONFIDENCE
+                && primary[i]
+                    .as_ref()
+                    .is_none_or(|r| r.confidence() < MIN_CONFIDENCE)
+            {
+                primary[i] = Some(reading);
+            }
+        }
+        log::info!(
+            "OCR East Slavic pass {:?}: {} of {} lines are Cyrillic",
+            t.elapsed(),
+            cyrillic.len(),
+            all.len()
+        );
+    }
+
+    // The Latin runs inside Cyrillic lines ("Settings → Privacy", "Apple®
+    // iPhone™"), cut out at the spaces around them and re-read by PP-OCRv6,
+    // which is the stronger reader of Latin and symbols — but only on a crop
+    // with no Cyrillic in it, where its context is not thrown off by glyphs
+    // it has never seen.
+    let mut patches: Vec<Patch> = Vec::new();
+    for (line, reading) in &cyrillic {
+        let crop_w = crops[*line].width() as f32;
+        let b = expanded[*line];
+        let scale = b.width as f32 / crop_w;
+        for (first, last) in latin_runs(reading) {
+            let g = &reading.glyphs;
+            let left = if first == 0 { 0.0 } else { g[first - 1].x };
+            let right = if last + 1 == g.len() { crop_w } else { g[last + 1].x };
+            let x0 = b.left + (left * scale).floor() as u32;
+            let x1 = (b.left + (right * scale).ceil() as u32).min(b.left + b.width);
+            if x1 <= x0 + 1 {
+                continue;
+            }
+            let sub = DetBox {
+                left: x0,
+                top: b.top,
+                width: x1 - x0,
+                height: b.height,
+            };
+            patches.push(Patch {
+                line: *line,
+                first,
+                last,
+                crop: img.crop_for_rec(&sub),
+                left: sub.left,
+                width: sub.width,
+            });
+        }
+    }
+    let mut patch_reads = recognize_crops(
+        &mut rec,
+        &patches
+            .iter()
+            .map(|p| &p.crop)
+            .collect::<Vec<_>>(),
+    );
+
+    let mut results: Vec<Option<(String, f32)>> = primary
+        .into_iter()
+        .map(|r| r.map(|r| (r.text(), r.confidence())))
+        .collect();
+    // Glyph positions into input pixels, where the line's reading and its
+    // patches' readings can be compared.
+    for (p, read) in patches.iter().zip(patch_reads.iter_mut()) {
+        if let Some(read) = read {
+            read.place_in_input(p.left, p.width, p.crop.width());
+        }
+    }
+    for (line, reading) in cyrillic.iter_mut() {
+        let b = expanded[*line];
+        reading.place_in_input(b.left, b.width, crops[*line].width());
+    }
+    for (line, reading) in cyrillic {
+        let spliced = splice_patches(
+            &reading,
+            patches
+                .iter()
+                .zip(&patch_reads)
+                .filter(|(p, _)| p.line == line)
+                .filter_map(|(p, r)| r.as_ref().map(|r| (p.first, p.last, r))),
+        );
+        results[line] = Some((fix_mixed_script_words(&spliced), reading.confidence()));
+    }
 
     let ox = req.origin.left() as f32;
     let oy = req.origin.top() as f32;
@@ -523,7 +684,8 @@ pub fn recognize(req: &OcrRequest) -> Result<OcrOutcome, OcrError> {
         let Some((text, confidence)) = result else {
             continue;
         };
-        if text.trim().is_empty() || confidence < MIN_CONFIDENCE {
+        let text = normalize_text(&text);
+        if text.is_empty() || confidence < MIN_CONFIDENCE {
             continue;
         }
 
@@ -912,18 +1074,64 @@ fn convex_hull(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
     lower
 }
 
+/// One decoded character of a recognized line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Glyph<'a> {
+    text: &'a str,
+    /// Its CTC step's softmax probability.
+    prob: f32,
+    /// Horizontal centre of the step that emitted it, in the recognizer's
+    /// input pixels (the 48 px tall resized crop). A CTC step covers a fixed
+    /// slice of the input width, so this places the character in the crop.
+    x: f32,
+}
+
+/// A recognizer's reading of one crop.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Reading<'a> {
+    glyphs: Vec<Glyph<'a>>,
+}
+
+impl Reading<'_> {
+    /// Move glyph positions from the recognizer's input pixels to input-image
+    /// pixels, for a crop cut at `left`, `width` wide, resized to `crop_w`.
+    fn place_in_input(&mut self, left: u32, width: u32, crop_w: u32) {
+        let scale = width as f32 / crop_w.max(1) as f32;
+        for g in &mut self.glyphs {
+            g.x = left as f32 + g.x * scale;
+        }
+    }
+
+    fn text(&self) -> String {
+        self.glyphs.iter().map(|g| g.text).collect()
+    }
+
+    /// Mean probability of the kept steps; 0.0 when nothing was read.
+    fn confidence(&self) -> f32 {
+        if self.glyphs.is_empty() {
+            0.0
+        } else {
+            self.glyphs
+                .iter()
+                .map(|g| g.prob)
+                .sum::<f32>()
+                / self.glyphs.len() as f32
+        }
+    }
+}
+
 /// Recognize every crop, batched in width-sorted chunks of [`REC_BATCH`]
-/// (see there). Returns `(text, mean confidence)` per crop, in the crops'
-/// own order; `None` where inference failed for that crop.
-fn recognize_crops(rec: &mut Recognizer, crops: &[RgbaImage]) -> Vec<Option<(String, f32)>> {
-    let mut results: Vec<Option<(String, f32)>> = vec![None; crops.len()];
+/// (see there). Returns one [`Reading`] per crop, in the crops' own order;
+/// `None` where inference failed for that crop.
+fn recognize_crops(rec: &mut Recognizer, crops: &[&RgbaImage]) -> Vec<Option<Reading<'static>>> {
+    let mut results: Vec<Option<Reading<'static>>> = vec![None; crops.len()];
     if crops.is_empty() {
         return results;
     }
     let mut rec_order: Vec<usize> = (0..crops.len()).collect();
     rec_order.sort_by_key(|&i| crops[i].width());
     for chunk in rec_order.chunks(REC_BATCH) {
-        let refs: Vec<&RgbaImage> = chunk.iter().map(|&i| &crops[i]).collect();
+        let refs: Vec<&RgbaImage> = chunk.iter().map(|&i| crops[i]).collect();
         match infer_batch(rec, &refs) {
             Ok(rs) => {
                 for (&i, r) in chunk.iter().zip(rs) {
@@ -936,7 +1144,7 @@ fn recognize_crops(rec: &mut Recognizer, crops: &[RgbaImage]) -> Vec<Option<(Str
                 // only the truly bad crop is lost.
                 log::warn!("OCR batch failed ({e:#}); retrying its regions individually");
                 for &i in chunk {
-                    match infer_batch(rec, &[&crops[i]]) {
+                    match infer_batch(rec, &[crops[i]]) {
                         Ok(mut r) => results[i] = r.pop(),
                         Err(e) => log::warn!("OCR region failed: {e:#}"),
                     }
@@ -952,7 +1160,7 @@ fn recognize_crops(rec: &mut Recognizer, crops: &[RgbaImage]) -> Vec<Option<(Str
 /// right in normalized space (`v/127.5 - 1`, B,G,R channel order — PaddleOCR
 /// trains its recognizer on cv2 BGR input), then greedy CTC decoding of the
 /// `[N,T,C]` per-step softmax.
-fn infer_batch(rec: &mut Recognizer, crops: &[&RgbaImage]) -> anyhow::Result<Vec<(String, f32)>> {
+fn infer_batch(rec: &mut Recognizer, crops: &[&RgbaImage]) -> anyhow::Result<Vec<Reading<'static>>> {
     let h = REC_TARGET_HEIGHT as usize;
     let wmax = crops
         .iter()
@@ -997,36 +1205,557 @@ fn infer_batch(rec: &mut Recognizer, crops: &[&RgbaImage]) -> anyhow::Result<Vec
         rec.charset.len()
     );
     let (steps, classes) = (dims[1], dims[2]);
+    // Every sample is padded to `wmax`, so a step covers the same width in
+    // all of them.
+    let step_width = wmax as f32 / steps.max(1) as f32;
     Ok((0..crops.len())
-        .map(|n| ctc_decode(&probs[n * steps * classes..(n + 1) * steps * classes], classes, &rec.charset))
+        .map(|n| {
+            let mut reading = ctc_decode(
+                &probs[n * steps * classes..(n + 1) * steps * classes],
+                classes,
+                &rec.charset,
+                step_width,
+            );
+            reading
+                .glyphs
+                .retain(|glyph| glyph.x < crops[n].width() as f32);
+            reading
+        })
         .collect())
 }
 
 /// Greedy CTC decode of one sample's `[T,C]` softmax: per-step argmax, drop
-/// blanks (class 0) and repeats of the previous step's class, and average
-/// the kept steps' probabilities as the confidence (0.0 when nothing was
-/// kept).
-fn ctc_decode(probs: &[f32], classes: usize, charset: &[&str]) -> (String, f32) {
-    let mut text = String::new();
-    let mut conf_sum = 0f32;
-    let mut kept = 0usize;
+/// blanks (class 0) and repeats of the previous step's class. Each kept step
+/// becomes a [`Glyph`] placed at the centre of its `step_width` slice.
+fn ctc_decode<'a>(probs: &[f32], classes: usize, charset: &[&'a str], step_width: f32) -> Reading<'a> {
+    let mut glyphs = Vec::new();
     let mut prev = 0usize;
-    for step in probs.chunks_exact(classes) {
+    for (t, step) in probs.chunks_exact(classes).enumerate() {
         let (idx, &p) = step
             .iter()
             .enumerate()
             .fold((0usize, &f32::NEG_INFINITY), |best, (i, v)| if v > best.1 { (i, v) } else { best });
         if idx != 0 && idx != prev {
-            if let Some(s) = charset.get(idx) {
-                text.push_str(s);
-                conf_sum += p;
-                kept += 1;
+            if let Some(&text) = charset.get(idx) {
+                glyphs.push(Glyph {
+                    text,
+                    prob: p,
+                    x: (t as f32 + 0.5) * step_width,
+                });
             }
         }
         prev = idx;
     }
-    let confidence = if kept == 0 { 0.0 } else { conf_sum / kept as f32 };
-    (text, confidence)
+    Reading {
+        glyphs,
+    }
+}
+
+/// Cyrillic ↔ Latin letters that render identically (or near enough that a
+/// recognizer cannot tell them apart in isolation), as `(cyrillic, latin)`.
+const HOMOGLYPHS: [(char, char); 23] = [
+    ('А', 'A'),
+    ('В', 'B'),
+    ('Е', 'E'),
+    ('К', 'K'),
+    ('М', 'M'),
+    ('Н', 'H'),
+    ('О', 'O'),
+    ('Р', 'P'),
+    ('С', 'C'),
+    ('Т', 'T'),
+    ('Х', 'X'),
+    ('У', 'Y'),
+    ('І', 'I'),
+    ('а', 'a'),
+    ('е', 'e'),
+    ('о', 'o'),
+    ('р', 'p'),
+    ('с', 'c'),
+    ('у', 'y'),
+    ('х', 'x'),
+    ('к', 'k'),
+    ('і', 'i'),
+    ('ѕ', 's'),
+];
+
+fn is_cyrillic(c: char) -> bool {
+    matches!(c, '\u{0400}'..='\u{04FF}')
+}
+
+/// A Cyrillic letter with no Latin look-alike: seeing one is evidence of
+/// Cyrillic text, not of a recognizer picking the wrong twin of a Latin
+/// letter.
+fn is_distinct_cyrillic(c: char) -> bool {
+    is_cyrillic(c) && c.is_alphabetic() && !HOMOGLYPHS.iter().any(|&(cy, _)| cy == c)
+}
+
+/// A Latin letter with no Cyrillic look-alike.
+fn is_distinct_latin(c: char) -> bool {
+    c.is_ascii_alphabetic() && !HOMOGLYPHS.iter().any(|&(_, la)| la == c)
+}
+
+/// Whether the East Slavic recognizer's reading of a line is Cyrillic text
+/// (see [`CYRILLIC_MIN_COUNT`]), or has a Cyrillic word in it: a word of two
+/// or more letters with a distinct Cyrillic letter and no distinct Latin one
+/// ("Тел.", "версия" in an otherwise English line). Such a line is read the
+/// Cyrillic way too, which costs its Latin words nothing — they are re-read
+/// by PP-OCRv6 as Latin runs.
+fn is_cyrillic_line(text: &str) -> bool {
+    let letters = text
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .count();
+    let distinct = text
+        .chars()
+        .filter(|&c| is_distinct_cyrillic(c))
+        .count();
+    if distinct > 0 && (distinct >= CYRILLIC_MIN_COUNT || distinct as f32 >= CYRILLIC_MIN_SHARE * letters as f32) {
+        return true;
+    }
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|w| {
+            w.chars()
+                .filter(|c| c.is_alphabetic())
+                .count()
+                >= 2
+                && w.chars().any(is_distinct_cyrillic)
+                && !w.chars().any(is_distinct_latin)
+        })
+}
+
+/// Short labels consisting only of look-alikes are inherently ambiguous.
+fn is_cyrillic_context(line: usize, boxes: &[DetBox], supported: &[bool]) -> bool {
+    let b = boxes[line];
+    let near = |i| {
+        let other: DetBox = boxes[i];
+        b.top.abs_diff(other.top) <= 4 * b.height.max(other.height) && b.left < other.left + other.width && other.left < b.left + b.width
+    };
+    let neighbors = line.saturating_sub(4)..(line + 5).min(boxes.len());
+    neighbors
+        .filter(|&i| i != line && supported[i] && near(i))
+        .take(2)
+        .count()
+        == 2
+}
+
+fn restore_cyrillic_label(reading: &mut Reading<'static>, charset: &[&'static str]) -> bool {
+    if reading.confidence() < MIN_CONFIDENCE {
+        return false;
+    }
+    let text = reading.text();
+    let label = text.trim();
+    if label.is_empty()
+        || label.chars().count() > 4
+        || !label.chars().all(|c| {
+            c.is_uppercase()
+                && HOMOGLYPHS
+                    .iter()
+                    .any(|&(cy, la)| c == cy || c == la)
+        })
+    {
+        return false;
+    }
+    for glyph in &mut reading.glyphs {
+        if let Some((cy, _)) = HOMOGLYPHS
+            .iter()
+            .find(|&&(_, la)| glyph.text.chars().eq([la]))
+        {
+            if let Some(&label) = charset
+                .iter()
+                .find(|label| label.chars().eq([*cy]))
+            {
+                glyph.text = label;
+            }
+        }
+    }
+    true
+}
+
+/// Straighten out words the East Slavic recognizer read in a mix of scripts.
+/// It knows both alphabets, and on look-alike letters it sometimes picks the
+/// wrong one inside an otherwise single-script word ("Привeт" with a Latin
+/// `e`, "Brаnd" with a Cyrillic `а`), which reads fine but breaks copy,
+/// search and spell-check. A word whose distinct letters are all Cyrillic
+/// gets its Latin look-alikes swapped for Cyrillic ones, and the other way
+/// round; a word with distinct letters of both scripts, or of neither, is
+/// left alone — there is nothing to decide it by.
+fn fix_mixed_script_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let cyr = word.chars().any(is_distinct_cyrillic);
+        let lat = word.chars().any(is_distinct_latin);
+        let mixed = word.chars().any(is_cyrillic) && word.chars().any(|c| c.is_ascii_alphabetic());
+        if mixed && cyr != lat {
+            for c in word.chars() {
+                let swapped = HOMOGLYPHS.iter().find_map(|&(cy, la)| {
+                    if cyr && c == la {
+                        Some(cy)
+                    } else if lat && c == cy {
+                        Some(la)
+                    } else {
+                        None
+                    }
+                });
+                out.push(swapped.unwrap_or(c));
+            }
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}' | '\u{20000}'..='\u{323af}')
+}
+
+/// East Slavic has no CJK classes. Keep confident CJK runs from PP-OCRv6
+/// and reread the intervening strips with East Slavic, so it sees only
+/// scripts it was trained on. If no Cyrillic survives, keep the original v6
+/// reading of the whole line.
+fn recognize_around_cjk(eslav: &mut Recognizer, crop: &RgbaImage, v6: &Reading<'static>) -> Option<Reading<'static>> {
+    let g = &v6.glyphs;
+    let is_space = |glyph: &Glyph<'_>| glyph.text.trim().is_empty();
+    let is_cjk_glyph = |glyph: &Glyph<'_>| glyph.text.chars().any(is_cjk);
+    let mut spans = Vec::new();
+    let mut end = 0;
+    while end < g.len() {
+        let start = end;
+        while end < g.len() && is_cjk_glyph(&g[end]) {
+            end += 1;
+        }
+        let run = &g[start..end];
+        if run.len() >= 2
+            && run
+                .iter()
+                .map(|glyph| glyph.prob)
+                .sum::<f32>()
+                >= 0.8 * run.len() as f32
+        {
+            let space_before = start > 0 && is_space(&g[start - 1]);
+            let first = if space_before
+                && spans
+                    .last()
+                    .is_none_or(|span: &std::ops::Range<usize>| span.end < start)
+            {
+                start - 1
+            } else {
+                start
+            };
+            let last = end + usize::from(end < g.len() && is_space(&g[end]));
+            spans.push(first..last);
+        }
+        end += 1;
+    }
+    if spans.is_empty() {
+        return None;
+    }
+
+    let edge = |i: usize| match i {
+        0 => 0,
+        i if i == g.len() => crop.width(),
+        _ => ((g[i - 1].x + g[i].x) * 0.5).round() as u32,
+    };
+    let gaps: Vec<_> = std::iter::once(0)
+        .chain(spans.iter().map(|span| span.end))
+        .zip(
+            spans
+                .iter()
+                .map(|span| span.start)
+                .chain(std::iter::once(g.len())),
+        )
+        .collect();
+    let strips: Vec<_> = gaps
+        .iter()
+        .filter_map(|&(start, end)| {
+            let (left, right) = (edge(start), edge(end));
+            (left < right).then(|| image::imageops::crop_imm(crop, left, 0, right - left, crop.height()).to_image())
+        })
+        .collect();
+    let mut reads = recognize_crops(eslav, &strips.iter().collect::<Vec<_>>()).into_iter();
+    let mut glyphs = Vec::new();
+    let mut has_cyrillic = false;
+    for (i, (start, end)) in gaps.into_iter().enumerate() {
+        let left = edge(start);
+        if left < edge(end) {
+            match reads.next().flatten() {
+                Some(mut read) if read.confidence() >= MIN_CONFIDENCE && is_cyrillic_line(&read.text()) => {
+                    has_cyrillic = true;
+                    for glyph in &mut read.glyphs {
+                        glyph.x += left as f32;
+                    }
+                    glyphs.extend(read.glyphs);
+                }
+                _ => glyphs.extend_from_slice(&g[start..end]),
+            }
+        }
+        if let Some(span) = spans.get(i) {
+            glyphs.extend_from_slice(&g[span.clone()]);
+        }
+    }
+    has_cyrillic.then_some(Reading {
+        glyphs,
+    })
+}
+
+/// A Latin run inside a Cyrillic line, cut out for PP-OCRv6 to re-read.
+struct Patch {
+    /// The line (index into the request's boxes) it belongs to.
+    line: usize,
+    /// The run's first and last glyph in the line's East Slavic reading.
+    first: usize,
+    last: usize,
+    crop: RgbaImage,
+    /// Left edge of the cut in input pixels.
+    left: u32,
+    /// Its width in input pixels.
+    width: u32,
+}
+
+/// Lowest confidence at which a PP-OCRv6 re-read replaces the East Slavic
+/// reading of a Latin run.
+const PATCH_MIN_CONFIDENCE: f32 = 0.6;
+
+/// The Latin runs of a Cyrillic line's reading, as inclusive glyph index
+/// ranges: maximal stretches of space-separated words with no more
+/// [distinct](is_distinct_cyrillic) Cyrillic letters than
+/// [distinct](is_distinct_latin) Latin ones, of which at least one contains a
+/// Latin letter. A run of
+/// bare numbers and punctuation is left alone — the East Slavic recognizer
+/// reads those as well as PP-OCRv6 does.
+fn latin_runs(reading: &Reading<'_>) -> Vec<(usize, usize)> {
+    // Words as glyph ranges, split at space glyphs.
+    let g = &reading.glyphs;
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, glyph) in g.iter().enumerate() {
+        let space = glyph.text.trim().is_empty();
+        match (space, start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                words.push((s, i - 1));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        words.push((s, g.len() - 1));
+    }
+
+    let count = |(a, b): (usize, usize), f: fn(char) -> bool| {
+        g[a..=b]
+            .iter()
+            .flat_map(|x| x.text.chars())
+            .filter(|&c| f(c))
+            .count()
+    };
+    let mut runs = Vec::new();
+    let mut run: Option<(usize, usize, bool)> = None;
+    for (index, &w) in words.iter().enumerate() {
+        // By the letters that have no twin in the other script: the East
+        // Slavic reading mixes look-alikes of the wrong script into words of
+        // either ("вepcия", "Privaсy"), so the look-alikes say nothing, and
+        // a stray misread distinct letter ("iPhoneгм") must not outvote the
+        // rest of its word.
+        if count(w, is_distinct_cyrillic) > count(w, is_distinct_latin) || count(w, is_cjk) > 0 {
+            if let Some((a, b, true)) = run.take() {
+                runs.push((a, b));
+            }
+            run = None;
+        } else {
+            let (first, last) = w;
+            let latin = count(w, |c| c.is_ascii_alphabetic()) > 0;
+            let digits = |a, b| count((a, b), |c| c.is_ascii_digit()) == b - a + 1;
+            let currency = first == last
+                && matches!(g[first].text, "P" | "Р" | "₽")
+                && index
+                    .checked_sub(1)
+                    .is_some_and(|i| digits(words[i].0, words[i].1));
+            let reread = latin || currency;
+            run = Some(match run {
+                Some((a, _, l)) => (a, w.1, l || reread),
+                None => (w.0, w.1, reread),
+            });
+        }
+    }
+    if let Some((a, b, true)) = run {
+        runs.push((a, b));
+    }
+    runs
+}
+
+/// A Cyrillic line's text with the PP-OCRv6 re-reads of its Latin runs
+/// spliced in if the new glyphs are confident and cover the original run.
+fn splice_patches<'a>(reading: &Reading<'_>, patches: impl Iterator<Item = (usize, usize, &'a Reading<'a>)>) -> String {
+    let g = &reading.glyphs;
+    let mut accepted: Vec<(usize, usize, String)> = patches
+        .filter_map(|(first, last, read)| {
+            let text = respace(&g[first..=last], read);
+            let had = g[first..=last]
+                .iter()
+                .filter(|x| !x.text.trim().is_empty())
+                .count();
+            let got = text
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .count();
+            let mut ink = read
+                .glyphs
+                .iter()
+                .filter(|g| !g.text.trim().is_empty());
+            let plausible = ink.next().is_some_and(|left| {
+                let right = ink.next_back().unwrap_or(left);
+                let margin = (g[last].x - g[first].x).max(1.0) * 0.15 + 2.0;
+                (left.x - g[first].x).abs() <= margin && (right.x - g[last].x).abs() <= margin
+            }) && read.confidence() >= PATCH_MIN_CONFIDENCE
+                && got * 2 >= had
+                && got <= had * 2;
+            // Keep a Cyrillic letter or an existing currency sign unless
+            // the second model has actually observed the rouble glyph.
+            let original: String = g[first..=last]
+                .iter()
+                .map(|glyph| glyph.text)
+                .collect();
+            let drops_currency = original.contains('₽') && !text.contains('₽');
+            let only_numeric = original
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_whitespace() || matches!(c, 'P' | 'Р'));
+            let changes_cyrillic_p = only_numeric && original.contains('Р') && !text.contains('₽');
+            (plausible && !drops_currency && !changes_cyrillic_p).then_some((first, last, text))
+        })
+        .collect();
+    accepted.sort_by_key(|p| p.0);
+
+    let mut out = String::new();
+    let mut i = 0;
+    let mut next = accepted.into_iter().peekable();
+    while i < g.len() {
+        if next.peek().is_some_and(|p| p.0 == i) {
+            let (_, last, text) = next.next().expect("peeked");
+            out.push_str(&text);
+            i = last + 1;
+        } else {
+            out.push_str(g[i].text);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A patch's re-read text, with the word breaks of the line's own reading
+/// (`segment`) restored where the re-read ran two words together, and the
+/// segment's edge punctuation kept where the cut clipped it. Both readings'
+/// glyphs must be in the same (input-pixel) coordinates.
+fn respace(segment: &[Glyph<'_>], read: &Reading<'_>) -> String {
+    let is_space = |x: &Glyph<'_>| x.text.trim().is_empty();
+    let words = |gs: &mut dyn Iterator<Item = bool>| {
+        let mut n = 0usize;
+        let mut prev_space = true;
+        for space in gs {
+            if !space && prev_space {
+                n += 1;
+            }
+            prev_space = space;
+        }
+        n
+    };
+    let glyphs: Vec<&Glyph<'_>> = read
+        .glyphs
+        .iter()
+        .skip_while(|x| is_space(x))
+        .collect();
+    let missing = words(&mut segment.iter().map(is_space)).saturating_sub(words(&mut glyphs.iter().map(|x| is_space(x))));
+
+    // Candidate gaps: between two adjacent non-space glyphs, containing one of
+    // the segment's spaces, wider than the re-read's typical glyph pitch (a
+    // word break is a space's width more than a letter step), and before a
+    // glyph that can start a word — the line's reading sometimes splits a
+    // trailing mark off its word ("iPhone TM"), which the width alone cannot
+    // tell from a real break.
+    let mut pitches: Vec<f32> = glyphs
+        .windows(2)
+        .map(|w| w[1].x - w[0].x)
+        .collect();
+    pitches.sort_by(f32::total_cmp);
+    let pitch = pitches
+        .get(pitches.len() / 2)
+        .copied()
+        .unwrap_or(0.0);
+    let spaces: Vec<f32> = segment
+        .iter()
+        .filter(|x| is_space(x))
+        .map(|x| x.x)
+        .collect();
+    let mut gaps: Vec<(usize, f32)> = (1..glyphs.len())
+        .filter(|&i| !is_space(glyphs[i]) && !is_space(glyphs[i - 1]))
+        .filter_map(|i| {
+            let (a, b) = (glyphs[i - 1].x, glyphs[i].x);
+            let starts_word = glyphs[i]
+                .text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || "([{«\"'“„".contains(c));
+            (starts_word && b - a > 1.2 * pitch && spaces.iter().any(|&s| s > a && s < b)).then_some((i, b - a))
+        })
+        .collect();
+    gaps.sort_by(|x, y| y.1.total_cmp(&x.1));
+    gaps.truncate(missing);
+
+    let mut out = String::new();
+    for (i, glyph) in glyphs.iter().enumerate() {
+        if gaps.iter().any(|&(g, _)| g == i) {
+            out.push(' ');
+        }
+        out.push_str(glyph.text);
+    }
+    let mut out = out.trim_end().to_string();
+
+    const EDGE: &str = ",.;:!?";
+    let seg: String = segment.iter().map(|x| x.text).collect();
+    let seg = seg.trim();
+    if let Some(c) = seg
+        .chars()
+        .last()
+        .filter(|&c| EDGE.contains(c))
+    {
+        if !out.ends_with(|o: char| EDGE.contains(o)) && !out.is_empty() {
+            out.push(c);
+        }
+    }
+    if let Some(c) = seg
+        .chars()
+        .next()
+        .filter(|&c| EDGE.contains(c))
+    {
+        if !out.starts_with(|o: char| EDGE.contains(o)) && !out.is_empty() {
+            out.insert(0, c);
+        }
+    }
+    out
+}
+
+/// Trim padding from recognition and normalize composed temperature symbols
+/// to the equivalent degree and unit used by the UI.
+fn normalize_text(text: &str) -> String {
+    text.trim()
+        .replace("°℃", "°C")
+        .replace('℃', "°C")
+        .replace("°С", "°C")
+        .replace("°℉", "°F")
+        .replace('℉', "°F")
 }
 
 #[cfg(test)]
@@ -1044,6 +1773,52 @@ mod tests {
     }
 
     /// Decode an RGBA PNG/JPEG into the request's BGRA layout.
+    fn fixture_bgra(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+        let mut image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        for pixel in image.pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+        (image.into_raw(), width, height)
+    }
+
+    #[test]
+    fn mixed_scripts_and_literal_tokens_survive_inference() {
+        let (pixels, width, height) = fixture_bgra(include_bytes!("../tests/fixtures/ocr/mixed.png"));
+        let outcome = recognize(&request(pixels, width, height)).unwrap();
+        assert_eq!(outcome.lines.len(), 27);
+        assert_eq!(outcome.lines[4].text, "ОК");
+        assert_eq!(outcome.lines[6].text, "ТЕСТ");
+        assert_eq!(outcome.lines[10].text, "Деталь 25 Р для сборки");
+        assert_eq!(outcome.lines[21].text, "日本語のテスト with English and русский текст.");
+        assert_eq!(outcome.lines[23].text, "Valid SKU 12O, disk label 48O, case-sensitive ABCx.");
+    }
+
+    #[test]
+    fn single_cyrillic_glyph_survives_inference() {
+        let (pixels, width, height) = fixture_bgra(include_bytes!("../tests/fixtures/ocr/single-glyph.png"));
+        let outcome = recognize(&request(pixels, width, height)).unwrap();
+        assert_eq!(outcome.full_text, "Я");
+    }
+
+    #[test]
+    fn dense_tiny_tier_keeps_cyrillic() {
+        let (pixels, width, height) = fixture_bgra(include_bytes!("../tests/fixtures/ocr/dense.png"));
+        // Repeat the panel to exceed the small-tier budget in a real request.
+        let outcome = recognize(&request(pixels.repeat(2), width, height * 2)).unwrap();
+        let expected = "Привет, світ! Ґанок, їжак, єдність.";
+        assert_eq!(
+            outcome
+                .lines
+                .iter()
+                .filter(|line| line.text == expected)
+                .count(),
+            2
+        );
+    }
+
     fn load_bgra(path: &str) -> (Vec<u8>, u32, u32) {
         let img = image::open(path)
             .unwrap_or_else(|e| panic!("{path}: {e}"))
@@ -1255,13 +2030,17 @@ mod tests {
             step[cls] = p;
             probs.extend(step);
         }
-        let (text, conf) = ctc_decode(&probs, 4, &charset);
-        assert_eq!(text, "aab");
+        let reading = ctc_decode(&probs, 4, &charset, 8.0);
+        assert_eq!(reading.text(), "aab");
+        let conf = reading.confidence();
         assert!((conf - (0.9 + 0.7 + 0.6) / 3.0).abs() < 1e-6, "{conf}");
+        // Each glyph sits at the centre of the step that emitted it.
+        let xs: Vec<f32> = reading.glyphs.iter().map(|g| g.x).collect();
+        assert_eq!(xs, [4.0, 28.0, 36.0]);
 
-        let (text, conf) = ctc_decode(&[1.0, 0.0, 0.0, 0.0], 4, &charset);
-        assert_eq!(text, "");
-        assert_eq!(conf, 0.0);
+        let reading = ctc_decode(&[1.0, 0.0, 0.0, 0.0], 4, &charset, 8.0);
+        assert_eq!(reading.text(), "");
+        assert_eq!(reading.confidence(), 0.0);
     }
 
     /// The charset layout the models were exported with: blank first, the
@@ -1277,6 +2056,62 @@ mod tests {
         assert_eq!(small[1], "!");
         assert_eq!(*small.last().unwrap(), " ");
         assert!(small.iter().skip(1).all(|s| !s.is_empty()), "empty dictionary entry");
+
+        // East Slavic: 517 dictionary lines + blank + space.
+        let eslav = charset_from_dict(ESLAV_CHARSET);
+        assert_eq!(eslav.len(), 519);
+        assert!(eslav.iter().skip(1).all(|s| !s.is_empty()), "empty dictionary entry");
+        // What it is embedded for: the whole Russian/Ukrainian/Belarusian
+        // alphabet, Latin and the symbols PP-OCRv6 drops.
+        for c in "абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯґєіїўҐЄІЇЎazAZ09№°®™©«»—%&_".chars()
+        {
+            assert!(
+                eslav
+                    .iter()
+                    .any(|s| s.chars().eq(std::iter::once(c))),
+                "{c} missing from the East Slavic charset"
+            );
+        }
+    }
+
+    /// Lines are routed to the East Slavic reading by their distinct
+    /// Cyrillic letters, so a Latin line that only picked up look-alikes
+    /// (or one stray misread letter) stays with PP-OCRv6.
+    #[test]
+    fn cyrillic_line_detection() {
+        assert!(is_cyrillic_line("Привет, мир!"));
+        assert!(is_cyrillic_line("да"));
+        assert!(is_cyrillic_line("Скидка 20% на Brand® до пятницы"));
+        assert!(!is_cyrillic_line("The quick brown fox 123"));
+        // Look-alikes only: no evidence either way, so not Cyrillic.
+        assert!(!is_cyrillic_line("Сосо ВЕРХ"));
+        // One stray distinct letter in a long Latin line is a misread.
+        assert!(!is_cyrillic_line("The quick brown fox jumps over the lazy dog и"));
+        assert!(!is_cyrillic_line("$49.99 (-15%) 1234"));
+        // One Cyrillic word is enough to read the line the Cyrillic way.
+        assert!(is_cyrillic_line("Email: ivan@mail.ru | Teл.: +7 912"));
+    }
+
+    /// A reading with glyphs every `pitch` px over `xs`, as PP-OCRv6 leaves
+    /// it.
+    #[test]
+    fn normalization_preserves_literal_tokens() {
+        assert_eq!(normalize_text("  25℃ and 30°℃ "), "25°C and 30°C");
+        for text in ["ABCx TODo 12O 48O", "Ключ Ox80070005", "Деталь 25 Р для сборки", "Why? x ?? 0"] {
+            assert_eq!(normalize_text(text), text);
+        }
+    }
+
+    #[test]
+    fn mixed_script_words_are_made_single_script() {
+        // Latin `e` inside a Russian word.
+        assert_eq!(fix_mixed_script_words("Привeт, мир"), "Привет, мир");
+        // Cyrillic `а`/`о` inside an English word.
+        assert_eq!(fix_mixed_script_words("Brаnd lоgin"), "Brand login");
+        // Single-script words are untouched, look-alike-only ones too.
+        assert_eq!(fix_mixed_script_words("Скидка на Brand® — ВСЕ OK"), "Скидка на Brand® — ВСЕ OK");
+        // Distinct letters of both scripts: nothing to decide by.
+        assert_eq!(fix_mixed_script_words("abcжз"), "abcжз");
     }
 
     /// Opt-in diagnostic for detection-resolution and tier-quality
@@ -1329,15 +2164,17 @@ mod tests {
             / 1000.0;
         for use_tiny in [false, true] {
             let name = if use_tiny { "tiny" } else { "small" };
-            let mut rec = Recognizer::load(use_tiny).expect("rec model");
+            let mut rec = Recognizer::load(if use_tiny { RecModel::Tiny } else { RecModel::Small }).expect("rec model");
+            let refs: Vec<&RgbaImage> = crops.iter().collect();
             // Warm, then timed.
-            let _ = recognize_crops(&mut rec, &crops[..crops.len().min(REC_BATCH)]);
+            let _ = recognize_crops(&mut rec, &refs[..refs.len().min(REC_BATCH)]);
             let t = Instant::now();
-            let results = recognize_crops(&mut rec, &crops);
+            let results = recognize_crops(&mut rec, &refs);
             let elapsed = t.elapsed();
-            let kept: Vec<&(String, f32)> = results
+            let kept: Vec<(String, f32)> = results
                 .iter()
                 .flatten()
+                .map(|r| (r.text(), r.confidence()))
                 .filter(|(s, c)| !s.trim().is_empty() && *c >= MIN_CONFIDENCE)
                 .collect();
             let mean_conf = kept.iter().map(|(_, c)| c).sum::<f32>() / kept.len().max(1) as f32;
@@ -1350,8 +2187,8 @@ mod tests {
                 elapsed.as_secs_f32() * 1000.0 / total_kpx.max(1.0),
             );
             for &i in &widest {
-                if let Some((s, c)) = &results[i] {
-                    eprintln!("  [{i}] {c:.2} {s}");
+                if let Some(r) = &results[i] {
+                    eprintln!("  [{i}] {:.2} {}", r.confidence(), r.text());
                 }
             }
             // The batching suspect: the same widest crops recognized
@@ -1359,8 +2196,8 @@ mod tests {
             // rows above, batch padding is degrading recognition.
             for &i in &widest {
                 if let Ok(mut r) = infer_batch(&mut rec, &[&crops[i]]) {
-                    let (s, c) = r.pop().unwrap();
-                    eprintln!("  solo[{i}] {c:.2} {s}");
+                    let r = r.pop().unwrap();
+                    eprintln!("  solo[{i}] {:.2} {}", r.confidence(), r.text());
                 }
             }
             // Per-batch cost at two widths, for the cost-model constants.
@@ -1375,6 +2212,46 @@ mod tests {
                 let _ = infer_batch(&mut rec, &refs[..1]);
                 eprintln!("  {name} batch {REC_BATCH}x{width}: {batch:?}; solo 1x{width}: {:?}", t.elapsed());
             }
+        }
+    }
+
+    /// Opt-in diagnostic for the script routing: set FLICKSNAP_OCR_BENCH_IMAGE
+    /// and run with --release --nocapture. Prints every line as the East Slavic
+    /// and the small PP-OCRv6 recognizer read it, with confidences and the
+    /// route `recognize` takes.
+    #[test]
+    fn env_compare_recognizers() {
+        let Ok(path) = std::env::var("FLICKSNAP_OCR_BENCH_IMAGE") else {
+            eprintln!("SKIP {}: FLICKSNAP_OCR_BENCH_IMAGE not set", module_path!());
+            return;
+        };
+        let (bgra, w, h) = load_bgra(&path);
+        let img = Bgra {
+            data: &bgra,
+            width: w,
+            height: h,
+        };
+        let boxes = {
+            let det = detector().expect("det model");
+            let mut det = det.lock().unwrap();
+            detect(&mut det, &img).expect("detect")
+        };
+        let keys: Vec<(i32, i32, u32)> = boxes
+            .iter()
+            .map(|b| (b.top as i32, b.left as i32, b.height))
+            .collect();
+        let crops: Vec<RgbaImage> = reading_order(&keys)
+            .into_iter()
+            .map(|i| img.crop_for_rec(&boxes[i].expand(BOX_BORDER, w, h)))
+            .collect();
+        let refs: Vec<&RgbaImage> = crops.iter().collect();
+        let eslav = recognize_crops(&mut Recognizer::load(RecModel::Eslav).expect("eslav"), &refs);
+        let small = recognize_crops(&mut Recognizer::load(RecModel::Small).expect("small"), &refs);
+        for (e, s) in eslav.iter().zip(&small) {
+            let (e, s) = (e.clone().unwrap_or_default(), s.clone().unwrap_or_default());
+            let (et, ec, st, sc) = (e.text(), e.confidence(), s.text(), s.confidence());
+            let route = if is_cyrillic_line(&et) { "eslav" } else { "small" };
+            eprintln!("[{route}] eslav {ec:.3} {et}\n        small {sc:.3} {st}");
         }
     }
 

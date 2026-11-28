@@ -54,7 +54,7 @@ declare -A LICENSE_OVERRIDES=(
 EXTRA_ENTRIES=(
     "RobustVideoMatting|1.0.0|GPL-3.0|https://github.com/PeterL1n/RobustVideoMatting"
     "DPDFNet||Apache-2.0|https://huggingface.co/Ceva-IP/DPDFNet"
-    "PaddleOCR PP-OCRv6 models||Apache-2.0|https://github.com/PaddlePaddle/PaddleOCR"
+    "PaddleOCR PP-OCRv6 and PP-OCRv5 East Slavic models||Apache-2.0|https://github.com/PaddlePaddle/PaddleOCR"
     "ONNX Runtime||MIT|https://github.com/microsoft/onnxruntime"
     "OBS Studio||GPL-2.0-or-later|https://github.com/obsproject/obs-studio"
     "FFmpeg||GPL-2.0-or-later|https://ffmpeg.org"

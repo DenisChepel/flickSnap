@@ -13,6 +13,8 @@ byte, and re-syncing a model means re-downloading it.
 | `pp-ocrv6_tiny_rec.onnx`    | `ocr`      | same                                                                    | Apache-2.0   |
 | `ppocrv6_dict.txt`          | `ocr`      | same (character dictionary of the small/medium recognizers, 18708 lines) | Apache-2.0  |
 | `ppocrv6_tiny_dict.txt`     | `ocr`      | same (character dictionary of the tiny recognizer, 6904 lines)          | Apache-2.0   |
+| `eslav_pp-ocrv5_mobile_rec.onnx` | `ocr` | `PaddlePaddle/PaddleOCR` PP-OCRv5 East Slavic — via `GreatV/oar-ocr` release `v0.3.0` | Apache-2.0 |
+| `ppocrv5_eslav_dict.txt`    | `ocr`      | same (its character dictionary, 517 lines)                              | Apache-2.0   |
 
 RobustVideoMatting is the MobileNetV3 fp32 tier (15.0 MB) rather than resnet50 (~102 MB): webcam
 mattes at the ≤540p analysis resolution look indistinguishable between the two, and the weights
@@ -38,6 +40,16 @@ verified against that project's registry on the way in:
 | `pp-ocrv6_tiny_rec.onnx`  | `9ef676d6ed3c88256a2d92c640c44f25b0c40947e111b14b8be8f594091563e6` | 4,462,639   |
 | `ppocrv6_dict.txt`        | `b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d` | 74,947      |
 | `ppocrv6_tiny_dict.txt`   | `c5cbe34ef40c29c4df07ed012bf96569cb69a2d2a01a07027e9f13cb832bd9cd` | 27,156      |
+| `eslav_pp-ocrv5_mobile_rec.onnx` | `36a66a68097e88b103e0f60f489e88c7239d3ea79d96fbac2d80ac9d134944cd` | 7,915,218   |
+| `ppocrv5_eslav_dict.txt`  | `3e95f1581557162870cacdba5af91a4c6be2890710d395b0c3c7578e7ee5e6eb` | 1,663       |
+
+PP-OCRv6 has no Cyrillic in its charsets. `eslav_pp-ocrv5_mobile_rec` (PaddleOCR's East Slavic
+recognizer: Russian, Ukrainian, Belarusian plus Latin, digits and symbols such as `№ ° ® ™ « »`)
+covers it: `src/ocr.rs` runs it on every detected line, including in the PP-OCRv6 tiny tier.
+Cyrillic readings can retain CJK runs identified by PP-OCRv6, and PP-OCRv6 can re-read their Latin
+runs. Short labels made of look-alikes use nearby lines as context. Its charset is the
+517-line `ppocrv5_eslav_dict.txt` (+ blank + space = 519 output classes); the input contract
+is the same as PP-OCRv6's.
 
 The `small` det/rec pair is the default; `tiny` rec (same detector, a 6904-glyph subset charset,
 roughly 4× faster) is the fallback `src/ocr.rs` switches to on text-dense selections. The

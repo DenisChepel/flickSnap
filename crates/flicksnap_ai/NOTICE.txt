@@ -24,6 +24,13 @@ It embeds the following model weights:
     (the official ONNX inference exports, obtained as flat files from the
     GreatV/oar-ocr v0.7.0 release)
 
+  * PaddleOCR PP-OCRv5 East Slavic text recognition model
+    (eslav_pp-ocrv5_mobile_rec.onnx and its character dictionary
+    ppocrv5_eslav_dict.txt)
+    Copyright (c) PaddlePaddle Authors — Apache-2.0
+    https://github.com/PaddlePaddle/PaddleOCR
+    (obtained as flat files from the GreatV/oar-ocr v0.3.0 release)
+
 It statically links ONNX Runtime (MIT, https://github.com/microsoft/onnxruntime)
 via the ort crate (Apache-2.0/MIT, https://github.com/pykeio/ort); both licenses
 are GPL-compatible. On Windows the DirectML execution-provider helper library
