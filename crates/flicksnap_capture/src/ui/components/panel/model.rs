@@ -982,12 +982,12 @@ mod tests {
         assert_eq!(defs[0].command, Command::Upload);
     }
 
-    /// UPLOAD is a real button with the paper-plane mark; the FlickSnap logo
+    /// UPLOAD is a real button with the file-upload mark; the FlickSnap logo
     /// is the tray emblem and must never be a button icon — the emblem is
     /// drawn at its own size, from `widgets::emblem`, with no button
     /// around it.
     #[test]
-    fn upload_icon_is_the_paper_plane() {
+    fn upload_icon_is_the_file_upload() {
         let upload = PanelButtonSet::Normal
             .defs()
             .iter()

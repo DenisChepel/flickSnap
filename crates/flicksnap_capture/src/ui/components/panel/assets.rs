@@ -65,7 +65,8 @@ macro_rules! svg {
     };
 }
 
-/// Paper-plane "send" mark for the UPLOAD button (24-unit canvas, white).
+/// File-upload mark for the UPLOAD button (white, viewBox fitted to the ink),
+/// matching `assets/icons/screenshot/ico_upload.svg` and the Avalonia `IconUpload`.
 pub const UPLOAD: Svg = svg!("upload.svg");
 pub const EDIT: Svg = svg!("edit_image.svg");
 pub const VIDEO: Svg = svg!("video_camera.svg");

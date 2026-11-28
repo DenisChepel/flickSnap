@@ -533,7 +533,7 @@
                                                                 ToolTip.Tip="Upload"
                                                                 AutomationProperties.Name="Upload">
                                                             <Viewbox>
-                                                                <!-- the paper plane, the same "upload" affordance the editor's toolbar
+                                                                <!-- the file-upload mark, the same "upload" affordance the editor's toolbar
                                                                      uses; a 24px canvas (AppStyles icon table). -->
                                                                 <Path Width="24" Height="24" Fill="{DynamicResource SemiColorText1}" Data="{StaticResource IconUpload}" />
                                                             </Viewbox>
