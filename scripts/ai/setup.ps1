@@ -7,9 +7,10 @@
     what is missing:
 
       1. Finds the repository root wherever the script is started from.
-      2. Checks prerequisites and the CodeGraph / RTK CLIs. A missing tool is offered for
-         installation (pinned, tested version, official source) only after confirmation.
-         Installed tools are never reinstalled or upgraded.
+      2. Checks the build toolchain (git, .NET 10 SDK, Rust, MSVC build tools) and the
+         CodeGraph / RTK CLIs. Anything missing is offered for installation from its official
+         winget / npm package (CodeGraph and RTK at the pinned, tested version) only after
+         confirmation. Installed tools are never reinstalled or upgraded.
       3. Detects Claude Code and Codex (CLI on PATH or VS Code-family extension) and wires
          CodeGraph MCP and RTK hooks into each with the tools' own commands
          (`codegraph install`, `rtk init`). Agent config files are backed up first.
@@ -25,14 +26,18 @@
     nothing is installed, written or indexed.
 
 .PARAMETER Yes
-    Answer "yes" to the install prompts (non-interactive use). Only the pinned versions
-    are installed, and only for tools that are missing.
+    Approve the selected installation, agent configuration and index changes
+    (non-interactive use). CodeGraph and RTK installs use the pinned versions.
 
 .PARAMETER Agents
     Which agents to configure: claude, codex (default: both, when detected).
 
+.PARAMETER SkipBuildTools
+    Do not offer to install the build toolchain (git, .NET 10 SDK, Rust, MSVC build tools).
+    It is still checked and reported.
+
 .PARAMETER SkipInstall
-    Never offer to install missing tools.
+    Never offer to install missing CodeGraph / RTK.
 
 .PARAMETER SkipAgents
     Do not touch any agent configuration.
@@ -56,6 +61,7 @@ param(
     [switch]$Yes,
     [ValidateSet('claude', 'codex')]
     [string[]]$Agents = @('claude', 'codex'),
+    [switch]$SkipBuildTools,
     [switch]$SkipInstall,
     [switch]$SkipAgents,
     [switch]$SkipIndex,
@@ -125,7 +131,7 @@ function Backup-AiAgentConfigs {
 }
 
 function Invoke-AiStep([string]$Description, [string]$FilePath, [string[]]$Arguments) {
-    $shown = "$([IO.Path]::GetFileName($FilePath)) $($Arguments -join ' ')"
+    $shown = "$([IO.Path]::GetFileName($FilePath)) $(Format-AiArgs $Arguments)"
     if ($DryRun) { Write-AiLine 'PLAN' "$Description  ->  $shown"; return $true }
     Write-AiLine 'DO' "$Description  ->  $shown"
     $r = Invoke-AiNative -FilePath $FilePath -Arguments $Arguments
@@ -171,8 +177,78 @@ $npmCmd = Find-AiCommand 'npm'
 $wingetCmd = Find-AiCommand 'winget'
 if ($npmCmd) { Write-AiLine 'OK' ("npm " + (Invoke-AiNative -FilePath $npmCmd.Source -Arguments @('--version')).Text + " (used only to install CodeGraph if missing)") }
 else { Write-AiLine 'INFO' 'npm not found; a missing CodeGraph would be installed with its official PowerShell installer.' }
-if ($wingetCmd) { Write-AiLine 'OK' 'winget available (used only to install RTK if missing).' }
-else { Write-AiLine 'INFO' 'winget not found; a missing RTK has to be installed manually (see docs/AI_SETUP.md).' }
+if ($wingetCmd) { Write-AiLine 'OK' 'winget available (used only to install missing tools).' }
+else { Write-AiLine 'INFO' 'winget not found; missing tools have to be installed manually (see docs/AI_SETUP.md).' }
+
+# ================================================================ 2a. build toolchain
+
+Write-AiHeader 'Build toolchain'
+
+# A copy-pasteable command line: arguments containing spaces are quoted.
+function Format-AiArgs([string[]]$Arguments) {
+    ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+}
+
+function Install-AiWinget([string]$Description, [string]$Id, [string[]]$Extra = @()) {
+    $wargs = @('install', '--id', $Id, '--exact', '--source', 'winget') + $Extra
+    if ($Yes) { $wargs += @('--accept-package-agreements', '--accept-source-agreements') }
+    if (-not $wingetCmd) { Add-Todo "$Description manually (winget is not available): winget id $Id"; return }
+    if ($DryRun) { Write-AiLine 'PLAN' "$Description  ->  winget $(Format-AiArgs $wargs)"; return }
+    if (Confirm-Ai "$($Description)?") { $null = Invoke-AiStep $Description $wingetCmd.Source $wargs }
+    else { Add-Todo "$Description`: winget $(Format-AiArgs $wargs)" }
+}
+
+function Report-AiBuildPrereqs {
+    foreach ($p in Get-AiBuildPrereqs) {
+        if ($p.Present) { Write-AiLine 'OK' "$($p.Name): $($p.Detail)" }
+        else { Write-AiLine 'WARN' "$($p.Name): $($p.Detail) (needed to build and test flickSnap)" }
+    }
+}
+
+$build = @{}
+foreach ($p in Get-AiBuildPrereqs) { $build[$p.Id] = $p }
+Report-AiBuildPrereqs
+$missingBuild = @($build.Values | Where-Object { -not $_.Present })
+if ($missingBuild.Count -gt 0 -and -not $SkipBuildTools) {
+    if (-not $build['git'].Present) {
+        Install-AiWinget 'Install git' $BuildWinget.Git
+    }
+    if (-not $build['dotnet'].Present) {
+        Install-AiWinget 'Install the .NET 10 SDK' $BuildWinget.DotNet
+    }
+    if (-not $build['msvc'].Present) {
+        # Several GB; the Visual Studio installer asks for elevation (UAC) itself.
+        Install-AiWinget 'Install the MSVC C++ build tools (several GB, asks for administrator rights)' $BuildWinget.Msvc @('--override', $MsvcInstallerOverride)
+    }
+    if (-not $build['rust'].Present) {
+        if ($build['rust'].HasRustup) {
+            $desc = 'Select the stable Rust toolchain as default'
+            if ($DryRun) { Write-AiLine 'PLAN' "$desc  ->  rustup default stable" }
+            elseif (Confirm-Ai "$($desc)?") { $null = Invoke-AiStep $desc $build['rust'].RustupPath @('default', 'stable') }
+            else { Add-Todo "$desc`: rustup default stable" }
+        } else {
+            Install-AiWinget 'Install Rust (rustup)' $BuildWinget.Rustup
+            if ($DryRun -and $wingetCmd) {
+                Write-AiLine 'PLAN' 'If Rustup is installed but Cargo is still unavailable  ->  rustup default stable'
+            } elseif (-not $DryRun) {
+                Update-AiSessionPath
+                $rust = Get-AiBuildPrereqs | Where-Object { $_.Id -eq 'rust' }
+                if ($rust -and -not $rust.Present -and $rust.HasRustup -and
+                    (Confirm-Ai 'Select the stable Rust toolchain as default?')) {
+                    $null = Invoke-AiStep 'Select the stable Rust toolchain as default' $rust.RustupPath @('default', 'stable')
+                }
+            }
+        }
+    }
+    if (-not $DryRun -and $script:Changed) {
+        Update-AiSessionPath   # installers change PATH in the registry, not in this process
+        Write-AiLine 'INFO' 'Build toolchain after installation:'
+        Report-AiBuildPrereqs
+        Add-Todo 'Open a new terminal (and restart VS Code / the agents) so they see the newly installed build tools on PATH.'
+    }
+} elseif ($missingBuild.Count -gt 0) {
+    Add-Todo ("Build toolchain incomplete (" + (($missingBuild | ForEach-Object { $_.Name }) -join ', ') + "); see BUILDING.md, or re-run without -SkipBuildTools.")
+}
 
 Write-AiHeader 'Tools'
 
@@ -207,14 +283,14 @@ if (-not $SkipInstall) {
         if ($npmCmd) {
             $desc = "Install CodeGraph $cgv (npm, official package $CodeGraphNpmPackage)"
             if ($DryRun) { Write-AiLine 'PLAN' "$desc  ->  npm install -g $CodeGraphNpmPackage@$cgv" }
-            elseif (Confirm-Ai "$desc?") {
+            elseif (Confirm-Ai "$($desc)?") {
                 $null = Invoke-AiStep $desc $npmCmd.Source @('install', '-g', "$CodeGraphNpmPackage@$cgv")
             } else { Add-Todo "Install CodeGraph: npm install -g $CodeGraphNpmPackage@$cgv" }
         } else {
             $desc = "Install CodeGraph v$cgv (official install.ps1, pinned with CODEGRAPH_VERSION)"
             $inner = "`$ErrorActionPreference='Stop'; `$env:CODEGRAPH_VERSION='v$cgv'; irm '$CodeGraphInstallPs1' | iex"
             if ($DryRun) { Write-AiLine 'PLAN' "$desc  ->  powershell -NoProfile -Command `"$inner`"" }
-            elseif (Confirm-Ai "$desc?") {
+            elseif (Confirm-Ai "$($desc)?") {
                 $ps = (Get-Command powershell.exe).Source
                 $null = Invoke-AiStep $desc $ps @('-NoProfile', '-Command', $inner)
             } else { Add-Todo "Install CodeGraph: $inner" }
@@ -227,7 +303,7 @@ if (-not $SkipInstall) {
             $wargs = @('install', '--id', $RtkWingetId, '--exact', '--version', $rv, '--source', 'winget')
             if ($Yes) { $wargs += @('--accept-package-agreements', '--accept-source-agreements') }
             if ($DryRun) { Write-AiLine 'PLAN' "$desc  ->  winget $($wargs -join ' ')" }
-            elseif (Confirm-Ai "$desc?") { $null = Invoke-AiStep $desc $wingetCmd.Source $wargs }
+            elseif (Confirm-Ai "$($desc)?") { $null = Invoke-AiStep $desc $wingetCmd.Source $wargs }
             else { Add-Todo "Install RTK: winget install --id $RtkWingetId --exact --version $rv" }
         } else {
             Add-Todo "Install RTK $rv manually from https://github.com/rtk-ai/rtk/releases (rtk-x86_64-pc-windows-msvc.zip) and put rtk.exe on PATH."
@@ -267,13 +343,18 @@ foreach ($a in @($claude, $codex)) {
 function Set-AiCodeGraphMcp($Agent) {
     $configured = if ($Agent.Id -eq 'claude') { Test-AiClaudeCodeGraphMcp $Agent $Root } else { Test-AiCodexCodeGraphMcp $Agent $Root }
     if ($configured) { Write-AiLine 'OK' "$($Agent.Name): CodeGraph MCP server already configured (left unchanged)."; return }
-    if (-not $script:CG.Works) { Write-AiLine 'WARN' "$($Agent.Name): CodeGraph MCP not configured, and CodeGraph is unavailable - skipped."; return }
     $cgArgs = @('install', "--target=$($Agent.Id)", '--location=global', '--yes')
     if ($NoCodeGraphAutoAllow) { $cgArgs += '--no-permissions' }
+    if ($DryRun -and -not $SkipInstall -and -not $script:CG.Present) {
+        Write-AiLine 'PLAN' "$($Agent.Name): add CodeGraph MCP server once CodeGraph is installed  ->  codegraph $(Format-AiArgs $cgArgs)"
+        return
+    }
+    if (-not $script:CG.Works) { Write-AiLine 'WARN' "$($Agent.Name): CodeGraph MCP not configured, and CodeGraph is unavailable - skipped."; return }
     if ($DryRun) {
         Write-AiLine 'PLAN' "$($Agent.Name): add CodeGraph MCP server  ->  codegraph $($cgArgs -join ' ')"
         return
     }
+    if (-not (Confirm-Ai "$($Agent.Name): add the global CodeGraph MCP server?")) { return }
     Backup-AiAgentConfigs
     if (Invoke-AiStep "$($Agent.Name): add CodeGraph MCP server" $script:CG.Path $cgArgs) { Add-Restart $Agent.Name }
 }
@@ -287,6 +368,10 @@ function Set-AiRtkHook($Agent) {
         $rtkArgs = @('init', '-g', '--codex')   # rtk refuses --auto-patch together with --codex
     }
     if ($hook) { Write-AiLine 'OK' "$($Agent.Name): existing RTK hook detected (left unchanged)."; return }
+    if ($DryRun -and -not $SkipInstall -and -not $script:RTK.Present) {
+        Write-AiLine 'PLAN' "$($Agent.Name): configure RTK once RTK is installed  ->  rtk $($rtkArgs -join ' ')"
+        return
+    }
     if (-not $script:RTK.Works) { Write-AiLine 'WARN' "$($Agent.Name): RTK not configured, and RTK is unavailable - skipped."; return }
     if ($DryRun) {
         Write-AiLine 'PLAN' "$($Agent.Name): configure RTK  ->  rtk $($rtkArgs -join ' ')  (RTK's own preview follows)"
@@ -294,6 +379,7 @@ function Set-AiRtkHook($Agent) {
         $r.Output | Where-Object { $_ -match '^\[dry-run\]' } | ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
         return
     }
+    if (-not (Confirm-Ai "$($Agent.Name): configure the global RTK hook?")) { return }
     Backup-AiAgentConfigs
     if (Invoke-AiStep "$($Agent.Name): configure RTK" $script:RTK.Path $rtkArgs) { Add-Restart $Agent.Name }
 }
@@ -323,7 +409,9 @@ if (-not $SkipAgents) {
 
 if (-not $SkipIndex) {
     Write-AiHeader 'CodeGraph index'
-    if (-not $script:CG.Works) {
+    if ($DryRun -and -not $SkipInstall -and -not $script:CG.Present) {
+        Write-AiLine 'PLAN' "Once CodeGraph is installed, check index status and initialize only if absent  ->  codegraph $(Format-AiArgs @('init', '--yes', '--local-only', $Root))"
+    } elseif (-not $script:CG.Works) {
         Write-AiLine 'WARN' 'CodeGraph unavailable - index step skipped (agents fall back to normal search).'
     } else {
         $status = Get-AiIndexStatus $script:CG.Path $Root
@@ -337,13 +425,17 @@ if (-not $SkipIndex) {
             $script:Failures++
         } elseif (-not $status.initialized) {
             # --local-only: .codegraph/ also ignores itself, a second guard next to .gitignore.
-            $null = Invoke-AiStep 'Build the local index (first time)' $script:CG.Path @('init', '--yes', '--local-only', $Root)
+            if ($DryRun -or (Confirm-Ai 'Build the local CodeGraph index?')) {
+                $null = Invoke-AiStep 'Build the local index (first time)' $script:CG.Path @('init', '--yes', '--local-only', $Root)
+            }
         } elseif ([bool](Get-AiProp $status 'rebuildInProgress')) {
             Write-AiLine 'INFO' 'A rebuild is already in progress; leaving it alone.'
         } else {
             $pending = Get-AiPendingCount $status
             if ($pending -gt 0) {
-                $null = Invoke-AiStep "Sync the index ($pending changed files)" $script:CG.Path @('sync', $Root)
+                if ($DryRun -or (Confirm-Ai "Sync the CodeGraph index ($pending changed files)?")) {
+                    $null = Invoke-AiStep "Sync the index ($pending changed files)" $script:CG.Path @('sync', $Root)
+                }
             } else {
                 Write-AiLine 'OK' ("Index up to date: {0} files, {1} nodes, {2} edges." -f (Get-AiProp $status 'fileCount'), (Get-AiProp $status 'nodeCount'), (Get-AiProp $status 'edgeCount'))
             }
@@ -355,7 +447,7 @@ if (-not $SkipIndex) {
 
 Write-AiHeader 'Summary'
 if ($DryRun) { Write-AiLine 'INFO' 'Dry run finished; nothing was changed.' }
-elseif (-not $script:Changed) { Write-AiLine 'OK' 'Nothing to do - the environment was already set up.' }
+elseif (-not $script:Changed) { Write-AiLine 'INFO' 'No setup steps completed.' }
 if ($script:BackupDir) { Write-AiLine 'INFO' "Config backup: $($script:BackupDir)" }
 if ($script:RestartAgents.Count -gt 0) {
     Add-Todo ("Restart " + ($script:RestartAgents -join ' and ') + " (and VS Code, if they run inside it) so they load the new MCP server / hooks and PATH.")

@@ -19,6 +19,10 @@
     None of these is a live agent session. To confirm the RTK hook end to end, ask the agent
     to run `git status` and look for it in `rtk gain --history`.
 
+    It also checks the build toolchain (git, .NET 10 SDK, Rust, MSVC build tools). The summary
+    ends with one "Setup would help: ..." line naming what scripts\ai\setup.ps1 could provide
+    (build-toolchain, ai-tools, agent-integration, index) or "none"; -Json carries it as "needs".
+
     Without -Live the script only reads files and runs version/status commands.
 
 .PARAMETER Live
@@ -44,14 +48,17 @@ $ErrorActionPreference = 'Stop'
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Section = ''
+# What setup.ps1 could provide, in its own phase names (see the summary and docs/AI_SETUP.md).
+$script:Needs = New-Object System.Collections.Generic.List[string]
 
 function Section([string]$Name) {
     $script:Section = $Name
     if (-not $Json) { Write-AiHeader $Name }
 }
 
-function Report([string]$Level, [string]$Check, [string]$Detail) {
+function Report([string]$Level, [string]$Check, [string]$Detail, [string]$Need = '') {
     $script:Results.Add([pscustomobject]@{ Section = $script:Section; Level = $Level; Check = $Check; Detail = $Detail })
+    if ($Need -and -not $script:Needs.Contains($Need)) { $script:Needs.Add($Need) }
     if (-not $Json) { Write-AiLine $Level ("{0}: {1}" -f $Check, $Detail) }
 }
 
@@ -111,6 +118,14 @@ Report 'OK' 'Repository root' $Root
 Update-AiSessionPath
 $git = Find-AiCommand 'git'
 
+# ================================================================ build toolchain
+
+Section 'Build toolchain'
+foreach ($p in Get-AiBuildPrereqs) {
+    if ($p.Present) { Report 'OK' $p.Name $p.Detail }
+    else { Report 'WARN' $p.Name "$($p.Detail) (needed to build and test flickSnap)" 'build-toolchain' }
+}
+
 # ================================================================ tools
 
 Section 'Tools'
@@ -120,7 +135,7 @@ foreach ($t in @(
         @{ Name = 'CodeGraph'; Exe = 'codegraph'; Tool = $cg;  Tested = $AiTested.CodeGraph },
         @{ Name = 'RTK';       Exe = 'rtk';       Tool = $rtk; Tested = $AiTested.Rtk })) {
     $tool = $t.Tool
-    if (-not $tool.Present) { Report 'WARN' $t.Name 'not installed (optional; agents fall back to normal search/output)'; continue }
+    if (-not $tool.Present) { Report 'WARN' $t.Name 'not installed (optional; agents fall back to normal search/output)' 'ai-tools'; continue }
     if ($t.Name -eq 'RTK' -and -not $tool.Works) { Report 'FAIL' $t.Name "$($tool.State) at $($tool.Path). $($tool.Detail)"; continue }
     if (-not $tool.Works) { Report 'FAIL' $t.Name "found at $($tool.Path) but does not run"; continue }
     if ($tool.Version -eq $t.Tested) { Report 'OK' $t.Name "$($tool.Version) at $($tool.Path)" }
@@ -142,11 +157,11 @@ if (-not $claude.Detected) {
 } else {
     Report 'OK' 'Detected' ((@($claude.CliPath, $claude.ExtExe) | Where-Object { $_ }) -join '; ')
     if (Test-AiClaudeCodeGraphMcp $claude $Root) { Report 'OK' 'CodeGraph MCP' 'found in user or project configuration' }
-    else { Report 'WARN' 'CodeGraph MCP' 'not configured (run scripts\ai\setup.ps1)' }
+    else { Report 'WARN' 'CodeGraph MCP' 'not configured (run scripts\ai\setup.ps1)' 'agent-integration' }
     if (Test-AiClaudeCodeGraphNotes $claude) { Report 'OK' 'CodeGraph instructions' "block present in $($claude.Paths.Instructions)" }
     else { Report 'INFO' 'CodeGraph instructions' 'no CodeGraph block in global CLAUDE.md' }
     if (Test-AiClaudeRtkHook $claude $Root) { Report 'OK' 'RTK hook' 'found in user or project PreToolUse configuration' }
-    else { Report 'WARN' 'RTK hook' 'not configured (run scripts\ai\setup.ps1)' }
+    else { Report 'WARN' 'RTK hook' 'not configured (run scripts\ai\setup.ps1)' 'agent-integration' }
     if (Test-AiClaudeRtkNotes $claude) { Report 'OK' 'RTK instructions' '@RTK.md referenced from global CLAUDE.md' }
     else { Report 'INFO' 'RTK instructions' 'RTK.md / @RTK.md not present' }
     Report 'INFO' 'RTK hook scope' 'rewrites Bash tool calls only; PowerShell tool and built-in Read/Grep/Glob are not rewritten'
@@ -158,11 +173,11 @@ if (-not $codex.Detected) {
 } else {
     Report 'OK' 'Detected' ((@($codex.CliPath, $codex.ExtExe) | Where-Object { $_ }) -join '; ')
     if (Test-AiCodexCodeGraphMcp $codex $Root) { Report 'OK' 'CodeGraph MCP' 'found in user or project configuration' }
-    else { Report 'WARN' 'CodeGraph MCP' 'not configured (run scripts\ai\setup.ps1)' }
+    else { Report 'WARN' 'CodeGraph MCP' 'not configured (run scripts\ai\setup.ps1)' 'agent-integration' }
     if (Test-AiCodexCodeGraphNotes $codex) { Report 'OK' 'CodeGraph instructions' "block present in $($codex.Paths.Instructions)" }
     else { Report 'INFO' 'CodeGraph instructions' 'no CodeGraph block in global AGENTS.md' }
     if (Test-AiCodexRtkHook $codex $Root) { Report 'OK' 'RTK hook' 'found in user or project PreToolUse configuration' }
-    else { Report 'WARN' 'RTK hook' 'not configured (run scripts\ai\setup.ps1)' }
+    else { Report 'WARN' 'RTK hook' 'not configured (run scripts\ai\setup.ps1)' 'agent-integration' }
     if (Test-AiCodexRtkNotes $codex) { Report 'OK' 'RTK instructions' 'RTK.md referenced from global AGENTS.md' }
     else { Report 'INFO' 'RTK instructions' 'RTK.md reference not present' }
     $feature = Get-AiCodexHooksFeature $codex
@@ -179,7 +194,8 @@ if (-not $codex.Detected) {
 Section 'CodeGraph index'
 $indexDir = Join-Path $Root '.codegraph'
 if (-not $cg.Works) {
-    Report 'INFO' 'Index' 'CodeGraph not available - not checked'
+    if (Test-Path -LiteralPath $indexDir) { Report 'INFO' 'Index' 'CodeGraph not available - not checked' }
+    else { Report 'WARN' 'Index' 'no .codegraph/ yet; it is built once CodeGraph is installed' 'index' }
 } else {
     $st = Get-AiIndexStatus $cg.Path $Root
     if ($null -eq $st) {
@@ -189,7 +205,7 @@ if (-not $cg.Works) {
         if (-not $reportedPath -or (Test-Path -LiteralPath $reportedPath) -or (Test-Path -LiteralPath $indexDir)) {
             Report 'FAIL' 'Index' 'CodeGraph reports an uninitialized index but its absence could not be confirmed'
         } else {
-            Report 'WARN' 'Index' 'no index yet (run scripts\ai\setup.ps1, or codegraph init --local-only)'
+            Report 'WARN' 'Index' 'no index yet (run scripts\ai\setup.ps1, or codegraph init --local-only)' 'index'
         }
     } else {
         Report 'OK' 'Index' ("{0} files, {1} nodes, {2} edges, last indexed {3}" -f (Get-AiProp $st 'fileCount'), (Get-AiProp $st 'nodeCount'), (Get-AiProp $st 'edgeCount'), (Get-AiProp $st 'lastIndexed'))
@@ -295,11 +311,15 @@ if ($Live) {
 $fails = @($script:Results | Where-Object { $_.Level -eq 'FAIL' }).Count
 $warns = @($script:Results | Where-Object { $_.Level -eq 'WARN' }).Count
 $todos = @($script:Results | Where-Object { $_.Level -eq 'TODO' }).Count
+$needs = @($script:Needs)
 if ($Json) {
-    [pscustomobject]@{ root = $Root; live = [bool]$Live; fail = $fails; warn = $warns; todo = $todos; results = $script:Results } | ConvertTo-Json -Depth 4
+    [pscustomobject]@{ root = $Root; live = [bool]$Live; fail = $fails; warn = $warns; todo = $todos; needs = $needs; results = $script:Results } | ConvertTo-Json -Depth 4
 } else {
     Write-AiHeader 'Summary'
     Write-Host ("  {0} FAIL, {1} WARN, {2} TODO{3}" -f $fails, $warns, $todos, $(if ($Live) { '' } else { '  (config checks only; add -Live for tool probes)' }))
+    # One stable line for agents (AGENTS.md, "First session on a machine"): what setup.ps1 can provide.
+    if ($needs.Count -gt 0) { Write-Host ("  Setup would help: {0}" -f ($needs -join ', ')) }
+    else { Write-Host '  Setup would help: none' }
 }
 if ($fails -gt 0) { exit 1 }
 exit 0

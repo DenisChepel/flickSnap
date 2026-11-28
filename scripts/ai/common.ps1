@@ -15,6 +15,17 @@ $script:CodeGraphNpmPackage   = '@colbymchenry/codegraph'
 $script:CodeGraphInstallPs1   = "https://raw.githubusercontent.com/colbymchenry/codegraph/v$($AiTested.CodeGraph)/install.ps1"
 $script:RtkWingetId           = 'rtk-ai.rtk'
 
+# The build toolchain BUILDING.md requires on Windows. setup.ps1 offers these official winget
+# packages only for what is missing, after confirmation, and never upgrades what is installed.
+$script:BuildWinget = @{
+    Git    = 'Git.Git'
+    DotNet = 'Microsoft.DotNet.SDK.10'
+    Rustup = 'Rustlang.Rustup'
+    Msvc   = 'Microsoft.VisualStudio.2022.BuildTools'
+}
+# The C++ build tools workload (MSVC linker + Windows SDK) that Rust's MSVC target links with.
+$script:MsvcInstallerOverride = '--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+
 # ---------------------------------------------------------------- output
 
 function Write-AiHeader([string]$Text) {
@@ -129,6 +140,11 @@ function Get-AiPersistentPathDirs {
 function Get-AiKnownToolDirs {
     $dirs = @()
     if ($env:APPDATA)      { $dirs += (Join-Path $env:APPDATA 'npm') }
+    $dirs += (Join-Path $HOME '.cargo\bin')
+    if ($env:ProgramFiles) {
+        $dirs += (Join-Path $env:ProgramFiles 'dotnet')
+        $dirs += (Join-Path $env:ProgramFiles 'Git\cmd')
+    }
     if ($env:LOCALAPPDATA) {
         $dirs += (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links')
         $dirs += (Join-Path $env:LOCALAPPDATA 'codegraph\current\bin')
@@ -197,7 +213,9 @@ function Get-AiRtk {
     if ($result.Version) {
         $probe = 'rewrite'
         $r = Invoke-AiNative -FilePath $cmd.Source -Arguments @($probe, 'git status')
-        if ($r.ExitCode -eq 0 -and $r.Text -match '(?m)^\s*(?:rtk\s+)?git status\s*$') {
+        # `rtk rewrite` prints a rewrite with exit 0 (allow rules cover it) or 3 (defer approval
+        # to the host, which is also what it answers with no permission rules at all).
+        if (($r.ExitCode -eq 0 -or $r.ExitCode -eq 3) -and $r.Text -match '(?m)^\s*(?:rtk\s+)?git status\s*$') {
             $result.State = 'Ready'
             $result.Works = $true
             return $result
@@ -215,6 +233,54 @@ function Get-AiRtk {
         $result.Detail = "$probe failed or returned unrecognized output (exit $($r.ExitCode))."
     }
     return $result
+}
+
+# ---------------------------------------------------------------- build toolchain (read-only)
+
+function Get-AiVswhere {
+    $base = [Environment]::GetFolderPath('ProgramFilesX86')
+    if (-not $base) { return $null }
+    $p = Join-Path $base 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $p) { return $p }
+    return $null
+}
+
+# One entry per toolchain piece: Id, Name, Present, Detail. Never installs anything.
+function Get-AiBuildPrereqs {
+    $items = New-Object System.Collections.Generic.List[object]
+
+    $git = Find-AiCommand 'git'
+    $gv = if ($git) { Get-AiVersionFromText (Invoke-AiNative -FilePath $git.Source -Arguments @('--version')).Text } else { $null }
+    $items.Add([pscustomobject]@{ Id = 'git'; Name = 'git'; Present = [bool]$gv
+        Detail = $(if ($gv) { "git $gv" } else { 'not found' }) })
+
+    $dotnet = Find-AiCommand 'dotnet'
+    $sdk = $null
+    if ($dotnet) {
+        $r = Invoke-AiNative -FilePath $dotnet.Source -Arguments @('--list-sdks')
+        $sdk = $r.Output | Where-Object { $_ -match '^\s*10\.\d+\.\d+' } | Select-Object -First 1
+    }
+    $items.Add([pscustomobject]@{ Id = 'dotnet'; Name = '.NET 10 SDK'; Present = [bool]$sdk
+        Detail = $(if ($sdk) { ($sdk -split '\s+')[0] } elseif ($dotnet) { 'dotnet found, but no 10.x SDK' } else { 'not found' }) })
+
+    $cargo = Find-AiCommand 'cargo'
+    $rustup = Find-AiCommand 'rustup'
+    $cv = if ($cargo) { Get-AiVersionFromText (Invoke-AiNative -FilePath $cargo.Source -Arguments @('--version')).Text } else { $null }
+    $rustDetail = if ($cv) { "cargo $cv" } elseif ($rustup) { 'rustup found, but no default toolchain' } else { 'not found' }
+    $items.Add([pscustomobject]@{ Id = 'rust'; Name = 'Rust (rustup, stable)'; Present = [bool]$cv; Detail = $rustDetail
+        HasRustup = [bool]$rustup; RustupPath = $(if ($rustup) { $rustup.Source } else { $null }) })
+
+    $msvc = $null
+    $vswhere = Get-AiVswhere
+    if ($vswhere) {
+        $r = Invoke-AiNative -FilePath $vswhere -Arguments @('-latest', '-products', '*', '-requires',
+            'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'displayName')
+        if ($r.ExitCode -eq 0) { $msvc = $r.Output | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1 }
+    }
+    $items.Add([pscustomobject]@{ Id = 'msvc'; Name = 'MSVC C++ build tools'; Present = [bool]$msvc
+        Detail = $(if ($msvc) { $msvc } else { 'no Visual Studio / Build Tools with the C++ workload' }) })
+
+    return $items
 }
 
 # ---------------------------------------------------------------- agents

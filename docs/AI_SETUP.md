@@ -30,10 +30,45 @@ pinned in [`scripts/ai/common.ps1`](../scripts/ai/common.ps1) (`$AiTested`).
 
 ## Setting up a new machine
 
-Prerequisites: Windows 10/11, Windows PowerShell 5.1, git, and at least one agent installed
-(Claude Code CLI or VS Code extension, and/or Codex CLI or the VS Code "Codex" extension).
-To install the tools, the script uses `npm` for CodeGraph (or CodeGraph's official
-PowerShell installer when npm is missing) and `winget` for RTK.
+Prerequisites: Windows 10/11, Windows PowerShell 5.1, winget, and at least one agent installed
+(Claude Code CLI or VS Code extension, and/or Codex CLI or the VS Code "Codex" extension). Open
+Codex once before setup, so `~/.codex` exists and the script can detect it. Clone with git, not
+as a ZIP: agents and scripts rely on it.
+
+The setup script checks, and on confirmation installs, what is missing:
+- the build toolchain from winget: `Git.Git`, `Microsoft.DotNet.SDK.10`, `Rustlang.Rustup`
+  (then `rustup default stable`), and `Microsoft.VisualStudio.2022.BuildTools` with the C++
+  workload (several GB, asks for administrator rights);
+- CodeGraph from `npm`, or from CodeGraph's official PowerShell installer when npm is missing;
+- RTK from winget.
+
+The recorder stack needs more: CMake, LLVM and the OBS submodule (see `BUILDING.md`). The
+script does not install those.
+
+### Agent-guided (recommended)
+
+Open the cloned folder in Claude Code or Codex and give it your first task, or just ask it to
+get to know the project. `AGENTS.md` ("First session on a machine") makes the agent:
+
+1. run `doctor.ps1`, which is read-only;
+2. report diagnostic failures that affect the task. If setup can help with
+   `build-toolchain`, `ai-tools`, `agent-integration` or `index`, ask once whether to set it up;
+3. on yes, show `setup.ps1 -DryRun`, then run it with `-Yes`. It asks for the agent's
+   approval or escalation, because it installs software and writes configs outside the repo.
+   If the sandbox cannot run it, the agent gives you the one command to run yourself;
+4. run `doctor.ps1` again and tell you to restart the agent and, in Codex, to trust the RTK
+   hook.
+
+Your answer controls what happens:
+- **Not now:** the agent works with normal search and does not ask again in that session.
+- **Never:** it saves `build/ai-setup-declined` in the ignored `build/` directory. This works
+  in a clone, worktree or extracted archive with a writable project folder. If the folder
+  is read-only, the refusal lasts for the current session. Remove the marker to get the
+  offer back. Existing `.git/ai-setup-declined` markers are still honored.
+
+The agent skips the check when the CodeGraph MCP tool is available and `.codegraph/` exists.
+
+### Manual
 
 ```powershell
 git clone <repo-url> flickSnap
@@ -98,9 +133,10 @@ on what is missing, so running it again is safe.
 | Switch | Effect |
 |---|---|
 | `-DryRun` | Preview only. Includes RTK's own `--dry-run` output for agent changes. |
-| `-Yes` | Accept the install prompts (pinned versions, missing tools only). Needed when there is no console, e.g. in a script. |
+| `-Yes` | Approve changes in the selected phases, including installs, agent configuration and index init or sync. Without it, each change requires interactive confirmation. |
 | `-Agents claude` / `-Agents codex` | Configure only that agent. |
-| `-SkipInstall`, `-SkipAgents`, `-SkipIndex` | Skip a phase. |
+| `-SkipBuildTools` | Do not offer the build toolchain installs. It is still checked. |
+| `-SkipInstall`, `-SkipAgents`, `-SkipIndex` | Skip a phase: CodeGraph/RTK install, agent integration, index. |
 | `-NoCodeGraphAutoAllow` | Passes `--no-permissions` to `codegraph install`, so Claude Code keeps asking before each CodeGraph MCP call. |
 
 The script never disables a sandbox, never trusts hooks for you, never edits application
@@ -198,6 +234,11 @@ directly when their contents matter.
 
 ## Windows, PowerShell and sandbox notes
 
+- **Codex's Windows sandbox and `-File`.** A nested `powershell -NoProfile -File
+  scripts/ai/doctor.ps1` can fail there with `DotSourceNotSupported`, because the child runs in
+  a different language mode. `& ./scripts/ai/doctor.ps1` from the sandbox's own PowerShell
+  works. `setup.ps1` installs software and writes outside the repository, so it has to run with
+  the user's approval outside the read-only sandbox anyway.
 - **The RTK hook only sees "Bash" tool calls.** In Claude Code on Windows, commands run
   through the PowerShell tool and the built-in Read/Grep/Glob tools are not rewritten.
   Codex on Windows runs shell commands through `powershell.exe`. Its hook still receives

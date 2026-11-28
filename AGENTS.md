@@ -8,6 +8,47 @@ This file is shared by both agents
 
 Prioritize correctness, security and existing behavior. Match dependency analysis and verification to the scope and risk of the change.
 
+## First session on a machine
+
+This section applies on Windows. Skip it when the `codegraph_explore` MCP tool is available
+and `.codegraph/` exists, when `build/ai-setup-declined` or the legacy
+`.git/ai-setup-declined` exists, or when the user already answered it in this session.
+Otherwise, before the first task, even if the user only asked you to get to know the project:
+
+1. Run `powershell -NoProfile -File scripts/ai/doctor.ps1` (read-only) and read its final
+   `Setup would help:` line. If a sandbox refuses it with `DotSourceNotSupported`, run
+   `& ./scripts/ai/doctor.ps1` in the current PowerShell instead. Check reported failures as
+   well as the summary. `Setup would help: none` means there is nothing to offer through
+   setup. Report failures that affect the task and proceed with the available tools.
+   If the diagnostic cannot run, explain the limitation and continue with the task.
+2. Otherwise ask the user one question. List what is missing, in plain words:
+   - `build-toolchain`: git, .NET 10 SDK, Rust, MSVC build tools;
+   - `ai-tools`: CodeGraph, RTK;
+   - `agent-integration`: MCP server and hooks for Claude Code / Codex;
+   - `index`: the local `.codegraph/`.
+
+   Offer: set up everything / only some parts / not now / never ask in this clone. Install
+   nothing before the answer.
+3. **Yes (all or some):** run `scripts/ai/setup.ps1 -DryRun` with the switches that match the
+   answer, show the plan, then run the same command with `-Yes` instead of `-DryRun`:
+   - only the index: `-SkipBuildTools -SkipInstall -SkipAgents`;
+   - no build toolchain: `-SkipBuildTools`;
+   - only the build toolchain: `-SkipInstall -SkipAgents -SkipIndex`.
+
+   The script installs software and writes agent configs outside the repository. Request
+   that through your normal approval or escalation prompt. If the sandbox cannot run it, give
+   the user the one command to run. Warn the user that the .NET SDK and MSVC installers may
+   show an administrator (UAC) prompt.
+4. **Afterwards:** run `doctor.ps1` again and report the result.
+   - Tell the user to restart the agent (and VS Code): the MCP server and hooks load only at
+     agent start. The `codegraph explore` CLI works at once.
+   - In Codex, the user must approve the `rtk hook codex` trust prompt once.
+5. **Not now:** continue with normal search, reading and plain commands, and do not ask again
+   in this session.
+6. **Never:** create an empty `build/ai-setup-declined` in the ignored `build/` directory
+   and do not ask again in this copy. If it cannot be written, honor the refusal for
+   this session and explain that it could not be saved. Removing the marker brings the offer back.
+
 ## Read on demand
 
 | Task touches | Read first |
