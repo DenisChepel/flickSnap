@@ -53,8 +53,9 @@ public C# `InteropStatus`):
 
 Positive values are benign. New members only by appending.
 
-A5. Last error: thread-local slot, cleared on entry by the panic guard, set on every non-OK
-status. `flicksnap_last_error_message(buf, cap) -> usize` returns the full length and writes only if
+A5. Last error: thread-local slot, cleared on entry by the panic guard, populated when the
+guard records an error or catches a panic. Positive statuses are successful outcomes.
+`flicksnap_last_error_message(buf, cap) -> usize` returns the full length and writes only if
 it fits (never truncates, never allocates); `flicksnap_last_error_code() -> i64` is the raw OS code
 (HRESULT / OSStatus / errno sign-extended from i32, 0 when none). No TLS path can unwind
 (`try_with` + `try_borrow`), because exports run on finalizer and OS callback threads.

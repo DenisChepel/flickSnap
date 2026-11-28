@@ -69,19 +69,38 @@ A flickSnap built inside the checkout needs no variable. One built to an out-of-
 FLICKSNAP_HELPERS_DIR="<repo>/target/debug:<repo>/ui/flickSnap.VideoRender/bin/Debug/net10.0"
 ```
 
-(`;` instead of `:` on Windows.) The only other variable is `FLICKSNAP_FFMPEG_PATH`, which names the
-FFmpeg library directory rather than a helper (below). The stdio contract every helper speaks is
-`crates/flicksnap_capture/HELPER_PROTOCOL.md`.
+(`;` instead of `:` on Windows.) The interop loader also checks `FLICKSNAP_INTEROP_PATH` first.
+`FLICKSNAP_FFMPEG_PATH` names the FFmpeg library directory. See
+`crates/flicksnap_capture/HELPER_PROTOCOL.md` for JSONL helpers and the binary AI exception.
+
+### Local Debug copy
+
+If `build/current/` exists, refresh it after executable or runtime-resource changes. Build only
+the affected Debug targets and their compatibility partners. Copy the affected helper from
+`target/debug/` and changed managed files from the appropriate project's Debug output under
+`ui/`. Preserve the existing layout and leave other files in place.
+
+- Close any processes using that copy before updating it. On Windows, a process that has
+  loaded the native DLL may also need to exit before Cargo can relink it.
+- For an ABI change, deploy `flicksnap_interop` and `flickSnap.Interop.dll` together. Build
+  the native library in its own Cargo invocation to preserve feature isolation.
+- For a catalog change, copy the rebuilt helper and the matching `flickSnap.Ipc.dll` and
+  affected managed consumers together, including the VideoRender host when it uses that catalog.
+  The ABI hash and catalog fingerprint are checked independently. Check any override paths
+  that can select a different copy.
+- Verify copied files by hash. This is a Debug copy, so use direct copies and leave release
+  staging scripts for packages. Documentation-only changes require no refresh. Create the
+  directory only on request.
 
 ### The video editor's FFmpeg
 
-The editor, the playback engine and `flickSnap.VideoRender` all load FFmpeg 8.1 natively (avcodec 62 /
-avformat 62 / avutil 60 / swscale 9 / swresample 6) and refuse to start without it:
-`FFmpegLoader.TryInitialize` asserts those majors. A release build takes them from the bundled
-recorder payload; `FFmpegLoader.FindBesideRecorder` is the one resolver every caller goes through,
-probing in order:
+The editor, the playback engine and `flickSnap.VideoRender` use FFmpeg 8.1. In
+`FFmpegLoader.TryInitialize`, flickSnap prepares the native directory via `flicksnap_interop`,
+then loads FFmpeg through AutoGen and explicitly checks avcodec 62 and avformat 62. The normal
+fallback resolver, `FFmpegLoader.FindBesideRecorder`, looks in the recorder payload.
+Resolution starts with:
 
-1. `FLICKSNAP_FFMPEG_PATH`, if set: always wins,
+1. `FLICKSNAP_FFMPEG_PATH`, when it names an existing directory,
 2. the recorder binary's own directory (the Windows layout, and every dev layout),
 3. its `Frameworks/` subdirectory (the macOS bundle layout).
 
@@ -92,9 +111,9 @@ FFmpeg libraries into the profile dir beside the binary, so the dev FFmpeg direc
 `target/<profile>`. Failing that, point `FLICKSNAP_HELPERS_DIR` at the directory an unpacked CI
 `recorder-<rid>` artifact sits in (the one holding `recorder/`).
 
-Roughly a hundred tests — every encode, render, composition-player, filmstrip, waveform and AI
-sidecar test — skip rather than fail when FFmpeg is missing, so check for `Skipped: 0` before
-believing a green run.
+FFmpeg-dependent tests skip when FFmpeg is missing. Check that the tests relevant to your
+change actually ran. The full suite can also skip tests based on platform, GPU or helper
+availability.
 
 The screen capture overlay is a separate Rust binary (`flicksnap_capture`); the tray app / editor is the Avalonia project `flickSnap`. For video recording, flickSnap runs the recorder (`flicksnap_recorder`, built from `crates/flicksnap_recorder` in this repository) from a `recorder/` directory alongside the flickSnap binary — see `.github/workflows/ci.yml` (which merges the outputs of `build-ui.yml`, `build-rust.yml` and `build-recorder.yml` in the same folder) for how release packages are assembled.
 

@@ -17,3 +17,9 @@ win-capture/
 # a generator under tools/ that imports a sibling module leaves a bytecode cache
 # next to the committed scripts
 __pycache__/
+
+# CodeGraph: the index is local to each machine and rebuilt with `codegraph init`
+# (see docs/AI_SETUP.md); codegraph.json at the repository root is shared and tracked.
+# .codegraph-*/ covers alternative index dirs such as .codegraph-wsl/ (WSL on a Windows drive).
+.codegraph/
+.codegraph-*/
